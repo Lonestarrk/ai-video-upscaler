@@ -125,7 +125,7 @@ fn prompt(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         });
         ui.add(
             egui::TextEdit::multiline(&mut app.settings.prompt)
-                .desired_rows(9)
+                .desired_rows(14)
                 .desired_width(f32::INFINITY)
                 .hint_text(tr("Beskriv hur bilderna ska restaureras…", "Describe how the frames should be restored…")),
         );

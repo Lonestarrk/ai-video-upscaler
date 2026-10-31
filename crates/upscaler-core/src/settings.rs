@@ -188,11 +188,43 @@ pub struct PromptPreset {
     pub text: String,
 }
 
-pub const DEFAULT_PROMPT: &str = "Restore and upscale this video frame to a clean, high-resolution image. \
+/// The default prompt: faithful restoration in one pass. Structure before detail, nothing
+/// invented, identity first.
+pub const DEFAULT_PROMPT: &str = "Restore and upscale this video frame faithfully, in a single pass. Recover the picture that is actually there; do not invent a new one.
+
+Work in this order within the one result:
+1. Structure first: restore the shapes, silhouettes, edges, tonal transitions, shadows, highlights and colors that are present in the source. Remove blur, compression artifacts, blocking, banding, noise, fading and damage without changing what lies underneath. Keep every face's head shape, the positions and proportions of the eyes, eyebrows, nose, mouth, cheeks, chin, jawline, ears and forehead, the expression and the pose exactly as they are.
+2. Then detail, only where that structure supports it: iris and pupil definition, eyelids and eyelashes, hair strands, skin texture, fabric, small objects. Detail must refine what is there, never add new physical features. Stop where more detail would require guessing.
+
+No invention: do not create facial or other details just to make the picture look more realistic. A blurred eye becomes a clearer version of the same eye, not a new eye. Do not redesign noses or mouths; keep their original width, position and shape. Never interpret a cast shadow, for example below the chin, as anatomy such as a jaw, chin or neck contour. Where information is genuinely missing, leave it naturally soft rather than guessing. Do not beautify, slim, smooth or reshape anyone, and do not change age, makeup or hairstyle.
+
+Priority when accuracy and detail conflict: 1) identity and facial geometry, 2) original positions and proportions, 3) original expression, 4) faithful photographic look (colors, lighting, grain, depth of field), 5) supported fine detail, 6) apparent resolution. Never sacrifice a higher priority for a lower one.
+
+The result should look like the same frame filmed with a better camera: natural, not over-sharpened, not painted, not airbrushed.";
+
+/// The first default prompt: a short, general clean-up. Kept as a preset.
+pub const SIMPLE_PROMPT: &str = "Restore and upscale this video frame to a clean, high-resolution image. \
 Keep it photorealistic and natural: recover fine detail and texture, sharpen soft edges, and remove \
 compression artifacts, blocking, banding, noise and blur. Do not add, remove or move anything. \
 Preserve the composition, faces, identities, expressions, text, colors, lighting and the overall \
 look of the original exactly. The result should look like the same shot filmed with a better camera.";
+
+/// Preset names, as shown in the prompt menu.
+pub const FAITHFUL_PRESET: &str = "Trogen restaurering";
+pub const SIMPLE_PRESET: &str = "Enkel uppstädning";
+
+fn default_presets() -> Vec<PromptPreset> {
+    vec![
+        PromptPreset {
+            name: FAITHFUL_PRESET.into(),
+            text: DEFAULT_PROMPT.into(),
+        },
+        PromptPreset {
+            name: SIMPLE_PRESET.into(),
+            text: SIMPLE_PROMPT.into(),
+        },
+    ]
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -275,10 +307,7 @@ impl Default for Settings {
             language: String::new(),
             provider: ProviderKind::ChatGptSubscription,
             prompt: DEFAULT_PROMPT.to_string(),
-            presets: vec![PromptPreset {
-                name: "Standard".into(),
-                text: DEFAULT_PROMPT.into(),
-            }],
+            presets: default_presets(),
             codex_path: String::new(),
             codex_model: String::new(),
             codex_reasoning: "low".into(),
@@ -320,12 +349,29 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Settings {
-        match std::fs::read_to_string(path) {
+        let mut s = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 log::warn!("settings.json could not be read ({e}), using defaults");
                 Settings::default()
             }),
             Err(_) => Settings::default(),
+        };
+        s.migrate();
+        s
+    }
+
+    /// Settings saved by an earlier version: the first default prompt becomes the new one
+    /// (unless it was edited), and the built-in presets are added.
+    fn migrate(&mut self) {
+        if self.prompt == SIMPLE_PROMPT {
+            self.prompt = DEFAULT_PROMPT.into();
+        }
+        self.presets
+            .retain(|p| !(p.name == "Standard" && p.text == SIMPLE_PROMPT));
+        for (i, preset) in default_presets().into_iter().enumerate() {
+            if !self.presets.iter().any(|p| p.name == preset.name) {
+                self.presets.insert(i.min(self.presets.len()), preset);
+            }
         }
     }
 
@@ -397,6 +443,23 @@ mod tests {
         assert_eq!(OutputSize::Height2160.target(853, 480), (3838, 2160));
         let (w, h) = OutputSize::Scale3.target(333, 111);
         assert!(w % 2 == 0 && h % 2 == 0);
+    }
+
+    #[test]
+    fn old_default_prompt_is_upgraded_but_edits_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let old = serde_json::json!({
+            "prompt": SIMPLE_PROMPT,
+            "presets": [{"name": "Standard", "text": SIMPLE_PROMPT}, {"name": "Mine", "text": "x"}]
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.prompt, DEFAULT_PROMPT);
+        let names: Vec<&str> = s.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec![FAITHFUL_PRESET, SIMPLE_PRESET, "Mine"]);
+        std::fs::write(&path, r#"{"prompt":"my own"}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).prompt, "my own");
     }
 
     #[test]
