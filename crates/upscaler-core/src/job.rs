@@ -145,8 +145,24 @@ pub fn run_preview(
         &tmp,
         cancel,
     );
-    let _ = std::fs::remove_dir_all(&tmp);
-    let img = result?;
+    // A failed request keeps its folder (input.png, codex-output.txt …) for troubleshooting.
+    let img = match result {
+        Ok(img) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            img
+        }
+        Err(e) if crate::process::is_cancelled(&e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        Err(e) => {
+            log::warn!(
+                "preview of frame {frame} failed, files kept in {}: {e:#}",
+                tmp.display()
+            );
+            return Err(e.context(format!("files kept in {}", tmp.display())));
+        }
+    };
     let path = preview_path(settings, info, frame);
     save_atomic(&img, &path)?;
     Ok(img)

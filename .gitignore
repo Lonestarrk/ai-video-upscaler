@@ -1,3 +1,5 @@
 /target
 /installer/Output
+/installer/ffmpeg
+/test-videos
 *.log

@@ -310,14 +310,16 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
     );
 }
 
-/// Checks frame accuracy on real files: `UPSCALER_TEST_VIDEOS=a.mp4:b.vob cargo test -- --ignored`.
+/// Checks frame accuracy on real files: `UPSCALER_TEST_VIDEOS=a.mp4:b.vob cargo test -- --ignored`
+/// (`;` between files on Windows).
 #[test]
 #[ignore]
 fn frame_accuracy_on_given_videos() {
     let tools = Tools::locate("").expect("ffmpeg");
     let list = std::env::var("UPSCALER_TEST_VIDEOS").expect("UPSCALER_TEST_VIDEOS");
-    for path in list.split(':').filter(|p| !p.is_empty()) {
-        let info = ffmpeg::probe(&tools, Path::new(path)).unwrap();
+    for path in std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()) {
+        let path = path.display().to_string();
+        let info = ffmpeg::probe(&tools, Path::new(&path)).unwrap();
         eprintln!(
             "{path}: {}x{} shown as {}x{}, {} frames, interlaced {}",
             info.coded_width,

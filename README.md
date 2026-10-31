@@ -64,6 +64,10 @@ Installationsprogram med [Inno Setup 6](https://jrsoftware.org/isinfo.php). Läg
 
 GitHub Actions (`.github/workflows/build.yml`) bygger exe och installationsprogram (med FFmpeg) för Windows samt en macOS-binär vid varje push. Filerna hittar du under *Actions → senaste körningen → Artifacts*.
 
+### Testvideor och fortsatt utveckling
+
+`scripts\make-test-videos.ps1` (eller `scripts/make-test-videos.sh`) hämtar Sintel-trailern från Blender och gör DVD-varianter: NTSC 16:9 interlaced, PAL 4:3 med och utan letterbox, och en medvetet felflaggad fil. `CLAUDE.md` beskriver arkitekturen, vad som är testat och vad som ska testas mot de riktiga tjänsterna, så att arbetet kan fortsätta i Claude Code.
+
 ### Struktur
 
 - `crates/upscaler-core`: allt utom gränssnittet: inställningar, FFmpeg (läsa, plocka ut bildrutor, koda med originalljud), AI-tjänsterna (`provider/`), bildgeometri (kanter, beskärning, scenbyten), prompter och exportjobbet.
