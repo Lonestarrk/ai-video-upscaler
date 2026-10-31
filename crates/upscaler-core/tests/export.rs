@@ -282,9 +282,32 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
         .unwrap()
         .to_rgb8();
     assert!(mean_diff(&first, &frame_by_counting(&tools, &info, 30)) < 1.0);
+    // Restored with square pixels, exported anamorphic again: 2x the stored 720x480, same
+    // pixel aspect ratio, so it still displays as 16:9.
     let result = ffmpeg::probe(&tools, &out).unwrap();
-    assert_eq!((result.width, result.height), (1708, 960));
+    assert_eq!((result.coded_width, result.coded_height), (1440, 960));
+    assert_eq!(result.sar, (32, 27));
     assert!(result.has_audio);
+    let up = image::open(spec.job_dir().join("out").join("000001.png")).unwrap();
+    assert_eq!(
+        (up.width(), up.height()),
+        (1708, 960),
+        "frames are restored with square pixels"
+    );
+
+    // With "keep anamorphic" off the export has square pixels.
+    let mut square = spec.clone();
+    square.settings.keep_anamorphic = false;
+    square.output = dir.path().join("dvd_square.mp4");
+    assert_eq!(
+        run(&tools, &square).last().map(String::as_str),
+        Some("finished")
+    );
+    let result = ffmpeg::probe(&tools, &square.output).unwrap();
+    assert_eq!(
+        (result.coded_width, result.coded_height, result.sar),
+        (1708, 960, (1, 1))
+    );
 }
 
 /// Checks frame accuracy on real files: `UPSCALER_TEST_VIDEOS=a.mp4:b.vob cargo test -- --ignored`.

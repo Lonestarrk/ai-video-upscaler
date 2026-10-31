@@ -45,6 +45,40 @@ fn pixel_settings_key(s: &Settings) -> Vec<String> {
     v
 }
 
+// ---------------------------------------------------------------- geometry
+
+/// Sizes for one video and the current settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    /// Square-pixel size the frames are restored at (previews, AI, consistency reference).
+    pub work: (u32, u32),
+    /// Size stored in the exported file.
+    pub stored: (u32, u32),
+    /// Pixel aspect ratio of the exported file when it is anamorphic.
+    pub sar: Option<(u32, u32)>,
+}
+
+pub fn geometry(settings: &Settings, info: &VideoInfo) -> Geometry {
+    // The same square-pixel size either way, so previews and finished frames are shared.
+    let work = settings.output_size.target(info.width, info.height);
+    if info.anamorphic() && settings.keep_anamorphic {
+        let stored = settings
+            .output_size
+            .target(info.coded_width, info.coded_height);
+        Geometry {
+            work,
+            stored,
+            sar: Some(info.sar),
+        }
+    } else {
+        Geometry {
+            work,
+            stored: work,
+            sar: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------- previews
 
 /// Where the preview of `frame` with the current settings is cached.
@@ -67,7 +101,7 @@ pub fn run_preview(
     source: &RgbImage,
     cancel: &AtomicBool,
 ) -> Result<RgbImage> {
-    let target = settings.output_size.target(info.width, info.height);
+    let target = geometry(settings, info).work;
     let provider = provider::create(settings);
     let tmp = temp_dir(settings);
     let result = provider::upscale_frame(
@@ -296,7 +330,8 @@ fn export(
     }
 
     // 3. Upscale
-    let target = s.output_size.target(spec.info.width, spec.info.height);
+    let geo = geometry(s, &spec.info);
+    let target = geo.work;
     let provider = provider::create(s);
     let done = AtomicU64::new(0);
     let report = |n: u64, path: PathBuf, seconds: Option<f32>| {
@@ -446,6 +481,7 @@ fn export(
         in_fps_num: info.fps_num,
         in_fps_den: info.fps_den as u64 * divisor as u64,
         interpolate_to: (divisor > 1).then_some((info.fps_num, info.fps_den)),
+        anamorphic: geo.sar.map(|sar| (geo.stored, sar)),
         codec: s.video_codec,
         crf: s.crf,
         audio_from: info.has_audio.then(|| {

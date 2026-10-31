@@ -169,15 +169,36 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     });
                 ui.end_row();
                 if let Some(v) = &app.video {
-                    let (w, h) = app.settings.output_size.target(v.info.width, v.info.height);
+                    let g = upscaler_core::job::geometry(&app.settings, &v.info);
+                    let i = &v.info;
+                    let text = match g.sar {
+                        Some((n, d)) => format!(
+                            "{}×{} ➡ {}×{}\n{} {n}:{d}, {} {}×{}",
+                            i.coded_width,
+                            i.coded_height,
+                            g.stored.0,
+                            g.stored.1,
+                            tr("anamorft, pixlar", "anamorphic, pixels"),
+                            tr("visas som", "shown as"),
+                            g.work.0,
+                            g.work.1
+                        ),
+                        None => format!("{}×{} ➡ {}×{}", i.width, i.height, g.stored.0, g.stored.1),
+                    };
                     ui.label("");
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}×{} ➡ {w}×{h}",
-                            v.info.width, v.info.height
-                        ))
-                        .weak(),
-                    );
+                    ui.label(egui::RichText::new(text).weak());
+                    ui.end_row();
+                    if i.anamorphic() {
+                        ui.label("");
+                        ui.checkbox(
+                            &mut app.settings.keep_anamorphic,
+                            tr("Behåll anamorfa pixlar", "Keep anamorphic pixels"),
+                        )
+                        .on_hover_text(tr(
+                            "Videon har icke-kvadratiska pixlar (t.ex. DVD). Bilden sträcks till kvadratiska pixlar för förhandsvisning och AI, och kläms sedan tillbaka till originalets pixelformat i den exporterade filen. Av: exportera med kvadratiska pixlar.",
+                            "The video has non-square pixels (e.g. DVD). The picture is stretched to square pixels for preview and AI, then squeezed back to the original pixel shape in the exported file. Off: export with square pixels.",
+                        ));
+                    }
                     ui.end_row();
                 }
                 ui.label(tr("Kodek", "Codec"));

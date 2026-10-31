@@ -82,6 +82,8 @@ pub struct VideoInfo {
     pub coded_height: u32,
     /// Interlaced (typical for DVD and TV): frames are deinterlaced when decoded.
     pub interlaced: bool,
+    /// Pixel aspect ratio as stored (32:27 for NTSC 16:9 DVD); (1, 1) for square pixels.
+    pub sar: (u32, u32),
     /// Timestamp (s) of the first video frame; frame `n` is at `start_time + n / fps`.
     pub start_time: f64,
     /// Frame rate as a fraction.
@@ -97,6 +99,11 @@ pub struct VideoInfo {
 }
 
 impl VideoInfo {
+    /// Stored with non-square pixels (anamorphic DVD and the like).
+    pub fn anamorphic(&self) -> bool {
+        self.sar != (1, 1)
+    }
+
     pub fn fps(&self) -> f64 {
         self.fps_num as f64 / self.fps_den.max(1) as f64
     }
@@ -153,13 +160,15 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
     }
     let (coded_width, coded_height) = (width, height);
     // Non-square pixels (DVD, DV, some TV recordings): widen to the display aspect ratio.
+    let mut sar = (1u32, 1u32);
     if let Some((n, d)) = video["sample_aspect_ratio"]
         .as_str()
         .and_then(|s| s.split_once(':'))
-        .and_then(|(n, d)| Some((n.parse::<f64>().ok()?, d.parse::<f64>().ok()?)))
-        .filter(|(n, d)| *n > 0.0 && *d > 0.0 && (n / d - 1.0).abs() > 0.01)
+        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .filter(|(n, d)| *n > 0 && *d > 0 && (*n as f64 / *d as f64 - 1.0).abs() > 0.01)
     {
-        width = ((width as f64 * n / d / 2.0).round() as u32).max(1) * 2;
+        sar = (n, d);
+        width = ((width as f64 * n as f64 / d as f64 / 2.0).round() as u32).max(1) * 2;
     }
     let interlaced = matches!(
         video["field_order"].as_str(),
@@ -209,6 +218,7 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
         coded_width,
         coded_height,
         interlaced,
+        sar,
         start_time,
         fps_num,
         fps_den,
@@ -423,6 +433,9 @@ pub struct EncodeOptions {
     pub in_fps_den: u64,
     /// Rebuild the original frame rate with motion interpolation (when frames were skipped).
     pub interpolate_to: Option<(u32, u32)>,
+    /// Squeeze the square-pixel frames back to this stored size and pixel aspect ratio
+    /// (anamorphic output).
+    pub anamorphic: Option<((u32, u32), (u32, u32))>,
     pub codec: crate::settings::VideoCodec,
     pub crf: u8,
     /// Audio: the source file and the range to cut from it.
@@ -458,10 +471,17 @@ pub fn encode(
         } else {
             cmd.args(["-map", "0:v:0"]);
         }
+        let mut filters: Vec<String> = Vec::new();
         if let Some((n, d)) = opts.interpolate_to {
-            cmd.arg("-vf").arg(format!(
+            filters.push(format!(
                 "minterpolate=fps={n}/{d}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
             ));
+        }
+        if let Some(((w, h), (n, d))) = opts.anamorphic {
+            filters.push(format!("scale={w}:{h}:flags=lanczos,setsar={n}/{d}"));
+        }
+        if !filters.is_empty() {
+            cmd.arg("-vf").arg(filters.join(","));
         }
         match opts.codec {
             crate::settings::VideoCodec::H264 => {
@@ -583,6 +603,7 @@ mod tests {
         let info = parse_probe(Path::new("x.vob"), json).unwrap();
         assert_eq!((info.width, info.height), (854, 480));
         assert_eq!((info.coded_width, info.coded_height), (720, 480));
+        assert_eq!(info.sar, (32, 27));
         assert!(info.interlaced);
         assert_eq!(info.frame_count, 300);
         let pal = r#"{"streams":[{"codec_type":"video","width":720,"height":576,"sample_aspect_ratio":"16:15",

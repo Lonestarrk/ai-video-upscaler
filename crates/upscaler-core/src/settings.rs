@@ -184,6 +184,9 @@ pub struct Settings {
     /// Pad frames to the classic image-model aspect ratios (1:1, 3:2, 2:3) and crop back afterwards,
     /// so the model never stretches or reframes a 16:9 frame.
     pub pad_to_model_aspect: bool,
+    /// Anamorphic sources (non-square pixels, e.g. DVD) are restored with square pixels and
+    /// squeezed back to the original pixel aspect ratio in the exported video.
+    pub keep_anamorphic: bool,
     /// Send the previous upscaled frame as a reference image (sequential processing).
     pub use_previous_frame: bool,
     /// Mean difference (0-255) above which a frame starts a new shot and gets no reference.
@@ -233,6 +236,7 @@ impl Default for Settings {
             work_dir: String::new(),
             output_size: OutputSize::Scale2,
             pad_to_model_aspect: true,
+            keep_anamorphic: true,
             use_previous_frame: true,
             scene_cut_threshold: 28.0,
             skip_duplicates: true,

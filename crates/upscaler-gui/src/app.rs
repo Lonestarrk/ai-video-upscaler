@@ -299,10 +299,7 @@ impl UpscalerApp {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "video".into());
-        let (w, h) = self
-            .settings
-            .output_size
-            .target(v.info.width, v.info.height);
+        let (w, h) = upscaler_core::job::geometry(&self.settings, &v.info).stored;
         let mut dialog = rfd::FileDialog::new()
             .add_filter("MP4", &["mp4"])
             .set_file_name(format!("{stem}_upscaled_{h}p.mp4"));
