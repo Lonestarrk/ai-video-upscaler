@@ -73,8 +73,17 @@ impl Tools {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoInfo {
     pub path: PathBuf,
+    /// Display size in square pixels (what everything downstream works with). DVDs store
+    /// 720x480/576 with non-square pixels; this is the size they are shown at, e.g. 854x480.
     pub width: u32,
     pub height: u32,
+    /// Size as stored in the file.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// Interlaced (typical for DVD and TV): frames are deinterlaced when decoded.
+    pub interlaced: bool,
+    /// Timestamp (s) of the first video frame; frame `n` is at `start_time + n / fps`.
+    pub start_time: f64,
     /// Frame rate as a fraction.
     pub fps_num: u32,
     pub fps_den: u32,
@@ -142,6 +151,20 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
     if width == 0 || height == 0 {
         bail!("the video has no size");
     }
+    let (coded_width, coded_height) = (width, height);
+    // Non-square pixels (DVD, DV, some TV recordings): widen to the display aspect ratio.
+    if let Some((n, d)) = video["sample_aspect_ratio"]
+        .as_str()
+        .and_then(|s| s.split_once(':'))
+        .and_then(|(n, d)| Some((n.parse::<f64>().ok()?, d.parse::<f64>().ok()?)))
+        .filter(|(n, d)| *n > 0.0 && *d > 0.0 && (n / d - 1.0).abs() > 0.01)
+    {
+        width = ((width as f64 * n / d / 2.0).round() as u32).max(1) * 2;
+    }
+    let interlaced = matches!(
+        video["field_order"].as_str(),
+        Some("tt" | "bb" | "tb" | "bt")
+    );
     // Phone videos are often stored sideways with a rotation tag; ffmpeg rotates them on decode.
     let rotation = video["side_data_list"]
         .as_array()
@@ -175,11 +198,18 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
         .filter(|n| *n > 0)
         .unwrap_or_else(|| (duration * fps).round() as u64)
         .max(1);
+    let start_time = num(&video["start_time"])
+        .or_else(|| num(&v["format"]["start_time"]))
+        .unwrap_or(0.0);
     let meta = std::fs::metadata(path).ok();
     Ok(VideoInfo {
         path: path.to_path_buf(),
         width,
         height,
+        coded_width,
+        coded_height,
+        interlaced,
+        start_time,
         fps_num,
         fps_den,
         duration,
@@ -222,8 +252,46 @@ pub fn probe(tools: &Tools, path: &Path) -> Result<VideoInfo> {
 }
 
 /// Seek time that lands exactly on frame `index` (a hair before its timestamp).
-fn seek_time(info: &VideoInfo, index: u64) -> f64 {
-    (info.frame_time(index) - 0.25 / info.fps()).max(0.0)
+/// The filter chain every decoded frame goes through: deinterlace when the video is
+/// interlaced, then scale to `w`x`h` square pixels.
+pub fn frame_filter(info: &VideoInfo, w: u32, h: u32) -> String {
+    filter_chain(info, None, w, h)
+}
+
+/// Deinterlace (with all decoded frames as context), then `select`, then scale.
+fn filter_chain(info: &VideoInfo, select: Option<&str>, w: u32, h: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if info.interlaced {
+        // bwdif only touches frames flagged as interlaced; progressive ones pass through.
+        parts.push("bwdif=mode=send_frame:parity=auto:deint=interlaced".into());
+    }
+    if let Some(s) = select {
+        parts.push(s.to_string());
+    }
+    parts.push(format!("scale={w}:{h}:flags=bicubic,setsar=1"));
+    parts.join(",")
+}
+
+/// How far before a frame decoding starts, so the deinterlacer has neighbouring fields and
+/// the exact frame can be picked by its timestamp.
+const PRE_ROLL: f64 = 1.0;
+
+/// Input options that seek to just before frame `index` and keep the file's own
+/// timestamps (`-copyts`), plus the `select` expression that lets exactly frames from
+/// `index` on through. Accurate seeking alone is off by one on some MPEG-2/DVD files, and it
+/// starts the deinterlacer without the previous field.
+fn seek_args(info: &VideoInfo, index: u64) -> (Vec<String>, String) {
+    let t = info.frame_time(index);
+    let pre = (t - PRE_ROLL).max(0.0);
+    let args = vec![
+        "-copyts".to_string(),
+        "-noaccurate_seek".to_string(),
+        "-ss".to_string(),
+        format!("{pre:.4}"),
+    ];
+    // Timestamps keep the file's start offset; take the frame whose time is closest to `t`.
+    let from = info.start_time + t - 0.5 / info.fps();
+    (args, format!("select=gte(t\\,{from:.5})"))
 }
 
 /// Decodes frame `index` at full size. `fast` seeks to the nearest keyframe instead (thumbnails).
@@ -242,15 +310,20 @@ pub fn grab_frame(
         None => (info.width, info.height),
     };
     let mut cmd = tools.ffmpeg_cmd();
-    if fast {
-        cmd.arg("-noaccurate_seek");
-    }
-    cmd.arg("-ss")
-        .arg(format!("{:.4}", seek_time(info, index)))
-        .arg("-i")
+    let filter = if fast {
+        // Thumbnails: the nearest keyframe is close enough and much faster.
+        cmd.args(["-noaccurate_seek", "-ss"])
+            .arg(format!("{:.4}", info.frame_time(index)));
+        frame_filter(info, w, h)
+    } else {
+        let (args, select) = seek_args(info, index);
+        cmd.args(args);
+        filter_chain(info, Some(&select), w, h)
+    };
+    cmd.arg("-i")
         .arg(&info.path)
         .args(["-frames:v", "1", "-an", "-sn", "-vf"])
-        .arg(format!("scale={w}:{h}:flags=bicubic"))
+        .arg(filter)
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
     let out = process::run(
         cmd,
@@ -292,16 +365,19 @@ pub fn extract_range(
     std::fs::create_dir_all(dir)?;
     let out_frames = range.count.div_ceil(divisor as u64);
     let mut cmd = tools.ffmpeg_cmd();
-    cmd.arg("-ss")
-        .arg(format!("{:.4}", seek_time(info, range.start)))
+    let (args, select) = seek_args(info, range.start);
+    cmd.args(args)
         .arg("-i")
         .arg(&info.path)
         .args(["-an", "-sn", "-vf"])
         .arg(format!(
-            "fps={}/{}",
+            "{},fps={}/{}",
+            filter_chain(info, Some(&select), info.width, info.height),
             info.fps_num,
             info.fps_den as u64 * divisor as u64
         ))
+        // Without this, ffmpeg would duplicate or drop frames to match the copied timestamps.
+        .args(["-fps_mode", "passthrough"])
         .args([
             "-frames:v",
             &out_frames.to_string(),
@@ -498,6 +574,22 @@ mod tests {
         );
         assert!(info.has_audio);
         assert!((info.fps() - 23.976).abs() < 0.01);
+    }
+
+    #[test]
+    fn dvd_probe_uses_display_aspect() {
+        let json = r#"{"streams":[{"codec_type":"video","codec_name":"mpeg2video","width":720,"height":480,
+            "sample_aspect_ratio":"32:27","field_order":"tt","avg_frame_rate":"30000/1001"}],"format":{"duration":"10"}}"#;
+        let info = parse_probe(Path::new("x.vob"), json).unwrap();
+        assert_eq!((info.width, info.height), (854, 480));
+        assert_eq!((info.coded_width, info.coded_height), (720, 480));
+        assert!(info.interlaced);
+        assert_eq!(info.frame_count, 300);
+        let pal = r#"{"streams":[{"codec_type":"video","width":720,"height":576,"sample_aspect_ratio":"16:15",
+            "field_order":"progressive","avg_frame_rate":"25/1"}],"format":{"duration":"1"}}"#;
+        let info = parse_probe(Path::new("x.vob"), pal).unwrap();
+        assert_eq!((info.width, info.height), (768, 576));
+        assert!(!info.interlaced);
     }
 
     #[test]

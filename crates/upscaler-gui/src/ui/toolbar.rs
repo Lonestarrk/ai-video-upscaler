@@ -27,10 +27,29 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 .on_hover_text(i.path.display().to_string());
             ui.label(
                 egui::RichText::new(format!(
-                    "{}×{}  ·  {:.3} fps  ·  {}  ·  {} {}  ·  {}{}  ·  {}",
-                    i.width,
-                    i.height,
+                    "{}{}  ·  {:.3} fps{}  ·  {}  ·  {} {}  ·  {}{}  ·  {}",
+                    if (i.coded_width, i.coded_height) != (i.width, i.height) {
+                        format!(
+                            "{}×{} ({} {}×{})",
+                            i.coded_width,
+                            i.coded_height,
+                            tr("visas som", "shown as"),
+                            i.width,
+                            i.height
+                        )
+                    } else {
+                        format!("{}×{}", i.width, i.height)
+                    },
+                    "",
                     i.fps(),
+                    if i.interlaced {
+                        format!(
+                            " {}",
+                            tr("interlaced, avflätas", "interlaced, deinterlaced")
+                        )
+                    } else {
+                        String::new()
+                    },
                     format_time(i.duration),
                     i.frame_count,
                     tr("bildrutor", "frames"),

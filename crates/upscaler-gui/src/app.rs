@@ -18,8 +18,9 @@ use crate::i18n::tr;
 use crate::ui;
 use crate::worker::{self, Bus, Event, FrameFetcher, FrameRequest};
 
-pub const VIDEO_EXTENSIONS: [&str; 12] = [
-    "mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "3gp",
+pub const VIDEO_EXTENSIONS: [&str; 20] = [
+    "mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "3gp", "vob",
+    "m2ts", "mts", "m2v", "dv", "divx", "ogv", "mxf",
 ];
 pub const THUMB_COUNT: usize = 40;
 
