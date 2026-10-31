@@ -42,6 +42,11 @@ fn pixel_settings_key(s: &Settings, info: &VideoInfo) -> Vec<String> {
             s.openai_quality.clone(),
             s.openai_input_fidelity.to_string(),
         ]),
+        crate::settings::ProviderKind::Gemini => {
+            v.extend([s.gemini_model.clone(), s.gemini_image_size.clone()])
+        }
+        crate::settings::ProviderKind::Flux => v.push(s.bfl_model.clone()),
+        crate::settings::ProviderKind::Grok => v.push(s.xai_model.clone()),
         crate::settings::ProviderKind::RealEsrgan => v.push(s.realesrgan_model.clone()),
         crate::settings::ProviderKind::Basic => {}
     }

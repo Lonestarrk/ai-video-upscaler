@@ -87,7 +87,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     .clicked()
                 {
                     app.settings_ui.open = true;
-                    app.settings_ui.tab = 3;
+                    app.settings_ui.tab = crate::ui::settings_window::TAB_FFMPEG;
                 }
             }
         });

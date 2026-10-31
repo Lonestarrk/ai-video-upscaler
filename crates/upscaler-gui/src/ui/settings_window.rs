@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use upscaler_core::provider::codex::{self, LoginState};
+use upscaler_core::settings::ProviderKind;
 
 use super::style::{primary_button, BAD, GOOD, WARN};
 use crate::app::UpscalerApp;
@@ -23,10 +24,13 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
         .resizable(true)
         .default_size([640.0, 520.0])
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let tabs = [
                     "ChatGPT",
                     "OpenAI API",
+                    "Gemini",
+                    "FLUX",
+                    "Grok",
                     "Real-ESRGAN",
                     tr("FFmpeg och mappar", "FFmpeg and folders"),
                     tr("Allmänt", "General"),
@@ -41,8 +45,11 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
                 .show(ui, |ui| match app.settings_ui.tab {
                     0 => chatgpt(ui, app),
                     1 => openai(ui, app),
-                    2 => realesrgan(ui, app),
-                    3 => ffmpeg(ui, app),
+                    2 => gemini(ui, app),
+                    3 => flux(ui, app),
+                    4 => grok(ui, app),
+                    5 => realesrgan(ui, app),
+                    TAB_FFMPEG => ffmpeg(ui, app),
                     _ => general(ui, app),
                 });
         });
@@ -202,6 +209,247 @@ fn start(app: &mut UpscalerApp, what: &str, op: CodexOp) {
     app.settings_ui.codex_message = None;
     app.settings_ui.codex_busy = Some((what.to_string(), cancel.clone()));
     worker::codex_action(app.bus.clone(), app.settings.codex_path.clone(), op, cancel);
+}
+
+pub const TAB_FFMPEG: usize = 6;
+
+/// The settings tab of a service.
+pub fn tab_for(p: ProviderKind) -> usize {
+    match p {
+        ProviderKind::ChatGptSubscription => 0,
+        ProviderKind::OpenAiApi => 1,
+        ProviderKind::Gemini => 2,
+        ProviderKind::Flux => 3,
+        ProviderKind::Grok => 4,
+        ProviderKind::RealEsrgan => 5,
+        ProviderKind::Basic => 7,
+    }
+}
+
+/// An API key field (hidden unless "Show"), with where the key comes from when it is empty.
+fn key_field(ui: &mut egui::Ui, key: &mut String, show: &mut bool, env: &[&str]) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(key)
+                .password(!*show)
+                .desired_width(320.0),
+        );
+        ui.checkbox(show, tr("Visa", "Show"));
+    });
+    if key.trim().is_empty() {
+        let found = env
+            .iter()
+            .find(|v| std::env::var(v).is_ok_and(|k| !k.is_empty()));
+        let text = match found {
+            Some(v) => format!(
+                "{} {v}",
+                tr(
+                    "Tomt: använder miljövariabeln",
+                    "Empty: uses the environment variable"
+                )
+            ),
+            None => format!(
+                "{} {}",
+                tr(
+                    "Tomt: läser miljövariabeln",
+                    "Empty: reads the environment variable"
+                ),
+                env.join(" / ")
+            ),
+        };
+        ui.label(egui::RichText::new(text).weak().small());
+    }
+}
+
+/// A model menu with the known names plus free text.
+fn model_field(ui: &mut egui::Ui, id: &str, value: &mut String, known: &[(&str, &str)]) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(known.iter().find(|(m, _)| *m == value.as_str()).map(|(_, l)| l.to_string()).unwrap_or_else(|| value.clone()))
+            .show_ui(ui, |ui| {
+                for (m, l) in known {
+                    ui.selectable_value(value, m.to_string(), *l);
+                }
+            });
+        ui.add(egui::TextEdit::singleline(value).desired_width(200.0)).on_hover_text(tr(
+            "Modellnamnet som skickas till tjänsten. Ändra om tjänsten byter namn eller släpper en ny modell.",
+            "The model name sent to the service. Change it if the service renames or releases a model.",
+        ));
+    });
+}
+
+fn gemini(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    ui.label(
+        egui::RichText::new("Google Gemini – Nano Banana")
+            .strong()
+            .size(16.0),
+    );
+    ui.label(tr(
+        "Googles bildmodeller. Nano Banana Pro (Gemini 3 Pro Image) får bland de bästa omdömena för att behålla identitet, ansikten och komposition vid redigering av riktiga foton. Tar föregående bildruta som referens. Kräver en API-nyckel från Google AI Studio med betalning aktiverad; en Google One/AI Pro-prenumeration räcker inte för API:t.",
+        "Google's image models. Nano Banana Pro (Gemini 3 Pro Image) is rated among the best at keeping identity, faces and composition when editing real photos. Takes the previous frame as a reference. Needs an API key from Google AI Studio with billing enabled; a Google One/AI Pro subscription does not cover the API.",
+    ));
+    ui.add_space(8.0);
+    egui::Grid::new("gemini")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(tr("API-nyckel", "API key"));
+            ui.vertical(|ui| {
+                key_field(
+                    ui,
+                    &mut app.settings.gemini_api_key,
+                    &mut app.settings_ui.show_key,
+                    &upscaler_core::provider::gemini::ENV_KEYS,
+                )
+            });
+            ui.end_row();
+            ui.label(tr("Modell", "Model"));
+            model_field(
+                ui,
+                "gemini_model",
+                &mut app.settings.gemini_model,
+                &[
+                    (
+                        "gemini-3-pro-image",
+                        tr(
+                            "Nano Banana Pro (bäst kvalitet)",
+                            "Nano Banana Pro (best quality)",
+                        ),
+                    ),
+                    ("gemini-nano-banana-2.1", "Nano Banana 2.1"),
+                    (
+                        "gemini-3.1-flash-image",
+                        tr(
+                            "Nano Banana 2 (snabbare, billigare)",
+                            "Nano Banana 2 (faster, cheaper)",
+                        ),
+                    ),
+                    (
+                        "gemini-2.5-flash-image",
+                        tr("Nano Banana (äldre)", "Nano Banana (older)"),
+                    ),
+                ],
+            );
+            ui.end_row();
+            ui.label(tr("Upplösning", "Resolution"));
+            ui.horizontal(|ui| {
+                for v in ["1K", "2K", "4K"] {
+                    ui.selectable_value(&mut app.settings.gemini_image_size, v.to_string(), v);
+                }
+            });
+            ui.end_row();
+        });
+    ui.label(
+        egui::RichText::new(tr(
+            "Ungefär 0,13 USD per bild i 2K med Nano Banana Pro (Googles prislista kan ändras).",
+            "About USD 0.13 per image at 2K with Nano Banana Pro (Google's price list may change).",
+        ))
+        .weak()
+        .small(),
+    );
+    ui.hyperlink_to(
+        tr(
+            "Skapa en API-nyckel i Google AI Studio",
+            "Create an API key in Google AI Studio",
+        ),
+        "https://aistudio.google.com/apikey",
+    );
+}
+
+fn flux(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    ui.label(
+        egui::RichText::new("FLUX – Black Forest Labs")
+            .strong()
+            .size(16.0),
+    );
+    ui.label(tr(
+        "Bildredigeringsmodeller som är kända för att behålla personer och komposition och bara ändra det man ber om. Behåller bildens form, så ingen utfyllnad behövs. FLUX.2 tar föregående bildruta som referens; FLUX.1 Kontext redigerar en bild åt gången.",
+        "Image editing models known for keeping people and composition and only changing what is asked. Keeps the picture's shape, so no padding is needed. FLUX.2 takes the previous frame as a reference; FLUX.1 Kontext edits one image at a time.",
+    ));
+    ui.add_space(8.0);
+    egui::Grid::new("flux")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(tr("API-nyckel", "API key"));
+            ui.vertical(|ui| {
+                key_field(
+                    ui,
+                    &mut app.settings.bfl_api_key,
+                    &mut app.settings_ui.show_key,
+                    &upscaler_core::provider::flux::ENV_KEYS,
+                )
+            });
+            ui.end_row();
+            ui.label(tr("Modell", "Model"));
+            model_field(
+                ui,
+                "bfl_model",
+                &mut app.settings.bfl_model,
+                &[
+                    ("flux-kontext-pro", "FLUX.1 Kontext [pro]"),
+                    ("flux-kontext-max", "FLUX.1 Kontext [max]"),
+                    (
+                        "flux-2-pro",
+                        tr(
+                            "FLUX.2 [pro] (med referens)",
+                            "FLUX.2 [pro] (with reference)",
+                        ),
+                    ),
+                    (
+                        "flux-2-max",
+                        tr(
+                            "FLUX.2 [max] (med referens)",
+                            "FLUX.2 [max] (with reference)",
+                        ),
+                    ),
+                ],
+            );
+            ui.end_row();
+        });
+    ui.hyperlink_to(
+        tr(
+            "Skapa en API-nyckel hos Black Forest Labs",
+            "Create an API key at Black Forest Labs",
+        ),
+        "https://dashboard.bfl.ai/",
+    );
+}
+
+fn grok(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    ui.label(egui::RichText::new("Grok – xAI").strong().size(16.0));
+    ui.label(tr(
+        "xAI:s bildmodell Grok Imagine. Snabb och billig (runt 0,02 USD per bild), men har färre omdömen för trogen restaurering än Gemini, FLUX och ChatGPT. Redigerar en bild åt gången och behåller bildens form.",
+        "xAI's image model Grok Imagine. Fast and cheap (around USD 0.02 per image), but has fewer reviews for faithful restoration than Gemini, FLUX and ChatGPT. Edits one image at a time and keeps the picture's shape.",
+    ));
+    ui.add_space(8.0);
+    egui::Grid::new("grok")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(tr("API-nyckel", "API key"));
+            ui.vertical(|ui| {
+                key_field(
+                    ui,
+                    &mut app.settings.xai_api_key,
+                    &mut app.settings_ui.show_key,
+                    &upscaler_core::provider::grok::ENV_KEYS,
+                )
+            });
+            ui.end_row();
+            ui.label(tr("Modell", "Model"));
+            model_field(
+                ui,
+                "xai_model",
+                &mut app.settings.xai_model,
+                &[("grok-imagine-image-2.0", "Grok Imagine Image 2.0")],
+            );
+            ui.end_row();
+        });
+    ui.hyperlink_to(
+        tr("Skapa en API-nyckel hos xAI", "Create an API key at xAI"),
+        "https://console.x.ai/",
+    );
 }
 
 fn openai(ui: &mut egui::Ui, app: &mut UpscalerApp) {

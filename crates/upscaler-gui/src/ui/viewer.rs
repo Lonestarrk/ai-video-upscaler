@@ -15,6 +15,15 @@ pub fn provider_name(p: ProviderKind) -> &'static str {
             tr("ChatGPT (prenumeration)", "ChatGPT (subscription)")
         }
         ProviderKind::OpenAiApi => tr("OpenAI API (betala per bild)", "OpenAI API (pay per image)"),
+        ProviderKind::Gemini => tr(
+            "Google Gemini – Nano Banana (betala per bild)",
+            "Google Gemini – Nano Banana (pay per image)",
+        ),
+        ProviderKind::Flux => tr(
+            "FLUX – Black Forest Labs (betala per bild)",
+            "FLUX – Black Forest Labs (pay per image)",
+        ),
+        ProviderKind::Grok => tr("Grok – xAI (betala per bild)", "Grok – xAI (pay per image)"),
         ProviderKind::RealEsrgan => tr("Real-ESRGAN (lokal, gratis)", "Real-ESRGAN (local, free)"),
         ProviderKind::Basic => tr("Enkel uppskalning (test)", "Basic upscale (test)"),
     }
@@ -288,6 +297,9 @@ fn short_provider(app: &UpscalerApp) -> &'static str {
     match app.settings.provider {
         ProviderKind::ChatGptSubscription => "ChatGPT",
         ProviderKind::OpenAiApi => "OpenAI API",
+        ProviderKind::Gemini => "Gemini",
+        ProviderKind::Flux => "FLUX",
+        ProviderKind::Grok => "Grok",
         ProviderKind::RealEsrgan => "Real-ESRGAN",
         ProviderKind::Basic => tr("Enkel", "Basic"),
     }

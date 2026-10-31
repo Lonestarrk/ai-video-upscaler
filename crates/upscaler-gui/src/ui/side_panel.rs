@@ -57,12 +57,7 @@ fn provider(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         .clicked()
     {
         app.settings_ui.open = true;
-        app.settings_ui.tab = match app.settings.provider {
-            ProviderKind::ChatGptSubscription => 0,
-            ProviderKind::OpenAiApi => 1,
-            ProviderKind::RealEsrgan => 2,
-            ProviderKind::Basic => 4,
-        };
+        app.settings_ui.tab = crate::ui::settings_window::tab_for(app.settings.provider);
     }
 }
 
@@ -82,11 +77,36 @@ fn provider_status(app: &UpscalerApp) -> (Color32, String) {
                 (GOOD, format!("{} {} · {}", tr("API-nyckel finns ·", "API key set ·"), app.settings.openai_model, tr("debiteras per bild", "billed per image")))
             }
         }
+        ProviderKind::Gemini => key_status(&app.settings.gemini_api_key, &upscaler_core::provider::gemini::ENV_KEYS, &app.settings.gemini_model),
+        ProviderKind::Flux => key_status(&app.settings.bfl_api_key, &upscaler_core::provider::flux::ENV_KEYS, &app.settings.bfl_model),
+        ProviderKind::Grok => key_status(&app.settings.xai_api_key, &upscaler_core::provider::grok::ENV_KEYS, &app.settings.xai_model),
         ProviderKind::RealEsrgan => match upscaler_core::provider::realesrgan::RealEsrgan::locate(&app.settings.realesrgan_path) {
             Some(_) => (GOOD, tr("Real-ESRGAN hittades. Körs lokalt på grafikkortet, ingen prompt.", "Real-ESRGAN found. Runs locally on the GPU, no prompt.").into()),
             None => (BAD, tr("realesrgan-ncnn-vulkan hittades inte – ange sökvägen.", "realesrgan-ncnn-vulkan not found – set its path.").into()),
         },
         ProviderKind::Basic => (GOOD, tr("Ingen AI: snabb skalning för att testa flödet.", "No AI: quick resize to try the workflow.").into()),
+    }
+}
+
+fn key_status(key: &str, env: &[&str], model: &str) -> (Color32, String) {
+    if upscaler_core::provider::http::key(key, env).is_empty() {
+        (
+            BAD,
+            tr(
+                "Ingen API-nyckel angiven – öppna inställningarna.",
+                "No API key set – open the settings.",
+            )
+            .into(),
+        )
+    } else {
+        (
+            GOOD,
+            format!(
+                "{} {model} · {}",
+                tr("API-nyckel finns ·", "API key set ·"),
+                tr("debiteras per bild", "billed per image")
+            ),
+        )
     }
 }
 
@@ -465,7 +485,17 @@ fn consistency(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     "Varje bildruta skickas tillsammans med den förra, redan uppskalade bildrutan så att detaljer, ansikten och färger hålls lika. Bildrutorna bearbetas då en i taget. Vid scenbyte skickas ingen referens.",
                     "Each frame is sent together with the previous, already upscaled frame so details, faces and colours stay the same. Frames are then processed one at a time. No reference is sent after a scene cut.",
                 ));
-            if app.settings.use_previous_frame {
+            if app.settings.use_previous_frame && !app.settings.reference_supported() {
+                ui.label(
+                    egui::RichText::new(tr(
+                        "Den här tjänsten tar bara en bild åt gången, så ingen referens skickas och bildrutorna kan bearbetas parallellt. Prompten håller ändå stilen.",
+                        "This service takes one image at a time, so no reference is sent and frames can run in parallel. The prompt still keeps the style.",
+                    ))
+                    .small()
+                    .color(WARN),
+                );
+            }
+            if app.settings.use_previous_frame && app.settings.reference_supported() {
                 ui.horizontal(|ui| {
                     ui.label(tr("Scenbyte vid skillnad över", "Scene cut above difference"));
                     ui.add(egui::DragValue::new(&mut app.settings.scene_cut_threshold).range(5.0..=80.0).speed(0.5));

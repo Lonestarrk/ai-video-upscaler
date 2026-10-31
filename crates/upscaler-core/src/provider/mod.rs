@@ -4,6 +4,10 @@
 
 pub mod basic;
 pub mod codex;
+pub mod flux;
+pub mod gemini;
+pub mod grok;
+pub mod http;
 pub mod openai_api;
 pub mod realesrgan;
 
@@ -33,12 +37,21 @@ pub struct Request<'a> {
 
 pub trait Provider: Send + Sync {
     fn upscale(&self, req: &Request, cancel: &AtomicBool) -> Result<RgbImage>;
+
+    /// Aspect ratios (width / height) the model answers in; frames are padded to the nearest.
+    /// Empty: the model keeps any input shape.
+    fn canvas_aspects(&self) -> &'static [f64] {
+        &frame::MODEL_ASPECTS
+    }
 }
 
 pub fn create(settings: &Settings) -> Box<dyn Provider> {
     match settings.provider {
         ProviderKind::ChatGptSubscription => Box::new(codex::Codex::from_settings(settings)),
         ProviderKind::OpenAiApi => Box::new(openai_api::OpenAiApi::from_settings(settings)),
+        ProviderKind::Gemini => Box::new(gemini::Gemini::from_settings(settings)),
+        ProviderKind::Flux => Box::new(flux::Flux::from_settings(settings)),
+        ProviderKind::Grok => Box::new(grok::Grok::from_settings(settings)),
         ProviderKind::RealEsrgan => Box::new(realesrgan::RealEsrgan::from_settings(settings)),
         ProviderKind::Basic => Box::new(basic::Basic),
     }
@@ -84,7 +97,14 @@ pub fn upscale_frame(
         Some(a) => frame::extend_canvas(source, a.ratio()),
         None => source.clone(),
     };
-    let prepared = frame::prepare(&base, settings.pad_to_model_aspect);
+    let aspects: &[f64] = if settings.pad_to_model_aspect {
+        provider.canvas_aspects()
+    } else {
+        &[]
+    };
+    let prepared = frame::prepare_with(&base, aspects);
+    // Services that edit one image at a time get no reference (and no word about one).
+    let reference = reference.filter(|_| settings.reference_supported());
     let reference = reference.map(|r| {
         // Same layout as the frame: resize the reference to the canvas size, then pad alike.
         let small = image::imageops::resize(
@@ -94,7 +114,7 @@ pub fn upscale_frame(
             image::imageops::FilterType::Lanczos3,
         );
         frame::limit_size(
-            &frame::prepare(&small, settings.pad_to_model_aspect).canvas,
+            &frame::prepare_with(&small, aspects).canvas,
             settings.reference_max_side,
         )
     });

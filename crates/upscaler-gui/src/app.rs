@@ -225,7 +225,7 @@ impl UpscalerApp {
                 "FFmpeg is needed to read video. Open Settings ➡ FFmpeg and click \"Download FFmpeg\".",
             ).into());
             self.settings_ui.open = true;
-            self.settings_ui.tab = 3;
+            self.settings_ui.tab = crate::ui::settings_window::TAB_FFMPEG;
             return;
         };
         self.gen += 1;

@@ -12,6 +12,12 @@ pub enum ProviderKind {
     ChatGptSubscription,
     /// OpenAI Images API with an API key (pay as you go).
     OpenAiApi,
+    /// Google Gemini image models ("Nano Banana") with an API key from Google AI Studio.
+    Gemini,
+    /// Black Forest Labs FLUX (Kontext / FLUX.2) with a BFL API key.
+    Flux,
+    /// xAI Grok Imagine with an xAI API key.
+    Grok,
     /// Real-ESRGAN (realesrgan-ncnn-vulkan), free and local, needs a GPU with Vulkan.
     RealEsrgan,
     /// Plain Lanczos resize with a little sharpening: instant, for testing the workflow.
@@ -19,9 +25,12 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 4] = [
+    pub const ALL: [ProviderKind; 7] = [
         ProviderKind::ChatGptSubscription,
         ProviderKind::OpenAiApi,
+        ProviderKind::Gemini,
+        ProviderKind::Flux,
+        ProviderKind::Grok,
         ProviderKind::RealEsrgan,
         ProviderKind::Basic,
     ];
@@ -30,7 +39,11 @@ impl ProviderKind {
     pub fn is_generative(self) -> bool {
         matches!(
             self,
-            ProviderKind::ChatGptSubscription | ProviderKind::OpenAiApi
+            ProviderKind::ChatGptSubscription
+                | ProviderKind::OpenAiApi
+                | ProviderKind::Gemini
+                | ProviderKind::Flux
+                | ProviderKind::Grok
         )
     }
 
@@ -38,6 +51,9 @@ impl ProviderKind {
         match self {
             ProviderKind::ChatGptSubscription => "chatgpt-codex",
             ProviderKind::OpenAiApi => "openai-api",
+            ProviderKind::Gemini => "gemini",
+            ProviderKind::Flux => "flux",
+            ProviderKind::Grok => "grok",
             ProviderKind::RealEsrgan => "realesrgan",
             ProviderKind::Basic => "basic",
         }
@@ -255,6 +271,21 @@ pub struct Settings {
     pub openai_quality: String,
     pub openai_input_fidelity: bool,
 
+    // Google Gemini
+    pub gemini_api_key: String,
+    pub gemini_model: String,
+    /// "1K", "2K" or "4K".
+    pub gemini_image_size: String,
+
+    // Black Forest Labs FLUX
+    pub bfl_api_key: String,
+    /// Endpoint name: "flux-kontext-pro", "flux-kontext-max", "flux-2-pro", …
+    pub bfl_model: String,
+
+    // xAI Grok
+    pub xai_api_key: String,
+    pub xai_model: String,
+
     // Real-ESRGAN
     pub realesrgan_path: String,
     pub realesrgan_model: String,
@@ -318,6 +349,13 @@ impl Default for Settings {
             openai_size: "auto".into(),
             openai_quality: "high".into(),
             openai_input_fidelity: false,
+            gemini_api_key: String::new(),
+            gemini_model: "gemini-3-pro-image".into(),
+            gemini_image_size: "2K".into(),
+            bfl_api_key: String::new(),
+            bfl_model: "flux-kontext-pro".into(),
+            xai_api_key: String::new(),
+            xai_model: "grok-imagine-image-2.0".into(),
             realesrgan_path: String::new(),
             realesrgan_model: "realesrgan-x4plus".into(),
             ffmpeg_dir: String::new(),
@@ -406,6 +444,9 @@ impl Settings {
             .unwrap_or(match self.provider {
                 ProviderKind::ChatGptSubscription => 90.0,
                 ProviderKind::OpenAiApi => 45.0,
+                ProviderKind::Gemini => 25.0,
+                ProviderKind::Flux => 15.0,
+                ProviderKind::Grok => 10.0,
                 ProviderKind::RealEsrgan => 2.0,
                 ProviderKind::Basic => 0.2,
             })
@@ -428,7 +469,19 @@ impl Settings {
 
     /// Whether frames must run one after another (the previous result feeds the next request).
     pub fn sequential(&self) -> bool {
-        self.provider.is_generative() && self.use_previous_frame
+        self.use_previous_frame && self.reference_supported()
+    }
+
+    /// Whether the current service can take the previous frame as a second image.
+    /// FLUX.1 Kontext and Grok edit one image at a time.
+    pub fn reference_supported(&self) -> bool {
+        match self.provider {
+            ProviderKind::ChatGptSubscription | ProviderKind::OpenAiApi | ProviderKind::Gemini => {
+                true
+            }
+            ProviderKind::Flux => !self.bfl_model.contains("kontext"),
+            ProviderKind::Grok | ProviderKind::RealEsrgan | ProviderKind::Basic => false,
+        }
     }
 }
 

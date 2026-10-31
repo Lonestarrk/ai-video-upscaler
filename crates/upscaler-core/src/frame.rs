@@ -52,10 +52,24 @@ pub fn limit_size(img: &RgbImage, max_side: u32) -> RgbImage {
 /// Puts `img` centred on a black canvas of the nearest model aspect when `pad` is set and the
 /// aspect differs by more than 2 %.
 pub fn prepare(img: &RgbImage, pad: bool) -> Prepared {
+    prepare_with(img, if pad { &MODEL_ASPECTS } else { &[] })
+}
+
+/// Like [`prepare`], with the aspect ratios this model produces (`[]`: any, no padding).
+pub fn prepare_with(img: &RgbImage, aspects: &[f64]) -> Prepared {
     let (w, h) = img.dimensions();
     let aspect = w as f64 / h as f64;
-    let target = nearest_model_aspect(aspect);
-    if !pad || (aspect / target - 1.0).abs() < 0.02 {
+    let Some(&target) = aspects.iter().min_by(|a, b| {
+        (a.ln() - aspect.ln())
+            .abs()
+            .total_cmp(&(b.ln() - aspect.ln()).abs())
+    }) else {
+        return Prepared {
+            canvas: img.clone(),
+            content: (0, 0, w, h),
+        };
+    };
+    if (aspect / target - 1.0).abs() < 0.02 {
         return Prepared {
             canvas: img.clone(),
             content: (0, 0, w, h),

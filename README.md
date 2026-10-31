@@ -21,6 +21,9 @@ Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade r
   |---|---|---|---|
   | ChatGPT (prenumeration) | ingår i Plus/Pro/Business | ~1–2 min/bild | via Codex CLI, bäst kvalitet |
   | OpenAI API | per bild | snabbare, parallellt | gpt-image-2, API-nyckel |
+  | Google Gemini (Nano Banana Pro) | per bild, ~0,13 USD i 2K | ~20–30 s/bild | bland de bästa på att behålla identitet, tar referensbildruta, API-nyckel från Google AI Studio |
+  | FLUX (Black Forest Labs) | per bild | ~10–20 s/bild | Kontext: en bild åt gången; FLUX.2: med referensbildruta |
+  | Grok (xAI) | per bild, ~0,02 USD | snabb | billig, en bild åt gången, färre omdömen för trogen restaurering |
   | Real-ESRGAN | gratis, lokalt | sekunder/bild | ingen prompt, kräver GPU med Vulkan |
   | Enkel uppskalning | gratis | direkt | för att testa flödet |
 - **Svenska och engelska**, mörkt tema och justerbar storlek på gränssnittet.
