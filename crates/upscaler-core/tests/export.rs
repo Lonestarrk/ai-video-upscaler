@@ -336,3 +336,59 @@ fn frame_accuracy_on_given_videos() {
         }
     }
 }
+
+/// "Change aspect ratio": a 16:9 video exported as 4:3 through the Codex stand-in. The frame
+/// arrives on a 4:3 canvas with grey above and below, the prompt asks the AI to fill it, and
+/// the exported video is 4:3.
+#[cfg(unix)]
+#[test]
+fn change_aspect_ratio_extends_the_canvas() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tools) = Tools::locate("") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("codex");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncat > ../../last-prompt.txt\ncp input.png ../../last-input.png\ncp input.png output.png\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let src = dir.path().join("in.mp4");
+    make_video(&tools, &src); // 320x180, 16:9
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let mut settings = Settings {
+        provider: ProviderKind::ChatGptSubscription,
+        change_aspect: true,
+        target_aspect: upscaler_core::settings::AspectChoice::Tv4x3,
+        pad_to_model_aspect: false,
+        ..Settings::default()
+    };
+    settings.codex_path = fake.display().to_string();
+    settings.work_dir = dir.path().join("work").display().to_string();
+    assert_eq!(job::geometry(&settings, &info).work, (640, 480));
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 3,
+        output: dir.path().join("43.mp4"),
+        settings,
+    };
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+
+    let prompt = std::fs::read_to_string(dir.path().join("work/last-prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("Change the aspect ratio to 4:3"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("above and below"));
+    let canvas = image::open(dir.path().join("work/last-input.png"))
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(canvas.dimensions(), (320, 240));
+    assert_eq!(canvas.get_pixel(160, 5), &upscaler_core::frame::EXTEND_FILL);
+    let out = ffmpeg::probe(&tools, &spec.output).unwrap();
+    assert_eq!((out.width, out.height), (640, 480));
+}

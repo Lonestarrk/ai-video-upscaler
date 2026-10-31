@@ -94,6 +94,40 @@ pub fn finish(result: &RgbImage, prepared: &Prepared, target: (u32, u32)) -> Rgb
     }
 }
 
+/// Grey used for the empty canvas the AI fills in when it extends the picture.
+pub const EXTEND_FILL: Rgb<u8> = Rgb([128, 128, 128]);
+
+/// Where a picture of aspect `inner` sits, centred, in a canvas of aspect `outer`, as
+/// fractions of the canvas: (x, y, width, height).
+pub fn inner_fraction(inner: f64, outer: f64) -> (f64, f64, f64, f64) {
+    if outer > inner {
+        let w = inner / outer;
+        ((1.0 - w) / 2.0, 0.0, w, 1.0)
+    } else {
+        let h = outer / inner;
+        (0.0, (1.0 - h) / 2.0, 1.0, h)
+    }
+}
+
+/// `img` centred on a grey canvas of aspect `aspect` (wider: grey at the sides; taller:
+/// above and below). The picture keeps its size; the canvas grows.
+pub fn extend_canvas(img: &RgbImage, aspect: f64) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let (cw, ch) = if aspect > w as f64 / h as f64 {
+        (((h as f64 * aspect).round() as u32).max(w), h)
+    } else {
+        (w, ((w as f64 / aspect).round() as u32).max(h))
+    };
+    let mut canvas = RgbImage::from_pixel(cw, ch, EXTEND_FILL);
+    imageops::replace(
+        &mut canvas,
+        img,
+        ((cw - w) / 2) as i64,
+        ((ch - h) / 2) as i64,
+    );
+    canvas
+}
+
 /// A plain resize to `target` followed by a gentle unsharp mask.
 pub fn basic_upscale(img: &RgbImage, target: (u32, u32)) -> RgbImage {
     let up = imageops::resize(img, target.0, target.1, FilterType::Lanczos3);
@@ -148,6 +182,19 @@ mod tests {
     fn portrait_pads_sideways() {
         let p = prepare(&RgbImage::new(1080, 1920), true);
         assert_eq!(p.canvas.dimensions(), (1280, 1920));
+    }
+
+    #[test]
+    fn extend_to_wider_and_taller() {
+        let img = RgbImage::from_pixel(400, 300, Rgb([255, 0, 0]));
+        let wide = extend_canvas(&img, 16.0 / 9.0);
+        assert_eq!(wide.dimensions(), (533, 300));
+        assert_eq!(wide.get_pixel(2, 150), &EXTEND_FILL);
+        assert_eq!(wide.get_pixel(266, 150), &Rgb([255, 0, 0]));
+        let tall = extend_canvas(&img, 9.0 / 16.0);
+        assert_eq!(tall.dimensions(), (400, 711));
+        let (x, y, w, h) = inner_fraction(4.0 / 3.0, 16.0 / 9.0);
+        assert!((w - 0.75).abs() < 1e-9 && h == 1.0 && (x - 0.125).abs() < 1e-9 && y == 0.0);
     }
 
     #[test]

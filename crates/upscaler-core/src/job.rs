@@ -30,6 +30,9 @@ fn pixel_settings_key(s: &Settings) -> Vec<String> {
     if s.provider.is_generative() {
         v.push(s.prompt.clone());
         v.push(s.pad_to_model_aspect.to_string());
+        if let Some(a) = s.aspect_change() {
+            v.push(format!("aspect {}", a.name()));
+        }
     }
     match s.provider {
         crate::settings::ProviderKind::ChatGptSubscription => v.push(s.codex_model.clone()),
@@ -61,6 +64,21 @@ pub struct Geometry {
 pub fn geometry(settings: &Settings, info: &VideoInfo) -> Geometry {
     // The same square-pixel size either way, so previews and finished frames are shared.
     let work = settings.output_size.target(info.width, info.height);
+    if let Some(a) = settings.aspect_change() {
+        // The picture keeps its size and the canvas grows: wider adds width, taller adds height.
+        let (w, h) = (work.0 as f64, work.1 as f64);
+        let even = |v: f64| ((v / 2.0).round() as u32).max(1) * 2;
+        let size = if a.ratio() > w / h {
+            (even(h * a.ratio()), work.1)
+        } else {
+            (work.0, even(w / a.ratio()))
+        };
+        return Geometry {
+            work: size,
+            stored: size,
+            sar: None,
+        };
+    }
     if info.anamorphic() && settings.keep_anamorphic {
         let stored = settings
             .output_size

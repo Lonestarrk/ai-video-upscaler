@@ -76,13 +76,21 @@ pub fn upscale_frame(
             )
         });
     }
-    let prepared = frame::prepare(source, settings.pad_to_model_aspect);
+    // A new aspect ratio: the frame sits on a grey canvas of that shape for the AI to fill.
+    let aspect = settings.aspect_change();
+    let source_aspect = source.width() as f64 / source.height() as f64;
+    let extend = aspect.filter(|a| (a.ratio() / source_aspect - 1.0).abs() > 0.01);
+    let base = match extend {
+        Some(a) => frame::extend_canvas(source, a.ratio()),
+        None => source.clone(),
+    };
+    let prepared = frame::prepare(&base, settings.pad_to_model_aspect);
     let reference = reference.map(|r| {
-        // Same layout as the frame: resize the reference to the source size, then pad alike.
+        // Same layout as the frame: resize the reference to the canvas size, then pad alike.
         let small = image::imageops::resize(
             r,
-            source.width(),
-            source.height(),
+            base.width(),
+            base.height(),
             image::imageops::FilterType::Lanczos3,
         );
         frame::limit_size(
@@ -94,6 +102,7 @@ pub fn upscale_frame(
         user_prompt: &settings.prompt,
         padded: prepared.padded(),
         has_reference: reference.is_some(),
+        extend: extend.map(|a| (a.name(), a.ratio() > source_aspect)),
     });
     let req = Request {
         image: &prepared.canvas,

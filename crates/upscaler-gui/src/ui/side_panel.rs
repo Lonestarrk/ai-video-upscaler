@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32};
 use upscaler_core::job::Stage;
 use upscaler_core::provider::codex::LoginState;
 use upscaler_core::settings::{
-    AiRate, OutputSize, PromptPreset, ProviderKind, VideoCodec, DEFAULT_PROMPT,
+    AiRate, AspectChoice, OutputSize, PromptPreset, ProviderKind, VideoCodec, DEFAULT_PROMPT,
 };
 
 use super::style::{self, primary_button, section, BAD, GOOD, WARN};
@@ -187,8 +187,8 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     };
                     ui.label("");
                     ui.label(egui::RichText::new(text).weak());
-                    ui.end_row();
-                    if i.anamorphic() {
+                    if i.anamorphic() && app.settings.aspect_change().is_none() {
+                        ui.end_row();
                         ui.label("");
                         ui.checkbox(
                             &mut app.settings.keep_anamorphic,
@@ -214,6 +214,7 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 );
                 ui.end_row();
             });
+        aspect_change(ui, app);
         ui.label(
             egui::RichText::new(tr(
                 "Ljudet kopieras alltid oförändrat från originalet.",
@@ -223,6 +224,81 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             .small(),
         );
     });
+}
+
+/// "Change aspect ratio": a checkbox that turns it on and a menu with the ratios.
+fn aspect_change(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    let generative = app.settings.provider.is_generative();
+    ui.add_space(4.0);
+    ui.add_enabled_ui(generative, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut app.settings.change_aspect, tr("Ändra bildformat till", "Change aspect ratio to"))
+                .on_hover_text(tr(
+                    "AI:n fyller ut bilden till det nya formatet genom att fortsätta scenen åt sidorna eller uppåt och nedåt. Inget av originalbilden beskärs bort. Föregående bildruta används som referens så att de utfyllda delarna hålls stabila.",
+                    "The AI extends the picture to the new shape by continuing the scene to the sides or above and below. Nothing of the original is cropped away. The previous frame is used as a reference so the added parts stay stable.",
+                ));
+            ui.add_enabled_ui(app.settings.change_aspect, |ui| {
+                egui::ComboBox::from_id_salt("target_aspect")
+                    .selected_text(aspect_label(app.settings.target_aspect))
+                    .show_ui(ui, |ui| {
+                        for a in AspectChoice::ALL {
+                            ui.selectable_value(&mut app.settings.target_aspect, a, aspect_label(a));
+                        }
+                    });
+            });
+        });
+    });
+    if !generative {
+        ui.label(
+            egui::RichText::new(tr(
+                "Byte av bildformat kräver ChatGPT eller OpenAI API.",
+                "Changing the aspect ratio needs ChatGPT or the OpenAI API.",
+            ))
+            .weak()
+            .small(),
+        );
+    } else if let (Some(a), Some(v)) = (app.settings.aspect_change(), &app.video) {
+        let (w, h) = upscaler_core::job::geometry(&app.settings, &v.info).stored;
+        let src = v.info.width as f64 / v.info.height as f64;
+        let note = if (a.ratio() / src - 1.0).abs() <= 0.01 {
+            tr(
+                "Videon har redan det formatet.",
+                "The video already has that shape.",
+            )
+            .to_string()
+        } else if a.ratio() > src {
+            format!(
+                "{w}×{h} · {}",
+                tr(
+                    "AI:n fyller ut till vänster och höger",
+                    "the AI fills in left and right"
+                )
+            )
+        } else {
+            format!(
+                "{w}×{h} · {}",
+                tr(
+                    "AI:n fyller ut ovanför och nedanför",
+                    "the AI fills in above and below"
+                )
+            )
+        };
+        ui.label(egui::RichText::new(note).weak().small());
+    }
+}
+
+fn aspect_label(a: AspectChoice) -> String {
+    let what = match a {
+        AspectChoice::Wide16x9 => tr("bredbild", "widescreen"),
+        AspectChoice::Tv4x3 => tr("TV", "TV"),
+        AspectChoice::Scope239 => tr("bio, cinemascope", "cinema, scope"),
+        AspectChoice::Flat185 => tr("bio", "cinema"),
+        AspectChoice::Photo3x2 => tr("foto", "photo"),
+        AspectChoice::Square1x1 => tr("kvadrat", "square"),
+        AspectChoice::Portrait4x5 => tr("stående, Instagram", "portrait, Instagram"),
+        AspectChoice::Vertical9x16 => tr("stående, mobil", "vertical, phone"),
+    };
+    format!("{} ({what})", a.name())
 }
 
 fn consistency(ui: &mut egui::Ui, app: &mut UpscalerApp) {

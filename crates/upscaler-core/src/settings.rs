@@ -95,6 +95,60 @@ impl OutputSize {
     }
 }
 
+/// Aspect ratios the AI can extend the picture to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AspectChoice {
+    Wide16x9,
+    Tv4x3,
+    Scope239,
+    Flat185,
+    Photo3x2,
+    Square1x1,
+    Portrait4x5,
+    Vertical9x16,
+}
+
+impl AspectChoice {
+    pub const ALL: [AspectChoice; 8] = [
+        AspectChoice::Wide16x9,
+        AspectChoice::Tv4x3,
+        AspectChoice::Scope239,
+        AspectChoice::Flat185,
+        AspectChoice::Photo3x2,
+        AspectChoice::Square1x1,
+        AspectChoice::Portrait4x5,
+        AspectChoice::Vertical9x16,
+    ];
+
+    /// Width / height.
+    pub fn ratio(self) -> f64 {
+        match self {
+            AspectChoice::Wide16x9 => 16.0 / 9.0,
+            AspectChoice::Tv4x3 => 4.0 / 3.0,
+            AspectChoice::Scope239 => 2.39,
+            AspectChoice::Flat185 => 1.85,
+            AspectChoice::Photo3x2 => 1.5,
+            AspectChoice::Square1x1 => 1.0,
+            AspectChoice::Portrait4x5 => 0.8,
+            AspectChoice::Vertical9x16 => 9.0 / 16.0,
+        }
+    }
+
+    /// The ratio as written in prompts and menus.
+    pub fn name(self) -> &'static str {
+        match self {
+            AspectChoice::Wide16x9 => "16:9",
+            AspectChoice::Tv4x3 => "4:3",
+            AspectChoice::Scope239 => "2.39:1",
+            AspectChoice::Flat185 => "1.85:1",
+            AspectChoice::Photo3x2 => "3:2",
+            AspectChoice::Square1x1 => "1:1",
+            AspectChoice::Portrait4x5 => "4:5",
+            AspectChoice::Vertical9x16 => "9:16",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
     H264,
@@ -187,6 +241,9 @@ pub struct Settings {
     /// Anamorphic sources (non-square pixels, e.g. DVD) are restored with square pixels and
     /// squeezed back to the original pixel aspect ratio in the exported video.
     pub keep_anamorphic: bool,
+    /// Let the AI extend the picture to `target_aspect` (generative providers only).
+    pub change_aspect: bool,
+    pub target_aspect: AspectChoice,
     /// Send the previous upscaled frame as a reference image (sequential processing).
     pub use_previous_frame: bool,
     /// Mean difference (0-255) above which a frame starts a new shot and gets no reference.
@@ -237,6 +294,8 @@ impl Default for Settings {
             output_size: OutputSize::Scale2,
             pad_to_model_aspect: true,
             keep_anamorphic: true,
+            change_aspect: false,
+            target_aspect: AspectChoice::Wide16x9,
             use_previous_frame: true,
             scene_cut_threshold: 28.0,
             skip_duplicates: true,
@@ -310,6 +369,12 @@ impl Settings {
             Some((_, avg)) => *avg = *avg * 0.7 + secs * 0.3,
             None => self.seconds_per_frame.push((id.to_string(), secs)),
         }
+    }
+
+    /// The aspect ratio the AI extends the picture to, when that option is on and the
+    /// provider can do it.
+    pub fn aspect_change(&self) -> Option<AspectChoice> {
+        (self.change_aspect && self.provider.is_generative()).then_some(self.target_aspect)
     }
 
     /// Whether frames must run one after another (the previous result feeds the next request).

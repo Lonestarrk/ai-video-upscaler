@@ -32,7 +32,44 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     ui.painter().rect_filled(rect, 4.0, CANVAS);
 
     let v = app.video.as_ref().unwrap();
-    let aspect = v.info.width as f32 / v.info.height.max(1) as f32;
+    // Everything is laid out on the output canvas. Usually that is the video's own shape; with
+    // "change aspect ratio" it is the new shape and the original sits inside it.
+    let source_aspect = v.info.width as f32 / v.info.height.max(1) as f32;
+    let extending = app.settings.aspect_change().is_some();
+    let aspect = if extending {
+        let (w, h) = upscaler_core::job::geometry(&app.settings, &v.info).work;
+        w as f32 / h.max(1) as f32
+    } else {
+        source_aspect
+    };
+    let inner = upscaler_core::frame::inner_fraction(source_aspect as f64, aspect as f64);
+    let original_rect = |canvas: Rect| -> Rect {
+        let (x, y, w, h) = inner;
+        Rect::from_min_size(
+            canvas.min + egui::vec2(x as f32 * canvas.width(), y as f32 * canvas.height()),
+            egui::vec2(w as f32 * canvas.width(), h as f32 * canvas.height()),
+        )
+    };
+    let canvas_outline = |p: &egui::Painter, canvas: Rect| {
+        if extending {
+            p.rect_stroke(
+                canvas,
+                0.0,
+                Stroke::new(1.0, Color32::from_gray(110)),
+                egui::StrokeKind::Inside,
+            );
+            p.text(
+                canvas.center_bottom() + egui::vec2(0.0, 6.0),
+                egui::Align2::CENTER_TOP,
+                tr(
+                    "AI fyller ut ytan runt bilden",
+                    "The AI fills the area around the picture",
+                ),
+                egui::FontId::proportional(12.0),
+                Color32::from_gray(150),
+            );
+        }
+    };
     let mode = app.settings.compare_mode;
     let panes: Vec<Rect> = match mode {
         CompareMode::SideBySide => {
@@ -106,8 +143,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             let (l, r) = (panes[0], panes[1]);
             let pl = painter.with_clip_rect(l);
             let pr = painter.with_clip_rect(r);
+            let canvas_l = image_rect(l, aspect, &t);
+            canvas_outline(&pl, canvas_l);
             if let Some(tex) = original {
-                pl.image(tex, image_rect(l, aspect, &t), full_uv, Color32::WHITE);
+                pl.image(tex, original_rect(canvas_l), full_uv, Color32::WHITE);
             }
             if let Some((tex, _)) = result {
                 pr.image(tex, image_rect(r, aspect, &t), full_uv, Color32::WHITE);
@@ -141,8 +180,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         }
         CompareMode::Swipe => {
             let img = image_rect(rect, aspect, &t);
+            canvas_outline(&painter, img);
             if let Some(tex) = original {
-                painter.image(tex, img, full_uv, Color32::WHITE);
+                painter.image(tex, original_rect(img), full_uv, Color32::WHITE);
             }
             // The line stays put on screen while zooming and panning.
             let split_x = rect.min.x + rect.width() * t.swipe;
