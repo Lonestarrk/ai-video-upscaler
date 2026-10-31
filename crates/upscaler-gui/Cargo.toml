@@ -1,0 +1,23 @@
+[package]
+name = "upscaler-gui"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "AIVideoUpscaler"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wgpu", "x11", "wayland"] }
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+egui_extras = { version = "0.37", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+rfd = "0.17"
+simplelog = "0.12"
+upscaler-core = { path = "../upscaler-core" }
+
+[build-dependencies]
+winresource = "0.1"

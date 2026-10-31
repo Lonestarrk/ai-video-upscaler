@@ -1,0 +1,768 @@
+//! Application state, event handling and the window layout.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
+use std::time::Instant;
+
+use eframe::egui;
+use image::RgbImage;
+use upscaler_core::ffmpeg::{Tools, VideoInfo};
+use upscaler_core::job::{ExportEvent, ExportSpec, Stage};
+use upscaler_core::provider::codex::LoginState;
+use upscaler_core::settings::Settings;
+
+use crate::i18n::tr;
+use crate::ui;
+use crate::worker::{self, Bus, Event, FrameFetcher, FrameRequest};
+
+pub const VIDEO_EXTENSIONS: [&str; 12] = [
+    "mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "3gp",
+];
+pub const THUMB_COUNT: usize = 40;
+
+/// The loaded video and everything shown about it.
+pub struct Video {
+    pub info: VideoInfo,
+    /// Frame under the playhead.
+    pub current: u64,
+    /// Decoded original of `shown_index`.
+    pub frame: Option<(u64, Arc<RgbImage>, egui::TextureHandle)>,
+    /// Upscaled result shown for `result.0`.
+    pub result: Option<(u64, egui::TextureHandle, (u32, u32))>,
+    pub thumbs: Vec<Option<egui::TextureHandle>>,
+    /// Frames that have a preview with the current settings (as far as this session knows).
+    pub previewed: BTreeSet<u64>,
+    pub in_point: Option<u64>,
+    pub out_point: Option<u64>,
+    /// Frame requested from the fetcher and not yet shown.
+    pub requested: Option<u64>,
+    pub frame_error: Option<String>,
+}
+
+impl Video {
+    /// The export range: in/out points, else the whole video. `end` is exclusive.
+    pub fn range(&self) -> (u64, u64) {
+        let start = self.in_point.unwrap_or(0);
+        let end = self
+            .out_point
+            .map(|o| o + 1)
+            .unwrap_or(self.info.frame_count);
+        if end > start {
+            (start, end)
+        } else {
+            (0, self.info.frame_count)
+        }
+    }
+}
+
+pub struct PreviewJob {
+    pub index: u64,
+    pub started: Instant,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub struct ExportState {
+    pub spec: ExportSpec,
+    pub cancel: Arc<AtomicBool>,
+    pub started: Instant,
+    pub stage: Stage,
+    pub done: u64,
+    pub total: u64,
+    /// Frames finished by the AI in this run, and the seconds they took (for the ETA).
+    pub ai_frames: u64,
+    pub ai_seconds: f64,
+    pub already_done: u64,
+    pub last_frame: Option<egui::TextureHandle>,
+    pub retries: Vec<String>,
+    pub outcome: Option<Result<PathBuf, String>>,
+    pub cancelled: bool,
+}
+
+#[derive(Default)]
+pub struct SettingsUi {
+    pub open: bool,
+    pub tab: usize,
+    pub codex: Option<LoginState>,
+    pub codex_busy: Option<(String, Arc<AtomicBool>)>,
+    pub codex_message: Option<Result<String, String>>,
+    pub ffmpeg_download: Option<(u64, Option<u64>, Arc<AtomicBool>)>,
+    pub ffmpeg_message: Option<Result<String, String>>,
+    pub work_dir_size: Option<u64>,
+    pub show_key: bool,
+}
+
+/// Zoom and pan shared by both halves of the comparison.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewTransform {
+    /// 1.0 = fit to the panel.
+    pub zoom: f32,
+    /// Image point (0..1) shown at the panel centre.
+    pub center: egui::Vec2,
+    /// Swipe line position across the view (0..1).
+    pub swipe: f32,
+}
+
+impl Default for ViewTransform {
+    fn default() -> Self {
+        ViewTransform {
+            zoom: 1.0,
+            center: egui::vec2(0.5, 0.5),
+            swipe: 0.5,
+        }
+    }
+}
+
+pub struct UpscalerApp {
+    pub settings: Settings,
+    saved_settings: Settings,
+    last_save: Instant,
+    pub tools: Option<Tools>,
+    rx: Receiver<Event>,
+    pub bus: Bus,
+    fetcher: FrameFetcher,
+    pub gen: u64,
+    pub loading: Option<PathBuf>,
+    pub video: Option<Video>,
+    pub view: ViewTransform,
+    pub preview: Option<PreviewJob>,
+    pub preview_error: Option<String>,
+    pub export: Option<ExportState>,
+    pub settings_ui: SettingsUi,
+    pub error: Option<String>,
+    /// Settings that change the result: when they change, the shown result is looked up again.
+    result_settings_key: String,
+    pub new_preset_name: String,
+}
+
+impl UpscalerApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        settings: Settings,
+        initial: Option<PathBuf>,
+    ) -> Self {
+        let (tx, rx) = channel();
+        let bus = Bus::new(tx, cc.egui_ctx.clone());
+        cc.egui_ctx
+            .set_zoom_factor(settings.ui_scale.clamp(0.75, 2.5));
+        ui::style::apply(&cc.egui_ctx);
+        let tools = Tools::locate(&settings.ffmpeg_dir);
+        if tools.is_none() {
+            log::warn!("ffmpeg was not found");
+        }
+        worker::codex_status(bus.clone(), settings.codex_path.clone());
+        let fetcher = FrameFetcher::start(bus.clone());
+        let key = result_key(&settings);
+        let mut app = UpscalerApp {
+            saved_settings: settings.clone(),
+            settings,
+            last_save: Instant::now(),
+            tools,
+            rx,
+            bus,
+            fetcher,
+            gen: 0,
+            loading: None,
+            video: None,
+            view: ViewTransform::default(),
+            preview: None,
+            preview_error: None,
+            export: None,
+            settings_ui: SettingsUi::default(),
+            error: None,
+            result_settings_key: key,
+            new_preset_name: String::new(),
+        };
+        if let Some(path) = initial {
+            app.open_video(path);
+        }
+        app
+    }
+
+    pub fn exporting(&self) -> bool {
+        self.export
+            .as_ref()
+            .is_some_and(|e| e.outcome.is_none() && !e.cancelled)
+    }
+
+    // ------------------------------------------------------------ actions
+
+    pub fn open_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter(tr("Video", "Video"), &VIDEO_EXTENSIONS);
+        if let Some(v) = &self.video {
+            if let Some(dir) = v.info.path.parent() {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_video(path);
+        }
+    }
+
+    pub fn open_video(&mut self, path: PathBuf) {
+        if self.exporting() {
+            self.error = Some(
+                tr(
+                    "Vänta tills exporten är klar eller avbryt den först.",
+                    "Wait for the export to finish or cancel it first.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let Some(tools) = self.tools.clone() else {
+            self.error = Some(tr(
+                "FFmpeg behövs för att läsa video. Öppna Inställningar ➡ FFmpeg och klicka \"Hämta FFmpeg\".",
+                "FFmpeg is needed to read video. Open Settings ➡ FFmpeg and click \"Download FFmpeg\".",
+            ).into());
+            self.settings_ui.open = true;
+            self.settings_ui.tab = 3;
+            return;
+        };
+        self.gen += 1;
+        self.loading = Some(path.clone());
+        self.cancel_preview();
+        worker::probe(self.bus.clone(), tools, self.gen, path);
+    }
+
+    pub fn seek(&mut self, index: u64) {
+        let Some(v) = &mut self.video else { return };
+        let index = index.min(v.info.frame_count.saturating_sub(1));
+        let shown = v.frame.as_ref().map(|(i, _, _)| *i);
+        if v.current == index
+            && (v.requested == Some(index) || (v.requested.is_none() && shown == Some(index)))
+        {
+            return;
+        }
+        v.current = index;
+        self.request_frame();
+    }
+
+    fn request_frame(&mut self) {
+        let (Some(v), Some(tools)) = (&mut self.video, &self.tools) else {
+            return;
+        };
+        v.requested = Some(v.current);
+        self.fetcher.request(FrameRequest {
+            gen: self.gen,
+            index: v.current,
+            tools: tools.clone(),
+            info: v.info.clone(),
+            settings: self.settings.clone(),
+        });
+    }
+
+    pub fn start_preview(&mut self) {
+        let Some(v) = &self.video else { return };
+        let Some((idx, src, _)) = &v.frame else {
+            return;
+        };
+        if *idx != v.current {
+            return;
+        }
+        let (idx, src, info) = (*idx, src.clone(), v.info.clone());
+        self.cancel_preview();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview_error = None;
+        self.preview = Some(PreviewJob {
+            index: idx,
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        worker::preview(
+            self.bus.clone(),
+            self.gen,
+            idx,
+            src,
+            self.settings.clone(),
+            info,
+            cancel,
+        );
+    }
+
+    pub fn cancel_preview(&mut self) {
+        if let Some(p) = self.preview.take() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn start_export(&mut self) {
+        let (Some(v), Some(tools)) = (&self.video, &self.tools) else {
+            return;
+        };
+        let stem = v
+            .info
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "video".into());
+        let (w, h) = self
+            .settings
+            .output_size
+            .target(v.info.width, v.info.height);
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("MP4", &["mp4"])
+            .set_file_name(format!("{stem}_upscaled_{h}p.mp4"));
+        if let Some(dir) = v.info.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut output) = dialog.save_file() else {
+            return;
+        };
+        if output.extension().is_none() {
+            output.set_extension("mp4");
+        }
+        if output == v.info.path {
+            self.error = Some(
+                tr(
+                    "Välj ett annat filnamn än originalet.",
+                    "Pick a different file name than the original.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let _ = w;
+        let (start, end) = v.range();
+        let spec = ExportSpec {
+            info: v.info.clone(),
+            start,
+            end,
+            output,
+            settings: self.settings.clone(),
+        };
+        let already_done = upscaler_core::job::frames_already_done(&spec);
+        let cancel = Arc::new(AtomicBool::new(false));
+        log::info!(
+            "export {} frames {start}..{end} to {}",
+            v.info.path.display(),
+            spec.output.display()
+        );
+        worker::export(
+            self.bus.clone(),
+            tools.clone(),
+            spec.clone(),
+            cancel.clone(),
+        );
+        self.export = Some(ExportState {
+            spec,
+            cancel,
+            started: Instant::now(),
+            stage: Stage::Extracting,
+            done: 0,
+            total: 0,
+            ai_frames: 0,
+            ai_seconds: 0.0,
+            already_done,
+            last_frame: None,
+            retries: Vec::new(),
+            outcome: None,
+            cancelled: false,
+        });
+    }
+
+    pub fn reload_tools(&mut self) {
+        self.tools = Tools::locate(&self.settings.ffmpeg_dir);
+    }
+
+    // ------------------------------------------------------------ events
+
+    fn handle_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.rx.try_recv() {
+            self.handle(ctx, event);
+        }
+    }
+
+    fn handle(&mut self, ctx: &egui::Context, event: Event) {
+        match event {
+            Event::Probed { gen, result } if gen == self.gen => {
+                self.loading = None;
+                match result {
+                    Ok(info) => {
+                        log::info!(
+                            "opened {} ({}x{}, {:.3} fps, {} frames)",
+                            info.path.display(),
+                            info.width,
+                            info.height,
+                            info.fps(),
+                            info.frame_count
+                        );
+                        if let Some(tools) = &self.tools {
+                            worker::thumbnails(
+                                self.bus.clone(),
+                                tools.clone(),
+                                gen,
+                                info.clone(),
+                                THUMB_COUNT,
+                            );
+                        }
+                        self.video = Some(Video {
+                            info,
+                            current: 0,
+                            frame: None,
+                            result: None,
+                            thumbs: vec![None; THUMB_COUNT],
+                            previewed: BTreeSet::new(),
+                            in_point: None,
+                            out_point: None,
+                            requested: None,
+                            frame_error: None,
+                        });
+                        self.view = ViewTransform::default();
+                        self.preview_error = None;
+                        self.request_frame();
+                    }
+                    Err(e) => {
+                        self.error = Some(format!(
+                            "{}\n\n{e}",
+                            tr(
+                                "Videon kunde inte öppnas.",
+                                "The video could not be opened."
+                            )
+                        ))
+                    }
+                }
+            }
+            Event::Thumb { gen, slot, image } if gen == self.gen => {
+                if let Some(v) = &mut self.video {
+                    let tex = ctx.load_texture(
+                        format!("thumb{slot}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if let Some(s) = v.thumbs.get_mut(slot) {
+                        *s = Some(tex);
+                    }
+                }
+            }
+            Event::Frame { gen, index, image } if gen == self.gen => {
+                if let Some(v) = &mut self.video {
+                    let tex = load_big_texture(ctx, "frame", &image);
+                    v.frame = Some((index, image, tex));
+                    v.frame_error = None;
+                    if v.requested == Some(index) {
+                        v.requested = None;
+                    }
+                }
+            }
+            Event::FrameFailed { gen, index, error } if gen == self.gen => {
+                if let Some(v) = &mut self.video {
+                    v.frame_error = Some(error);
+                    if v.requested == Some(index) {
+                        v.requested = None;
+                    }
+                }
+            }
+            Event::CachedResult {
+                gen,
+                index,
+                key,
+                image,
+            } if gen == self.gen => {
+                let current_key = self
+                    .video
+                    .as_ref()
+                    .map(|v| upscaler_core::job::preview_path(&self.settings, &v.info, index));
+                if let Some(v) = &mut self.video {
+                    if v.current != index || current_key.as_ref() != Some(&key) {
+                        return;
+                    }
+                    match image {
+                        Some(img) => {
+                            v.previewed.insert(index);
+                            v.result = Some((
+                                index,
+                                load_big_texture(ctx, "result", &img),
+                                img.dimensions(),
+                            ));
+                        }
+                        None => {
+                            v.previewed.remove(&index);
+                            v.result = None;
+                        }
+                    }
+                }
+            }
+            Event::PreviewDone {
+                gen,
+                index,
+                key,
+                result,
+                seconds,
+            } if gen == self.gen => {
+                if self.preview.as_ref().is_some_and(|p| p.index == index) {
+                    self.preview = None;
+                }
+                match result {
+                    Ok(img) => {
+                        if self.settings.provider.is_generative() || seconds > 0.5 {
+                            self.settings
+                                .record_seconds_per_frame(self.settings.provider, seconds);
+                        }
+                        let still_current = self.video.as_ref().is_some_and(|v| {
+                            upscaler_core::job::preview_path(&self.settings, &v.info, index) == key
+                        });
+                        if let Some(v) = &mut self.video {
+                            if still_current {
+                                v.previewed.insert(index);
+                                if v.current == index {
+                                    v.result = Some((
+                                        index,
+                                        load_big_texture(ctx, "result", &img),
+                                        img.dimensions(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e == "cancelled" => {}
+                    Err(e) => self.preview_error = Some(e),
+                }
+            }
+            Event::Export(e) => self.handle_export(e),
+            Event::ExportThumb(img) => {
+                if let Some(x) = &mut self.export {
+                    x.last_frame =
+                        Some(ctx.load_texture("export-last", img, egui::TextureOptions::LINEAR));
+                }
+            }
+            Event::CodexStatus(s) => self.settings_ui.codex = Some(s),
+            Event::CodexAction(r) => {
+                self.settings_ui.codex_busy = None;
+                self.settings_ui.codex_message = Some(r);
+            }
+            Event::FfmpegDownload { done, total } => {
+                if let Some(d) = &mut self.settings_ui.ffmpeg_download {
+                    d.0 = done;
+                    d.1 = total;
+                }
+            }
+            Event::FfmpegDownloaded(r) => {
+                self.settings_ui.ffmpeg_download = None;
+                self.reload_tools();
+                self.settings_ui.ffmpeg_message = Some(match r {
+                    Ok(()) if self.tools.is_some() => {
+                        Ok(tr("FFmpeg är installerat.", "FFmpeg is installed.").into())
+                    }
+                    Ok(()) => Err(tr(
+                        "FFmpeg hämtades men hittas inte.",
+                        "FFmpeg was downloaded but cannot be found.",
+                    )
+                    .into()),
+                    Err(e) => Err(e),
+                });
+            }
+            Event::WorkDirSize(b) => self.settings_ui.work_dir_size = Some(b),
+            _ => {} // stale events from an earlier video
+        }
+    }
+
+    fn handle_export(&mut self, e: ExportEvent) {
+        let Some(x) = &mut self.export else { return };
+        match e {
+            ExportEvent::Progress { stage, done, total } => {
+                x.stage = stage;
+                x.done = done;
+                x.total = total;
+            }
+            ExportEvent::FrameDone {
+                seconds: Some(s), ..
+            } => {
+                x.ai_frames += 1;
+                x.ai_seconds += s as f64;
+                let provider = x.spec.settings.provider;
+                // Parallel requests overlap: the wall-clock time per frame is what estimates need.
+                let per = if x.spec.settings.sequential() {
+                    s
+                } else {
+                    s / x.spec.settings.parallel_requests.max(1) as f32
+                };
+                self.settings.record_seconds_per_frame(provider, per);
+            }
+            ExportEvent::FrameDone { .. } => {}
+            ExportEvent::Retry { n, error } => {
+                x.retries
+                    .push(format!("{} {n}: {error}", tr("Bildruta", "Frame")));
+            }
+            ExportEvent::Finished(p) => {
+                log::info!("export finished: {}", p.display());
+                x.outcome = Some(Ok(p));
+            }
+            ExportEvent::Failed(err) => x.outcome = Some(Err(err)),
+            ExportEvent::Cancelled => x.cancelled = true,
+        }
+    }
+
+    /// Saves changed settings (at most every half second) and refreshes the shown result
+    /// when a setting that changes it was edited.
+    fn persist(&mut self) {
+        if self.settings != self.saved_settings && self.last_save.elapsed().as_millis() > 500 {
+            if let Err(e) = self.settings.save() {
+                log::warn!("could not save settings: {e}");
+            }
+            self.saved_settings = self.settings.clone();
+            self.last_save = Instant::now();
+        }
+        let key = result_key(&self.settings);
+        if key != self.result_settings_key {
+            self.result_settings_key = key;
+            if let Some(v) = &mut self.video {
+                v.previewed.clear();
+                v.result = None;
+                worker::check_cached(
+                    self.bus.clone(),
+                    self.gen,
+                    v.current,
+                    self.settings.clone(),
+                    v.info.clone(),
+                );
+            }
+        }
+    }
+
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        if let Some(path) = dropped.into_iter().find(|p| is_video(p) || p.is_file()) {
+            self.open_video(path);
+        }
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let Some(v) = &self.video else { return };
+        let (cur, fps, last) = (
+            v.current,
+            v.info.fps().round().max(1.0) as u64,
+            v.info.frame_count.saturating_sub(1),
+        );
+        let mut target: Option<u64> = None;
+        ctx.input(|i| {
+            let step = if i.modifiers.shift { fps } else { 1 };
+            if i.key_pressed(egui::Key::ArrowRight) {
+                target = Some((cur + step).min(last));
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                target = Some(cur.saturating_sub(step));
+            }
+            if i.key_pressed(egui::Key::Home) {
+                target = Some(0);
+            }
+            if i.key_pressed(egui::Key::End) {
+                target = Some(last);
+            }
+        });
+        let (set_in, set_out, preview) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::I),
+                i.key_pressed(egui::Key::O),
+                i.key_pressed(egui::Key::P),
+            )
+        });
+        if let Some(t) = target {
+            self.seek(t);
+        }
+        if let Some(v) = &mut self.video {
+            if set_in {
+                v.in_point = Some(v.current);
+            }
+            if set_out {
+                v.out_point = Some(v.current);
+            }
+        }
+        if preview && self.preview.is_none() {
+            self.start_preview();
+        }
+    }
+}
+
+fn result_key(s: &Settings) -> String {
+    let mut s = s.clone();
+    // Only fields that change the pixels matter; zero the rest.
+    s.compare_mode = upscaler_core::settings::CompareMode::SideBySide;
+    s.ui_scale = 1.0;
+    s.seconds_per_frame.clear();
+    s.presets.clear();
+    s.language.clear();
+    s.video_codec = upscaler_core::settings::VideoCodec::H264;
+    s.crf = 0;
+    s.ai_rate = upscaler_core::settings::AiRate::All;
+    s.parallel_requests = 0;
+    s.use_previous_frame = false;
+    s.skip_duplicates = false;
+    s.scene_cut_threshold = 0.0;
+    format!("{s:?}")
+}
+
+pub fn is_video(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Uploads a frame, shrinking it first if it exceeds the GPU's texture limit.
+fn load_big_texture(ctx: &egui::Context, name: &str, img: &RgbImage) -> egui::TextureHandle {
+    let max = ctx.input(|i| i.max_texture_side).max(2048) as u32;
+    let color = if img.width() > max || img.height() > max {
+        let small = upscaler_core::frame::limit_size(img, max);
+        worker::to_color_image(&small)
+    } else {
+        worker::to_color_image(img)
+    };
+    ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
+}
+
+impl eframe::App for UpscalerApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_events(ctx);
+        self.handle_drops(ctx);
+        self.handle_keys(ctx);
+        self.persist();
+        if self.preview.is_some()
+            || self.exporting()
+            || self.settings_ui.codex_busy.is_some()
+            || self.loading.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let zoom = self.settings.ui_scale.clamp(0.75, 2.5);
+        if (ui.ctx().zoom_factor() - zoom).abs() > 0.001 {
+            ui.ctx().set_zoom_factor(zoom);
+        }
+        egui::Panel::top("toolbar").show(ui, |ui| ui::toolbar::show(ui, self));
+        egui::Panel::right("side")
+            .resizable(true)
+            .default_size(360.0)
+            .min_size(300.0)
+            .show(ui, |ui| ui::side_panel::show(ui, self));
+        if self.video.is_some() {
+            egui::Panel::bottom("timeline")
+                .resizable(false)
+                .show(ui, |ui| ui::timeline::show(ui, self));
+        }
+        egui::CentralPanel::default().show(ui, |ui| ui::viewer::show(ui, self));
+        ui::settings_window::show(ui.ctx(), self);
+        ui::dialogs::show(ui.ctx(), self);
+        ui::dialogs::drop_overlay(ui.ctx());
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(x) = &self.export {
+            x.cancel.store(true, Ordering::Relaxed);
+        }
+        self.cancel_preview();
+        let _ = self.settings.save();
+    }
+}

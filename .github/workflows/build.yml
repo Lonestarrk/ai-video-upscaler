@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build -p upscaler-gui --release
+      - name: Bundle FFmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-tmp
+          New-Item -ItemType Directory -Force installer\ffmpeg | Out-Null
+          Get-ChildItem ffmpeg-tmp -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination installer\ffmpeg
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'upscaler-gui' | Select-Object -ExpandProperty version
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\upscaler.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIVideoUpscaler-windows
+          path: |
+            target/release/AIVideoUpscaler.exe
+            installer/Output/*.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p upscaler-gui --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIVideoUpscaler-macos
+          path: target/release/AIVideoUpscaler
