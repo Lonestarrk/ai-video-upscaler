@@ -1,6 +1,7 @@
 //! Everything that is not user interface: settings, FFmpeg, the AI providers, the frame
 //! pipeline (padding, prompts, consistency) and the export job.
 
+pub mod aspect;
 pub mod cache;
 pub mod ffmpeg;
 pub mod ffmpeg_download;

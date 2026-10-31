@@ -41,6 +41,12 @@ pub struct Video {
     /// Frame requested from the fetcher and not yet shown.
     pub requested: Option<u64>,
     pub frame_error: Option<String>,
+    /// Frame shape chosen by the user instead of the file's flag (`None`: from the file).
+    pub frame_aspect: Option<(u32, u32)>,
+    /// Whether the picture's shape looks like a standard one, measured when the video opened.
+    pub aspect_check: upscaler_core::aspect::Check,
+    /// The user answered the "flagged wrongly?" warning (chose or kept a shape).
+    pub aspect_hint_done: bool,
 }
 
 impl Video {
@@ -385,6 +391,8 @@ impl UpscalerApp {
                             None
                         };
                         let info = info.with_crop(crop);
+                        let aspect_check = upscaler_core::aspect::check(&info);
+                        log::info!("aspect check: {aspect_check:?}");
                         log::info!(
                             "opened {} ({}x{}, {:.3} fps, {} frames)",
                             info.path.display(),
@@ -413,6 +421,9 @@ impl UpscalerApp {
                             out_point: None,
                             requested: None,
                             frame_error: None,
+                            frame_aspect: None,
+                            aspect_check,
+                            aspect_hint_done: false,
                         });
                         self.view = ViewTransform::default();
                         self.preview_error = None;
@@ -609,7 +620,8 @@ impl UpscalerApp {
             self.saved_settings = self.settings.clone();
             self.last_save = Instant::now();
         }
-        // "Remove black bars" toggled: the picture itself changes, so it is decoded again.
+        // "Remove black bars" toggled or the source's shape changed: the picture itself
+        // changes, so it is decoded again.
         let mut refetch = false;
         if let Some(v) = &mut self.video {
             let wanted = if self.settings.remove_black_bars {
@@ -617,8 +629,9 @@ impl UpscalerApp {
             } else {
                 None
             };
-            if v.info.crop != wanted {
-                v.info = v.info.with_crop(wanted);
+            let wanted_sar = v.info.with_frame_aspect(v.frame_aspect).sar;
+            if v.info.crop != wanted || v.info.sar != wanted_sar {
+                v.info = v.info.with_frame_aspect(v.frame_aspect).with_crop(wanted);
                 v.frame = None;
                 v.result = None;
                 v.previewed.clear();

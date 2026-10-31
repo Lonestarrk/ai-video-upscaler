@@ -102,6 +102,8 @@ pub struct VideoInfo {
     pub interlaced: bool,
     /// Pixel aspect ratio as stored (32:27 for NTSC 16:9 DVD); (1, 1) for square pixels.
     pub sar: (u32, u32),
+    /// The pixel aspect ratio the file declares (`sar` differs when the user overrides it).
+    pub declared_sar: (u32, u32),
     /// Timestamp (s) of the first video frame; frame `n` is at `start_time + n / fps`.
     pub start_time: f64,
     /// Frame rate as a fraction.
@@ -141,12 +143,50 @@ impl VideoInfo {
             .crop
             .map(|c| format!("|crop {}x{}+{}+{}", c.w, c.h, c.x, c.y))
             .unwrap_or_default();
+        let sar = if self.sar != self.declared_sar {
+            format!("|sar {}:{}", self.sar.0, self.sar.1)
+        } else {
+            String::new()
+        };
         format!(
-            "{}|{}|{}{crop}",
+            "{}|{}|{}{crop}{sar}",
             self.path.display(),
             self.file_size,
             self.modified
         )
+    }
+
+    /// This video with the whole stored frame shown at `dar` (width:height) instead of what
+    /// the file declares (`None`: as declared). Used when a file is flagged wrongly.
+    pub fn with_frame_aspect(&self, dar: Option<(u32, u32)>) -> VideoInfo {
+        if self.rotated {
+            return self.clone();
+        }
+        let sar = match dar {
+            None => self.declared_sar,
+            Some((n, d)) => {
+                let (a, b) = (
+                    n as u64 * self.source_height as u64,
+                    d as u64 * self.source_width as u64,
+                );
+                if (a as f64 / b as f64 - 1.0).abs() < 0.01 {
+                    (1, 1)
+                } else {
+                    let g = gcd(a, b);
+                    ((a / g) as u32, (b / g) as u32)
+                }
+            }
+        };
+        let mut v = self.clone();
+        v.sar = sar;
+        v.with_crop(self.crop)
+    }
+
+    /// Display aspect ratio of the whole stored frame as declared by the file.
+    pub fn declared_frame_aspect(&self) -> f64 {
+        self.source_width as f64 * self.declared_sar.0 as f64
+            / self.declared_sar.1 as f64
+            / self.source_height as f64
     }
 
     /// This video cut to `crop` (or uncut with `None`): sizes are recomputed from the
@@ -168,6 +208,14 @@ impl VideoInfo {
             v.height = ch;
         }
         v
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a.max(1)
+    } else {
+        gcd(b, a % b)
     }
 }
 
@@ -268,6 +316,7 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
         rotated,
         interlaced,
         sar,
+        declared_sar: sar,
         start_time,
         fps_num,
         fps_den,

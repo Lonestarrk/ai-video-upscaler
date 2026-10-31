@@ -327,9 +327,12 @@ fn frame_accuracy_on_given_videos() {
             info.frame_count,
             info.interlaced
         );
+        let mut checked = info.clone();
+        checked.detected_crop = ffmpeg::detect_black_bars(&tools, &info);
+        eprintln!("  black bars: {:?}", checked.detected_crop);
         eprintln!(
-            "  black bars: {:?}",
-            ffmpeg::detect_black_bars(&tools, &info)
+            "  aspect check: {:?}",
+            upscaler_core::aspect::check(&checked)
         );
         let last = info.frame_count - 1;
         for n in [0, 1, 2, 100, 333, 548, 777, last / 2, last - 30] {
@@ -482,4 +485,74 @@ fn letterbox_is_detected_and_removed() {
     make_video(&tools, &full);
     let info = ffmpeg::probe(&tools, &full).unwrap();
     assert_eq!(ffmpeg::detect_black_bars(&tools, &info), None);
+}
+
+/// A 2.35:1 film letterboxed in a 4:3 PAL frame but flagged 16:9: the check notices that the
+/// picture would be 3.14:1, suggests 4:3, and with that the export is 2.35:1 and flagged right.
+#[test]
+fn wrongly_flagged_dvd_is_detected_and_fixed() {
+    let Some(tools) = Tools::locate("") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("wrong.mpg");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=768x326:rate=25:duration=12",
+        ])
+        .args([
+            "-vf",
+            "scale=720:326,pad=720:576:0:125:black",
+            "-target",
+            "pal-dvd",
+            "-aspect",
+            "16:9",
+        ])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut info = ffmpeg::probe(&tools, &src).unwrap();
+    info.detected_crop = ffmpeg::detect_black_bars(&tools, &info);
+    let check = upscaler_core::aspect::check(&info);
+    assert!(check.standard.is_none(), "{check:?}");
+    assert_eq!(check.suggestions.len(), 1);
+    let s = &check.suggestions[0];
+    assert_eq!((s.frame, s.picture_name), ((4, 3), "2.35:1"));
+
+    let fixed = info
+        .with_frame_aspect(Some(s.frame))
+        .with_crop(info.detected_crop);
+    assert_eq!(fixed.sar, (16, 15));
+    assert!((fixed.width as f64 / fixed.height as f64 - 2.35).abs() < 0.03);
+    let mut settings = Settings {
+        provider: ProviderKind::Basic,
+        ..Settings::default()
+    };
+    settings.work_dir = dir.path().join("work").display().to_string();
+    let spec = ExportSpec {
+        info: fixed,
+        start: 20,
+        end: 24,
+        output: dir.path().join("fixed.mp4"),
+        settings,
+    };
+    assert_eq!(
+        run(&tools, &spec).last().map(String::as_str),
+        Some("finished")
+    );
+    let out = ffmpeg::probe(&tools, &spec.output).unwrap();
+    assert_eq!(out.sar, (16, 15));
+    assert!(
+        (out.width as f64 / out.height as f64 - 2.35).abs() < 0.03,
+        "{}x{}",
+        out.width,
+        out.height
+    );
 }

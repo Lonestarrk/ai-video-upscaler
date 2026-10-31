@@ -214,6 +214,7 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 );
                 ui.end_row();
             });
+        source_aspect(ui, app);
         black_bars(ui, app);
         aspect_change(ui, app);
         ui.label(
@@ -225,6 +226,124 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             .small(),
         );
     });
+}
+
+/// Frame shapes the user can give the source instead of its flag.
+const FRAME_CHOICES: [((u32, u32), &str); 5] = [
+    ((4, 3), "4:3"),
+    ((16, 9), "16:9"),
+    ((185, 100), "1.85:1"),
+    ((235, 100), "2.35:1"),
+    ((239, 100), "2.39:1"),
+];
+
+fn ratio_name(r: f64) -> String {
+    upscaler_core::aspect::standard_name(r)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{r:.2}:1"))
+}
+
+/// "Source aspect ratio": what the file declares, a warning with suggestions when that looks
+/// wrong, and a menu to set it by hand.
+fn source_aspect(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    let Some(v) = &mut app.video else { return };
+    let declared = v.info.declared_frame_aspect();
+    let declared_name = ratio_name(declared);
+    let square = (v.info.source_width, v.info.source_height);
+    let label = |choice: Option<(u32, u32)>| -> String {
+        match choice {
+            None => format!("{} ({declared_name})", tr("Från filen", "From the file")),
+            Some(c) if c == square => format!(
+                "{} ({}×{})",
+                tr("Kvadratiska pixlar", "Square pixels"),
+                square.0,
+                square.1
+            ),
+            Some(c) => FRAME_CHOICES
+                .iter()
+                .find(|(f, _)| *f == c)
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_default(),
+        }
+    };
+    ui.add_space(4.0);
+    let mut chosen = v.frame_aspect;
+    ui.horizontal(|ui| {
+        ui.label(tr("Källans bildformat", "Source aspect ratio")).on_hover_text(tr(
+            "Hur hela bildrutan i filen ska visas. Ändra bara om filen är felflaggad: personer ser smala eller breda ut, runda saker är ovala.",
+            "How the whole frame in the file is shown. Only change it if the file is flagged wrongly: people look thin or wide, round things are oval.",
+        ));
+        egui::ComboBox::from_id_salt("source_aspect").selected_text(label(chosen)).show_ui(ui, |ui| {
+            ui.selectable_value(&mut chosen, None, label(None));
+            for (f, _) in FRAME_CHOICES {
+                ui.selectable_value(&mut chosen, Some(f), label(Some(f)));
+            }
+            ui.selectable_value(&mut chosen, Some(square), label(Some(square)));
+        });
+    });
+    if chosen != v.frame_aspect {
+        v.frame_aspect = chosen;
+        v.aspect_hint_done = true;
+    }
+
+    let check = v.aspect_check.clone();
+    let picture_now = v.info.width as f64 / v.info.height.max(1) as f64;
+    if v.frame_aspect.is_none() && !v.aspect_hint_done && check.standard.is_none() {
+        egui::Frame::new()
+            .fill(WARN.linear_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, WARN.linear_multiply(0.6)))
+            .corner_radius(4.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(format!("⚠ {}", tr("Bildformatet kan vara felflaggat", "The aspect ratio may be flagged wrongly"))).color(WARN).strong());
+                ui.label(format!(
+                    "{} {:.2}:1 {} ({declared_name}). {}",
+                    tr("Bilden blir", "The picture comes out at"),
+                    check.picture,
+                    tr("med filens flagga", "with the file's flag"),
+                    tr("Det är inget vanligt film- eller TV-format.", "That is no usual film or TV shape."),
+                ));
+                if check.suggestions.is_empty() {
+                    ui.label(egui::RichText::new(tr(
+                        "Kontrollera i svepläget att runda saker ser runda ut, och välj annars format ovan.",
+                        "Check in swipe mode that round things look round, otherwise choose a shape above.",
+                    )).small());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for sug in &check.suggestions {
+                        let text = format!(
+                            "{} {} ({} {})",
+                            tr("Använd", "Use"),
+                            sug.frame_name,
+                            tr("bilden blir", "picture becomes"),
+                            sug.picture_name
+                        );
+                        if ui.button(text).clicked() {
+                            v.frame_aspect = Some(sug.frame);
+                            v.aspect_hint_done = true;
+                        }
+                    }
+                    if ui.button(tr("Behåll filens", "Keep the file's")).clicked() {
+                        v.aspect_hint_done = true;
+                    }
+                });
+            });
+    } else {
+        let note = match v.frame_aspect {
+            Some(_) => format!(
+                "{} {declared_name} · {} {}",
+                tr("Filen säger", "The file says"),
+                tr("bilden visas nu som", "the picture is now shown as"),
+                ratio_name(picture_now)
+            ),
+            None => format!(
+                "{} {}",
+                tr("Bilden:", "Picture:"),
+                ratio_name(check.picture)
+            ),
+        };
+        ui.label(egui::RichText::new(note).weak().small());
+    }
 }
 
 /// "Remove black bars": letterbox/pillarbox found when the video was opened.
