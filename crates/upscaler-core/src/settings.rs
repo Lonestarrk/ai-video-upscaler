@@ -241,6 +241,8 @@ pub struct Settings {
     /// Anamorphic sources (non-square pixels, e.g. DVD) are restored with square pixels and
     /// squeezed back to the original pixel aspect ratio in the exported video.
     pub keep_anamorphic: bool,
+    /// Cut away black bars (letterbox/pillarbox) found in the video before anything else.
+    pub remove_black_bars: bool,
     /// Let the AI extend the picture to `target_aspect` (generative providers only).
     pub change_aspect: bool,
     pub target_aspect: AspectChoice,
@@ -294,6 +296,7 @@ impl Default for Settings {
             output_size: OutputSize::Scale2,
             pad_to_model_aspect: true,
             keep_anamorphic: true,
+            remove_black_bars: true,
             change_aspect: false,
             target_aspect: AspectChoice::Wide16x9,
             use_previous_frame: true,

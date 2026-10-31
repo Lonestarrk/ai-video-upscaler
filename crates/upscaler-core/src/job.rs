@@ -25,12 +25,12 @@ use crate::provider;
 use crate::settings::Settings;
 
 /// Everything about the settings that changes the resulting pixels.
-fn pixel_settings_key(s: &Settings) -> Vec<String> {
+fn pixel_settings_key(s: &Settings, info: &VideoInfo) -> Vec<String> {
     let mut v = vec![s.provider.id().to_string(), format!("{:?}", s.output_size)];
     if s.provider.is_generative() {
         v.push(s.prompt.clone());
         v.push(s.pad_to_model_aspect.to_string());
-        if let Some(a) = s.aspect_change() {
+        if let Some(a) = extension(s, info) {
             v.push(format!("aspect {}", a.name()));
         }
     }
@@ -61,10 +61,19 @@ pub struct Geometry {
     pub sar: Option<(u32, u32)>,
 }
 
+/// The aspect ratio the AI extends this video to: the chosen one, unless the picture
+/// already has it (within 1 %).
+pub fn extension(settings: &Settings, info: &VideoInfo) -> Option<crate::settings::AspectChoice> {
+    let source = info.width as f64 / info.height.max(1) as f64;
+    settings
+        .aspect_change()
+        .filter(|a| (a.ratio() / source - 1.0).abs() > 0.01)
+}
+
 pub fn geometry(settings: &Settings, info: &VideoInfo) -> Geometry {
     // The same square-pixel size either way, so previews and finished frames are shared.
     let work = settings.output_size.target(info.width, info.height);
-    if let Some(a) = settings.aspect_change() {
+    if let Some(a) = extension(settings, info) {
         // The picture keeps its size and the canvas grows: wider adds width, taller adds height.
         let (w, h) = (work.0 as f64, work.1 as f64);
         let even = |v: f64| ((v / 2.0).round() as u32).max(1) * 2;
@@ -101,7 +110,7 @@ pub fn geometry(settings: &Settings, info: &VideoInfo) -> Geometry {
 
 /// Where the preview of `frame` with the current settings is cached.
 pub fn preview_path(settings: &Settings, info: &VideoInfo, frame: u64) -> PathBuf {
-    let mut parts = pixel_settings_key(settings);
+    let mut parts = pixel_settings_key(settings, info);
     parts.push(info.identity());
     parts.push(frame.to_string());
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
@@ -212,7 +221,7 @@ impl ExportSpec {
     }
 
     pub fn job_dir(&self) -> PathBuf {
-        let mut parts = pixel_settings_key(&self.settings);
+        let mut parts = pixel_settings_key(&self.settings, &self.info);
         parts.extend([
             self.info.identity(),
             self.start.to_string(),

@@ -70,6 +70,15 @@ impl Tools {
     }
 }
 
+/// A rectangle cut out of the decoded picture (in stored pixels), e.g. to drop letterbox bars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crop {
+    pub w: u32,
+    pub h: u32,
+    pub x: u32,
+    pub y: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoInfo {
     pub path: PathBuf,
@@ -77,9 +86,18 @@ pub struct VideoInfo {
     /// 720x480/576 with non-square pixels; this is the size they are shown at, e.g. 854x480.
     pub width: u32,
     pub height: u32,
-    /// Size as stored in the file.
+    /// Size as stored in the file (of the cropped area when `crop` is set).
     pub coded_width: u32,
     pub coded_height: u32,
+    /// Full stored size, before any crop.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Black bars (letterbox/pillarbox) found in the picture, if any.
+    pub detected_crop: Option<Crop>,
+    /// The crop in use: every decoded frame is cut to it.
+    pub crop: Option<Crop>,
+    /// Stored sideways with a rotation tag (phones); such videos are never cropped.
+    pub rotated: bool,
     /// Interlaced (typical for DVD and TV): frames are deinterlaced when decoded.
     pub interlaced: bool,
     /// Pixel aspect ratio as stored (32:27 for NTSC 16:9 DVD); (1, 1) for square pixels.
@@ -117,14 +135,39 @@ impl VideoInfo {
         ((seconds * self.fps()).floor().max(0.0) as u64).min(self.frame_count.saturating_sub(1))
     }
 
-    /// Identifies this exact file (path, size and modification time) for caches.
+    /// Identifies this exact file (path, size and modification time) and crop for caches.
     pub fn identity(&self) -> String {
+        let crop = self
+            .crop
+            .map(|c| format!("|crop {}x{}+{}+{}", c.w, c.h, c.x, c.y))
+            .unwrap_or_default();
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}{crop}",
             self.path.display(),
             self.file_size,
             self.modified
         )
+    }
+
+    /// This video cut to `crop` (or uncut with `None`): sizes are recomputed from the
+    /// stored size and the pixel aspect ratio.
+    pub fn with_crop(&self, crop: Option<Crop>) -> VideoInfo {
+        let mut v = self.clone();
+        // A rotated video keeps its full frame: crop rectangles are in unrotated pixels.
+        let rotated = self.rotated;
+        let crop = crop.filter(|_| !rotated);
+        let (cw, ch) = crop
+            .map(|c| (c.w, c.h))
+            .unwrap_or((self.source_width, self.source_height));
+        v.crop = crop;
+        v.coded_width = cw;
+        v.coded_height = ch;
+        if !rotated {
+            let (n, d) = self.sar;
+            v.width = ((cw as f64 * n as f64 / d as f64 / 2.0).round() as u32).max(1) * 2;
+            v.height = ch;
+        }
+        v
     }
 }
 
@@ -184,7 +227,8 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
                 .and_then(|r| r.parse().ok())
         })
         .unwrap_or(0.0);
-    if (rotation.abs() - 90.0).abs() < 1.0 || (rotation.abs() - 270.0).abs() < 1.0 {
+    let rotated = (rotation.abs() - 90.0).abs() < 1.0 || (rotation.abs() - 270.0).abs() < 1.0;
+    if rotated {
         std::mem::swap(&mut width, &mut height);
     }
     let (fps_num, fps_den) = video["avg_frame_rate"]
@@ -217,6 +261,11 @@ pub fn parse_probe(path: &Path, json: &str) -> Result<VideoInfo> {
         height,
         coded_width,
         coded_height,
+        source_width: coded_width,
+        source_height: coded_height,
+        detected_crop: None,
+        crop: None,
+        rotated,
         interlaced,
         sar,
         start_time,
@@ -277,6 +326,9 @@ fn filter_chain(info: &VideoInfo, select: Option<&str>, w: u32, h: u32) -> Strin
     }
     if let Some(s) = select {
         parts.push(s.to_string());
+    }
+    if let Some(c) = info.crop {
+        parts.push(format!("crop={}:{}:{}:{}", c.w, c.h, c.x, c.y));
     }
     parts.push(format!("scale={w}:{h}:flags=bicubic,setsar=1"));
     parts.join(",")
@@ -350,6 +402,109 @@ pub fn grab_frame(
         bail!("could not decode frame {index}: {}", out.tail(4));
     }
     RgbImage::from_raw(w, h, out.stdout[..need].to_vec()).ok_or_else(|| anyhow!("bad frame buffer"))
+}
+
+/// Finds black bars (letterbox above/below, pillarbox at the sides) by running `cropdetect`
+/// on a few frames at ten points in the video. The least aggressive result wins, so a dark
+/// scene never crops into the picture; bars thinner than 2 % are ignored.
+pub fn detect_black_bars(tools: &Tools, info: &VideoInfo) -> Option<Crop> {
+    if info.rotated {
+        return None;
+    }
+    let (fw, fh) = (info.source_width, info.source_height);
+    let mut best: Option<Crop> = None;
+    let mut samples = 0;
+    for i in 1..=10 {
+        let t = info.duration * i as f64 / 11.0;
+        let mut cmd = command(&tools.ffmpeg);
+        cmd.args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "info",
+            "-noaccurate_seek",
+            "-ss",
+        ])
+        .arg(format!("{t:.3}"))
+        .arg("-i")
+        .arg(&info.path)
+        .args([
+            "-frames:v",
+            "8",
+            "-an",
+            "-sn",
+            "-vf",
+            "cropdetect=limit=24:round=2:reset=0",
+            "-f",
+            "null",
+            "-",
+        ]);
+        let Ok(out) = process::run(
+            cmd,
+            None,
+            &AtomicBool::new(false),
+            Some(std::time::Duration::from_secs(30)),
+        ) else {
+            continue;
+        };
+        let Some(c) = out.stderr_text().lines().rev().find_map(parse_cropdetect) else {
+            continue;
+        };
+        // A nearly black frame reports a tiny or empty area: no information.
+        if c.w < fw / 3 || c.h < fh / 3 {
+            continue;
+        }
+        samples += 1;
+        best = Some(match best {
+            None => c,
+            Some(b) => {
+                // Union of the two: keep everything either sample saw as picture.
+                let x0 = b.x.min(c.x);
+                let y0 = b.y.min(c.y);
+                let x1 = (b.x + b.w).max(c.x + c.w);
+                let y1 = (b.y + b.h).max(c.y + c.h);
+                Crop {
+                    w: x1 - x0,
+                    h: y1 - y0,
+                    x: x0,
+                    y: y0,
+                }
+            }
+        });
+    }
+    let c = best.filter(|_| samples >= 3)?;
+    let even = |v: u32| v & !1;
+    let c = Crop {
+        w: even(c.w),
+        h: even(c.h),
+        x: even(c.x),
+        y: even(c.y),
+    };
+    let meaningful = (c.w as f64) < fw as f64 * 0.98 || (c.h as f64) < fh as f64 * 0.98;
+    meaningful.then_some(c)
+}
+
+/// `crop=720:432:0:72` from a cropdetect log line.
+fn parse_cropdetect(line: &str) -> Option<Crop> {
+    let spec = line
+        .rsplit("crop=")
+        .next()
+        .filter(|_| line.contains("crop="))?;
+    let mut it = spec
+        .split_whitespace()
+        .next()?
+        .split(':')
+        .map(|v| v.parse::<i64>().ok());
+    let (w, h, x, y) = (it.next()??, it.next()??, it.next()??, it.next()??);
+    if w <= 0 || h <= 0 || x < 0 || y < 0 {
+        return None;
+    }
+    Some(Crop {
+        w: w as u32,
+        h: h as u32,
+        x: x as u32,
+        y: y as u32,
+    })
 }
 
 /// What [`extract_range`] produces.
@@ -594,6 +749,38 @@ mod tests {
         );
         assert!(info.has_audio);
         assert!((info.fps() - 23.976).abs() < 0.01);
+    }
+
+    #[test]
+    fn cropdetect_lines_and_crop_sizes() {
+        let line = "[Parsed_cropdetect_0 @ 0x5] x1:0 x2:719 y1:72 y2:503 w:720 h:432 x:0 y:72 pts:1 t:0.04 limit:0.09 crop=720:432:0:72";
+        assert_eq!(
+            parse_cropdetect(line),
+            Some(Crop {
+                w: 720,
+                h: 432,
+                x: 0,
+                y: 72
+            })
+        );
+        assert_eq!(parse_cropdetect("crop=-720:-576:719:575"), None);
+        let json = r#"{"streams":[{"codec_type":"video","width":720,"height":576,"sample_aspect_ratio":"16:15",
+            "avg_frame_rate":"25/1"}],"format":{"duration":"1"}}"#;
+        let info = parse_probe(Path::new("x.vob"), json).unwrap();
+        let cropped = info.with_crop(Some(Crop {
+            w: 720,
+            h: 432,
+            x: 0,
+            y: 72,
+        }));
+        assert_eq!((cropped.width, cropped.height), (768, 432));
+        assert_eq!((cropped.coded_width, cropped.coded_height), (720, 432));
+        assert_ne!(cropped.identity(), info.identity());
+        let back = cropped.with_crop(None);
+        assert_eq!(
+            (back.width, back.height, back.coded_height),
+            (768, 576, 576)
+        );
     }
 
     #[test]

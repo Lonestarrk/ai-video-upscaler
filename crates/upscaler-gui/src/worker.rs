@@ -90,7 +90,12 @@ pub fn to_color_image(img: &RgbImage) -> egui::ColorImage {
 
 pub fn probe(bus: Bus, tools: Tools, gen: u64, path: PathBuf) {
     spawn("probe", move || {
-        let result = ffmpeg::probe(&tools, &path).map_err(|e| format!("{e:#}"));
+        let result = ffmpeg::probe(&tools, &path)
+            .map(|mut info| {
+                info.detected_crop = ffmpeg::detect_black_bars(&tools, &info);
+                info
+            })
+            .map_err(|e| format!("{e:#}"));
         bus.send(Event::Probed { gen, result });
     });
 }

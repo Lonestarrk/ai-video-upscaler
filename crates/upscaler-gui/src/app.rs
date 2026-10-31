@@ -379,6 +379,12 @@ impl UpscalerApp {
                 self.loading = None;
                 match result {
                     Ok(info) => {
+                        let crop = if self.settings.remove_black_bars {
+                            info.detected_crop
+                        } else {
+                            None
+                        };
+                        let info = info.with_crop(crop);
                         log::info!(
                             "opened {} ({}x{}, {:.3} fps, {} frames)",
                             info.path.display(),
@@ -602,6 +608,36 @@ impl UpscalerApp {
             }
             self.saved_settings = self.settings.clone();
             self.last_save = Instant::now();
+        }
+        // "Remove black bars" toggled: the picture itself changes, so it is decoded again.
+        let mut refetch = false;
+        if let Some(v) = &mut self.video {
+            let wanted = if self.settings.remove_black_bars {
+                v.info.detected_crop
+            } else {
+                None
+            };
+            if v.info.crop != wanted {
+                v.info = v.info.with_crop(wanted);
+                v.frame = None;
+                v.result = None;
+                v.previewed.clear();
+                v.thumbs = vec![None; THUMB_COUNT];
+                if let Some(tools) = &self.tools {
+                    worker::thumbnails(
+                        self.bus.clone(),
+                        tools.clone(),
+                        self.gen,
+                        v.info.clone(),
+                        THUMB_COUNT,
+                    );
+                }
+                self.view = ViewTransform::default();
+                refetch = true;
+            }
+        }
+        if refetch {
+            self.request_frame();
         }
         let key = result_key(&self.settings);
         if key != self.result_settings_key {

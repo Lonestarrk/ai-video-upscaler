@@ -28,11 +28,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             ui.label(
                 egui::RichText::new(format!(
                     "{}{}  ·  {:.3} fps{}  ·  {}  ·  {} {}  ·  {}{}  ·  {}",
-                    if (i.coded_width, i.coded_height) != (i.width, i.height) {
+                    if (i.source_width, i.source_height) != (i.width, i.height) {
                         format!(
                             "{}×{} ({} {}×{})",
-                            i.coded_width,
-                            i.coded_height,
+                            i.source_width,
+                            i.source_height,
                             tr("visas som", "shown as"),
                             i.width,
                             i.height

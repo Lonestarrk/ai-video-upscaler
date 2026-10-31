@@ -32,66 +32,55 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     ui.painter().rect_filled(rect, 4.0, CANVAS);
 
     let v = app.video.as_ref().unwrap();
-    // Everything is laid out on the output canvas. Usually that is the video's own shape; with
-    // "change aspect ratio" it is the new shape and the original sits inside it.
+    // The original is always shown in its own shape. The result has the output shape: the
+    // same, or the new aspect ratio the AI extends the picture to, with the original's
+    // content somewhere inside it. Zoom and pan follow the original's content in both.
     let source_aspect = v.info.width as f32 / v.info.height.max(1) as f32;
-    let extending = app.settings.aspect_change().is_some();
-    let aspect = if extending {
+    let extending = upscaler_core::job::extension(&app.settings, &v.info).is_some();
+    let output_aspect = if extending {
         let (w, h) = upscaler_core::job::geometry(&app.settings, &v.info).work;
         w as f32 / h.max(1) as f32
     } else {
         source_aspect
     };
-    let inner = upscaler_core::frame::inner_fraction(source_aspect as f64, aspect as f64);
-    let original_rect = |canvas: Rect| -> Rect {
-        let (x, y, w, h) = inner;
-        Rect::from_min_size(
-            canvas.min + egui::vec2(x as f32 * canvas.width(), y as f32 * canvas.height()),
-            egui::vec2(w as f32 * canvas.width(), h as f32 * canvas.height()),
-        )
+    let (ix, iy, iw, ih) =
+        upscaler_core::frame::inner_fraction(source_aspect as f64, output_aspect as f64);
+    let source = Layout {
+        aspect: source_aspect,
+        inner: (0.0, 0.0, 1.0, 1.0),
     };
-    let canvas_outline = |p: &egui::Painter, canvas: Rect| {
-        if extending {
-            p.rect_stroke(
-                canvas,
-                0.0,
-                Stroke::new(1.0, Color32::from_gray(110)),
-                egui::StrokeKind::Inside,
-            );
-            p.text(
-                canvas.center_bottom() + egui::vec2(0.0, 6.0),
-                egui::Align2::CENTER_TOP,
-                tr(
-                    "AI fyller ut ytan runt bilden",
-                    "The AI fills the area around the picture",
-                ),
-                egui::FontId::proportional(12.0),
-                Color32::from_gray(150),
-            );
-        }
+    let output = Layout {
+        aspect: output_aspect,
+        inner: (ix as f32, iy as f32, iw as f32, ih as f32),
     };
     let mode = app.settings.compare_mode;
-    let panes: Vec<Rect> = match mode {
+    let panes: Vec<(Rect, Layout)> = match mode {
         CompareMode::SideBySide => {
             let half = (rect.width() - 4.0) / 2.0;
             vec![
-                Rect::from_min_size(rect.min, egui::vec2(half, rect.height())),
-                Rect::from_min_size(
-                    egui::pos2(rect.min.x + half + 4.0, rect.min.y),
-                    egui::vec2(half, rect.height()),
+                (
+                    Rect::from_min_size(rect.min, egui::vec2(half, rect.height())),
+                    source,
+                ),
+                (
+                    Rect::from_min_size(
+                        egui::pos2(rect.min.x + half + 4.0, rect.min.y),
+                        egui::vec2(half, rect.height()),
+                    ),
+                    output,
                 ),
             ]
         }
-        CompareMode::Swipe => vec![rect],
+        CompareMode::Swipe => vec![(rect, output)],
     };
 
-    // ---- interaction (uses the first pane's geometry; both panes share the transform)
+    // ---- interaction: both panes share one transform, in the original's coordinates
     let mut t = app.view;
     let pane_at = |p: Pos2| {
         panes
             .iter()
             .copied()
-            .find(|r| r.contains(p))
+            .find(|(r, _)| r.contains(p))
             .unwrap_or(panes[0])
     };
     let swipe_id = ui.scope_id().with("swipe_drag");
@@ -99,8 +88,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
         let factor = (scroll * 0.0018).exp() * pinch;
         if (factor - 1.0).abs() > 1e-4 {
-            let pane = pane_at(pos);
-            zoom_at(&mut t, pane, aspect, pos, factor);
+            let (pane, layout) = pane_at(pos);
+            zoom_at(&mut t, pane, layout, pos, factor);
         }
     }
     if response.drag_started() {
@@ -117,8 +106,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 t.swipe = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
             }
         } else {
-            let size = image_rect(panes[0], aspect, &t).size();
-            t.center -= response.drag_delta() / size;
+            let (pane, layout) = response
+                .interact_pointer_pos()
+                .map(pane_at)
+                .unwrap_or(panes[0]);
+            t.center -= response.drag_delta() / layout.content_size(pane, t.zoom);
         }
     }
     if response.double_clicked() {
@@ -138,18 +130,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         .filter(|(i, _, _)| *i == v.current)
         .map(|(_, tex, size)| (tex.id(), *size));
     let full_uv = Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
+    let aspect_note = |p: &egui::Painter, canvas: Rect| {
+        if extending {
+            p.text(
+                canvas.center_bottom() + egui::vec2(0.0, 6.0),
+                egui::Align2::CENTER_TOP,
+                format!(
+                    "{} {}",
+                    tr("Utfyllt av AI till", "Extended by the AI to"),
+                    app.settings.target_aspect.name()
+                ),
+                egui::FontId::proportional(12.0),
+                Color32::from_gray(150),
+            );
+        }
+    };
     match mode {
         CompareMode::SideBySide => {
-            let (l, r) = (panes[0], panes[1]);
+            let (l, r) = (panes[0].0, panes[1].0);
             let pl = painter.with_clip_rect(l);
             let pr = painter.with_clip_rect(r);
-            let canvas_l = image_rect(l, aspect, &t);
-            canvas_outline(&pl, canvas_l);
             if let Some(tex) = original {
-                pl.image(tex, original_rect(canvas_l), full_uv, Color32::WHITE);
+                pl.image(tex, source.content_rect(l, &t), full_uv, Color32::WHITE);
             }
             if let Some((tex, _)) = result {
-                pr.image(tex, image_rect(r, aspect, &t), full_uv, Color32::WHITE);
+                let canvas = output.canvas_rect(r, &t);
+                pr.image(tex, canvas, full_uv, Color32::WHITE);
+                aspect_note(&pr, canvas);
             } else {
                 result_placeholder(&pr, r, app);
             }
@@ -179,10 +186,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             }
         }
         CompareMode::Swipe => {
-            let img = image_rect(rect, aspect, &t);
-            canvas_outline(&painter, img);
+            // One picture: the result's shape, with the original over its own area.
+            let canvas = output.canvas_rect(rect, &t);
+            if extending {
+                painter.rect_stroke(
+                    canvas,
+                    0.0,
+                    Stroke::new(1.0, Color32::from_gray(110)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if let Some(tex) = original {
-                painter.image(tex, original_rect(img), full_uv, Color32::WHITE);
+                painter.image(tex, output.content_rect(rect, &t), full_uv, Color32::WHITE);
             }
             // The line stays put on screen while zooming and panning.
             let split_x = rect.min.x + rect.width() * t.swipe;
@@ -190,7 +205,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 let clip = Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
                 painter
                     .with_clip_rect(clip)
-                    .image(tex, img, full_uv, Color32::WHITE);
+                    .image(tex, canvas, full_uv, Color32::WHITE);
+                aspect_note(&painter, canvas);
                 badge(
                     &painter,
                     rect.left_top() + egui::vec2(8.0, 8.0),
@@ -277,24 +293,48 @@ fn short_provider(app: &UpscalerApp) -> &'static str {
     }
 }
 
-/// The picture's rectangle in `pane` for the transform (fit × zoom, centred on `center`).
-pub fn image_rect(pane: Rect, aspect: f32, t: &ViewTransform) -> Rect {
-    let fit = if pane.width() / pane.height().max(1.0) > aspect {
-        egui::vec2(pane.height() * aspect, pane.height())
-    } else {
-        egui::vec2(pane.width(), pane.width() / aspect)
-    };
-    let size = fit * t.zoom;
-    Rect::from_min_size(pane.center() - t.center * size, size)
+/// How a pane shows a picture: a canvas of `aspect` (width / height) fitted into the pane,
+/// with the original's content at `inner` (x, y, width, height as fractions of the canvas).
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    pub aspect: f32,
+    pub inner: (f32, f32, f32, f32),
+}
+
+impl Layout {
+    /// On-screen size of the original's content at `zoom`.
+    pub fn content_size(&self, pane: Rect, zoom: f32) -> Vec2 {
+        let fit = if pane.width() / pane.height().max(1.0) > self.aspect {
+            egui::vec2(pane.height() * self.aspect, pane.height())
+        } else {
+            egui::vec2(pane.width(), pane.width() / self.aspect)
+        };
+        fit * zoom * egui::vec2(self.inner.2, self.inner.3)
+    }
+
+    /// Where the original's content is drawn: its point `t.center` sits at the pane centre.
+    pub fn content_rect(&self, pane: Rect, t: &ViewTransform) -> Rect {
+        let size = self.content_size(pane, t.zoom);
+        Rect::from_min_size(pane.center() - t.center * size, size)
+    }
+
+    /// Where the whole canvas is drawn.
+    pub fn canvas_rect(&self, pane: Rect, t: &ViewTransform) -> Rect {
+        let content = self.content_rect(pane, t);
+        let size = content.size() / egui::vec2(self.inner.2, self.inner.3);
+        Rect::from_min_size(
+            content.min - egui::vec2(self.inner.0 * size.x, self.inner.1 * size.y),
+            size,
+        )
+    }
 }
 
 /// Zooms by `factor`, keeping the picture point under `cursor` in place.
-fn zoom_at(t: &mut ViewTransform, pane: Rect, aspect: f32, cursor: Pos2, factor: f32) {
-    let before = image_rect(pane, aspect, t);
+fn zoom_at(t: &mut ViewTransform, pane: Rect, layout: Layout, cursor: Pos2, factor: f32) {
+    let before = layout.content_rect(pane, t);
     let p = (cursor - before.min) / before.size();
     t.zoom = (t.zoom * factor).clamp(1.0, 32.0);
-    let after_size = image_rect(pane, aspect, t).size();
-    t.center = p - (cursor - pane.center()) / after_size;
+    t.center = p - (cursor - pane.center()) / layout.content_size(pane, t.zoom);
 }
 
 fn clamp(t: &mut ViewTransform) {

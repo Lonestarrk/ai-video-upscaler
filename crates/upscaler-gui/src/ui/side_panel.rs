@@ -187,7 +187,7 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     };
                     ui.label("");
                     ui.label(egui::RichText::new(text).weak());
-                    if i.anamorphic() && app.settings.aspect_change().is_none() {
+                    if i.anamorphic() && upscaler_core::job::extension(&app.settings, i).is_none() {
                         ui.end_row();
                         ui.label("");
                         ui.checkbox(
@@ -214,6 +214,7 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 );
                 ui.end_row();
             });
+        black_bars(ui, app);
         aspect_change(ui, app);
         ui.label(
             egui::RichText::new(tr(
@@ -224,6 +225,40 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             .small(),
         );
     });
+}
+
+/// "Remove black bars": letterbox/pillarbox found when the video was opened.
+fn black_bars(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    ui.add_space(4.0);
+    ui.checkbox(&mut app.settings.remove_black_bars, tr("Ta bort svarta kanter (letterbox)", "Remove black bars (letterbox)"))
+        .on_hover_text(tr(
+            "Svarta fält som är inbakade i bilden (t.ex. bredbildsfilm på en 4:3-DVD) skärs bort innan uppskalningen, så att bara själva bilden restaureras och exporteras.",
+            "Black bars baked into the picture (e.g. a widescreen film on a 4:3 DVD) are cut away before upscaling, so only the picture itself is restored and exported.",
+        ));
+    if let Some(v) = &app.video {
+        let i = &v.info;
+        let text = match i.detected_crop {
+            Some(c) => {
+                let shown_w =
+                    ((c.w as f64 * i.sar.0 as f64 / i.sar.1 as f64 / 2.0).round() as u32) * 2;
+                format!(
+                    "{} {}×{} ➡ {}×{} ({:.2}:1)",
+                    tr("Hittade svarta kanter:", "Black bars found:"),
+                    i.source_width,
+                    i.source_height,
+                    c.w,
+                    c.h,
+                    shown_w as f64 / c.h as f64
+                )
+            }
+            None => tr(
+                "Inga svarta kanter hittades i videon.",
+                "No black bars found in the video.",
+            )
+            .to_string(),
+        };
+        ui.label(egui::RichText::new(text).weak().small());
+    }
 }
 
 /// "Change aspect ratio": a checkbox that turns it on and a menu with the ratios.

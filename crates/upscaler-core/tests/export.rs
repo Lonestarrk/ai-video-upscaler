@@ -327,6 +327,10 @@ fn frame_accuracy_on_given_videos() {
             info.frame_count,
             info.interlaced
         );
+        eprintln!(
+            "  black bars: {:?}",
+            ffmpeg::detect_black_bars(&tools, &info)
+        );
         let last = info.frame_count - 1;
         for n in [0, 1, 2, 100, 333, 548, 777, last / 2, last - 30] {
             let got = ffmpeg::grab_frame(&tools, &info, n, None, false).unwrap();
@@ -391,4 +395,91 @@ fn change_aspect_ratio_extends_the_canvas() {
     assert_eq!(canvas.get_pixel(160, 5), &upscaler_core::frame::EXTEND_FILL);
     let out = ffmpeg::probe(&tools, &spec.output).unwrap();
     assert_eq!((out.width, out.height), (640, 480));
+}
+
+/// Black bars are found and cut away: a 2.35:1 picture letterboxed into a 4:3 PAL DVD frame.
+#[test]
+fn letterbox_is_detected_and_removed() {
+    let Some(tools) = Tools::locate("") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("letterbox.mpg");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=768x326:rate=25:duration=12",
+        ])
+        .args([
+            "-vf",
+            "scale=720:326,pad=720:576:0:125:black",
+            "-target",
+            "pal-dvd",
+            "-aspect",
+            "4:3",
+        ])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let crop = ffmpeg::detect_black_bars(&tools, &info).expect("bars found");
+    assert_eq!((crop.w, crop.x), (720, 0));
+    assert!(
+        (crop.h as i64 - 326).abs() <= 4 && (crop.y as i64 - 125).abs() <= 4,
+        "{crop:?}"
+    );
+    let cut = info.with_crop(Some(crop));
+    assert_eq!(cut.width, 768);
+    let frame = ffmpeg::grab_frame(&tools, &cut, 100, None, false).unwrap();
+    assert_eq!(frame.dimensions(), (cut.width, cut.height));
+    // No black rows left at the top or bottom.
+    let row_mean = |y: u32| {
+        (0..frame.width())
+            .map(|x| {
+                frame
+                    .get_pixel(x, y)
+                    .0
+                    .iter()
+                    .map(|v| *v as u32)
+                    .sum::<u32>()
+            })
+            .sum::<u32>()
+            / frame.width()
+    };
+    assert!(row_mean(1) > 60 && row_mean(frame.height() - 2) > 60);
+
+    // The export has no bars either: 2x the cut area, still anamorphic like the DVD.
+    let mut settings = Settings {
+        provider: ProviderKind::Basic,
+        ..Settings::default()
+    };
+    settings.work_dir = dir.path().join("work").display().to_string();
+    let spec = ExportSpec {
+        info: cut.clone(),
+        start: 50,
+        end: 56,
+        output: dir.path().join("cut.mp4"),
+        settings,
+    };
+    assert_eq!(
+        run(&tools, &spec).last().map(String::as_str),
+        Some("finished")
+    );
+    let out = ffmpeg::probe(&tools, &spec.output).unwrap();
+    assert_eq!(
+        (out.coded_width, out.coded_height, out.sar),
+        (1440, crop.h * 2, (16, 15))
+    );
+
+    // A full-frame video has no bars.
+    let full = dir.path().join("full.mp4");
+    make_video(&tools, &full);
+    let info = ffmpeg::probe(&tools, &full).unwrap();
+    assert_eq!(ffmpeg::detect_black_bars(&tools, &info), None);
 }
