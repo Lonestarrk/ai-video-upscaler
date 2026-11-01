@@ -229,6 +229,33 @@ fn newest_image_since(dir: &Path, since: SystemTime, skip: &HashSet<PathBuf>) ->
     best.map(|(_, p)| p)
 }
 
+/// The session id from the "session id: <uuid>" line of Codex's header.
+fn session_id(transcript: &str) -> Option<String> {
+    transcript.lines().find_map(|l| {
+        let id = l.trim().strip_prefix("session id:")?.trim();
+        let ok = !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        ok.then(|| id.to_string())
+    })
+}
+
+/// Generated images are stored per session below `root`. Only this run's session is searched,
+/// so parallel runs cannot take each other's images. Without a session id the whole folder is
+/// searched (old behaviour, can mix up concurrent runs).
+fn generated_fallback(
+    root: &Path,
+    session: Option<&str>,
+    since: SystemTime,
+    skip: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    match session {
+        Some(id) => newest_image_since(&root.join(id), since, skip),
+        None => {
+            log::warn!("no Codex session id found in the output; searching all generated images");
+            newest_image_since(root, since, skip)
+        }
+    }
+}
+
 /// Short, readable reason from Codex's output.
 fn explain_failure(text: &str) -> String {
     let lower = text.to_lowercase();
@@ -321,7 +348,12 @@ impl Provider for Codex {
             Some(output.clone())
         } else {
             newest_image_since(dir, started, &skip).or_else(|| {
-                newest_image_since(&codex_home().join("generated_images"), started, &skip)
+                generated_fallback(
+                    &codex_home().join("generated_images"),
+                    session_id(&transcript).as_deref(),
+                    started,
+                    &skip,
+                )
             })
         };
         let Some(path) = found else {
@@ -448,6 +480,45 @@ mod tests {
         );
         let skip: HashSet<PathBuf> = [new].into_iter().collect();
         assert_eq!(newest_image_since(dir.path(), since, &skip), None);
+    }
+
+    #[test]
+    fn parses_session_id() {
+        let t = "OpenAI Codex v0.166.0\n--------\nworkdir: C:\\x\nmodel: m\nsession id: 01a1962b-9bfb-71e2-aef0-2c9db77be71a\n--------\nuser\nsession id: nope!\n";
+        assert_eq!(
+            session_id(t).as_deref(),
+            Some("01a1962b-9bfb-71e2-aef0-2c9db77be71a")
+        );
+        assert_eq!(session_id("hello\nno header"), None);
+    }
+
+    #[test]
+    fn fallback_stays_in_own_session() {
+        let root = tempfile::tempdir().unwrap();
+        let since = SystemTime::now() - Duration::from_secs(2);
+        let mine = root.path().join("sess-a");
+        let other = root.path().join("sess-b");
+        std::fs::create_dir(&mine).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let a = mine.join("exec-1.png");
+        std::fs::write(&a, b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let b = other.join("exec-2.png"); // newer, but another session
+        std::fs::write(&b, b"x").unwrap();
+        let skip = HashSet::new();
+        assert_eq!(
+            generated_fallback(root.path(), Some("sess-a"), since, &skip),
+            Some(a)
+        );
+        assert_eq!(
+            generated_fallback(root.path(), Some("sess-b"), since, &skip),
+            Some(b.clone())
+        );
+        assert_eq!(
+            generated_fallback(root.path(), Some("sess-c"), since, &skip),
+            None
+        );
+        assert_eq!(generated_fallback(root.path(), None, since, &skip), Some(b));
     }
 
     #[test]
