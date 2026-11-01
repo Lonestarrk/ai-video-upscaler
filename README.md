@@ -115,7 +115,7 @@ Som standard kopieras ljudet oförändrat. Under *Ljud* i sidopanelen kan du i s
 | Motor | Vad den gör | Tid |
 |---|---|---|
 | **AI (lokal, grafikkort)** | En AI-modell (BandIt Plus) delar upp ljudet i tal, musik och effekter. Talet hamnar i mitten (FC), musik och effekter i fram- och bakkanalerna, och basen från effekterna i LFE. Inget försvinner: det modellen inte kan placera ligger kvar fram. | ~25 s per minut ljud på grafikkortet, ~4 min per minut på processorn |
-| **Klassisk (utan AI)** | FFmpegs `surround`-filter styr ljudet efter riktning: det som är lika i båda kanalerna går till mitten, resten fram och (fördröjt) bak. Fungerar på alla datorer, men skiljer inte tal från musik som ligger i mitten. | några sekunder per minut |
+| **Klassisk (utan AI)** | Appen delar upp ljudet i många små frekvensband och flyttar det som ligger mitt i stereobilden (oftast dialogen) till mitten och tar bort det från fram-höger/vänster; skillnaden mellan kanalerna går fördröjt bak. Fungerar på alla datorer, men skiljer inte tal från musik som ligger i mitten. | några sekunder per minut |
 
 Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Mono kan inte bli 5.1.
 
