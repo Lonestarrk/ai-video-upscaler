@@ -1,4 +1,4 @@
-//! Source audio analysis with the real ffmpeg (skipped when it is not installed).
+﻿//! Source audio analysis with the real ffmpeg (skipped when it is not installed).
 
 use std::path::Path;
 
@@ -225,5 +225,85 @@ mod io_tests {
                 assert_eq!(best, *f, "{name} channel {c}");
             }
         }
+    }
+}
+
+mod classic_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use upscaler_core::audio::classic::upmix_classic;
+    use upscaler_core::audio::io::{write_wav, Pcm};
+    use upscaler_core::ffmpeg::Tools;
+    use upscaler_core::settings::LfeLevel;
+
+    fn tools() -> Option<Tools> {
+        let t = Tools::locate("");
+        if t.is_none() {
+            eprintln!("ffmpeg not installed, skipping");
+        }
+        t
+    }
+
+    fn stereo(n: usize) -> Pcm {
+        let mut s = 777u32;
+        let mut noise = move || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let tau = std::f32::consts::TAU;
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let t = i as f32 / 48000.0;
+            let v = 0.2 * (tau * 300.0 * t).sin() * (0.6 + 0.4 * (tau * 4.0 * t).sin());
+            l.push(v + 0.08 * noise());
+            r.push(0.7 * v + 0.08 * noise());
+        }
+        Pcm::from_channels(48000, &[l, r])
+    }
+
+    #[test]
+    fn classic_length_matches() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        for n in [48000usize, 100_003, 1500] {
+            let wav = dir.path().join(format!("in{n}.wav"));
+            write_wav(&wav, &stereo(n)).unwrap();
+            let out = upmix_classic(&tools, &wav, LfeLevel::Normal, &cancel).unwrap();
+            assert_eq!((out.channels, out.frames()), (6, n), "n={n}");
+            assert!(out.samples.iter().all(|v| v.is_finite()));
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|f| !f.starts_with("in"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
+    #[test]
+    fn classic_is_in_sync() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let src = stereo(5 * 48000);
+        let wav = dir.path().join("in.wav");
+        write_wav(&wav, &src).unwrap();
+        let out = upmix_classic(&tools, &wav, LfeLevel::Normal, &cancel).unwrap();
+        let (l, r) = (src.channel(0), src.channel(1));
+        let (fl, fr, fc) = (out.channel(0), out.channel(1), out.channel(2));
+        let a: Vec<f32> = (0..l.len()).map(|i| l[i] + r[i]).collect();
+        let b: Vec<f32> = (0..l.len()).map(|i| fl[i] + fr[i] + fc[i]).collect();
+        let (lo, hi) = (48000usize, 48000 * 3);
+        let mut best = (0i32, f64::MIN);
+        for lag in -100i32..=100 {
+            let c: f64 = (lo..hi)
+                .map(|i| a[i] as f64 * b[(i as i32 + lag) as usize] as f64)
+                .sum();
+            if c > best.1 {
+                best = (lag, c);
+            }
+        }
+        assert!(best.0.abs() <= 1, "peak at lag {}", best.0);
     }
 }
