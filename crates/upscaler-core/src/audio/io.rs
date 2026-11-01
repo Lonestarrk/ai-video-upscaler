@@ -191,8 +191,10 @@ pub fn read_raw_frames(path: &Path, channels: usize, start: u64, len: u64) -> Re
     })
 }
 
-/// Writes headerless interleaved f32le atomically (`*.part`, then rename).
-pub fn write_raw(path: &Path, pcm: &Pcm) -> Result<()> {
+/// Writes headerless interleaved f32le atomically (`*.part`, then rename). Only the tests
+/// write sources this way; the job extracts them with FFmpeg.
+#[cfg(test)]
+pub(crate) fn write_raw(path: &Path, pcm: &Pcm) -> Result<()> {
     let part = part_path(path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -275,19 +277,8 @@ pub struct StreamEncoder<'a> {
 }
 
 /// Starts an FFmpeg encoding `channels` channels of 48 kHz f32le (arriving through
-/// [`StreamEncoder::write`]) with channel layout `layout` into `out`.
-pub fn encode_stream<'a>(
-    tools: &Tools,
-    channels: usize,
-    layout: &str,
-    codec: AudioCodec,
-    out: &Path,
-    cancel: &'a AtomicBool,
-) -> Result<StreamEncoder<'a>> {
-    encode_stream_filtered(tools, channels, layout, codec, None, out, cancel)
-}
-
-/// Like [`encode_stream`], with an FFmpeg audio filter (e.g. a limiter) run before encoding.
+/// [`StreamEncoder::write`]) with channel layout `layout` into `out`, with an optional FFmpeg
+/// audio filter (e.g. a limiter) run before encoding.
 pub fn encode_stream_filtered<'a>(
     tools: &Tools,
     channels: usize,
@@ -335,7 +326,7 @@ pub fn encode_stream_filtered<'a>(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("could not start ffmpeg")?;
+    let mut child = crate::process::spawn(&mut cmd).context("could not start ffmpeg")?;
     let stdin = child.stdin.take();
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let pipe = child.stderr.take();

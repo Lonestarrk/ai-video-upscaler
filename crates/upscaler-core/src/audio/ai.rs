@@ -92,9 +92,31 @@ pub(crate) fn device_to_json(d: &Device) -> serde_json::Value {
     }
 }
 
-/// The error text when the pack is missing; the GUI shows it as it is.
+/// The error text when the pack is missing and nothing says what it was wanted for.
 pub const PACK_MISSING: &str = "The local AI audio pack is not installed (or is incomplete). \
+     Install it with the AI audio pack button in Settings.";
+/// The pack is missing and the AI separation (5.1 with the AI engine) needs it.
+pub const PACK_MISSING_SEPARATION: &str =
+    "The local AI audio pack is not installed (or is incomplete). \
      Install it with the AI audio pack button in Settings, or choose the classic 5.1 engine.";
+/// The pack is missing and only the enhancement needs it.
+pub const PACK_MISSING_ENHANCE: &str =
+    "The local AI audio pack is not installed (or is incomplete). \
+     Install it with the AI audio pack button in Settings, or turn off \"Improve the audio quality\".";
+/// The pack is missing and both the AI separation and the enhancement need it.
+pub const PACK_MISSING_BOTH: &str = "The local AI audio pack is not installed (or is incomplete). \
+     Install it with the AI audio pack button in Settings, or choose the classic 5.1 engine \
+     and turn off \"Improve the audio quality\".";
+
+/// The "pack missing" text for a job that uses the AI to separate and/or to enhance.
+pub fn pack_missing_message(separation: bool, enhance: bool) -> &'static str {
+    match (separation, enhance) {
+        (true, true) => PACK_MISSING_BOTH,
+        (true, false) => PACK_MISSING_SEPARATION,
+        (false, true) => PACK_MISSING_ENHANCE,
+        (false, false) => PACK_MISSING,
+    }
+}
 
 /// The AI audio pack's Python worker.
 #[derive(Clone, Debug)]
@@ -207,8 +229,7 @@ pub(crate) fn run_worker<S: AsRef<OsStr>>(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
+    let mut child = process::spawn(&mut cmd)
         .with_context(|| format!("could not start {}", python.display()))?;
 
     let (tx, rx) = mpsc::channel::<String>();

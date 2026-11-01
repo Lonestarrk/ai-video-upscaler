@@ -60,17 +60,11 @@ use anyhow::{bail, Result};
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
-use super::dsp::{band, db_to_gain, decorrelate, delay};
 use super::io::{Pcm, RATE};
 use super::lfe::{make_lfe, LfeSource};
-use super::place::CENTRE_GAIN;
+use super::place::{surrounds, CENTRE_GAIN};
 use crate::process::Cancelled;
 use crate::settings::LfeLevel;
-
-/// Surround channels lag the fronts by 15 ms, as a cinema decoder does.
-const SURROUND_DELAY: usize = 720;
-const SURROUND_GAIN_DB: f32 = -3.0;
-const SURROUND_BAND: (f32, f32) = (100.0, 7000.0);
 
 const WIN: usize = 4096;
 const HOP: usize = 1024;
@@ -104,21 +98,8 @@ pub fn upmix_classic(src: &Pcm, level: LfeLevel, cancel: &AtomicBool) -> Result<
     let mono: Vec<f32> = (0..n).map(|i| 0.5 * (l[i] + r[i])).collect();
     let lfe = make_lfe(&mono, LfeSource::MonoSum, level, rate);
     let side: Vec<f32> = (0..n).map(|i| 0.5 * (l[i] - r[i])).collect();
-    let side = delay(
-        &band(&side, SURROUND_BAND.0, SURROUND_BAND.1, rate),
-        SURROUND_DELAY,
-    );
-    let g = db_to_gain(SURROUND_GAIN_DB);
-    let surround = |seed| -> Vec<f32> {
-        decorrelate(&side, seed)
-            .into_iter()
-            .map(|v| v * g)
-            .collect()
-    };
-    Ok(Pcm::from_channels(
-        RATE,
-        &[fl, fr, fc, lfe, surround(1), surround(2)],
-    ))
+    let [sl, sr] = surrounds(&side, rate);
+    Ok(Pcm::from_channels(RATE, &[fl, fr, fc, lfe, sl, sr]))
 }
 
 /// Periodic Hann window.
@@ -303,7 +284,7 @@ pub(crate) fn centre(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::dsp::rms_db;
+    use crate::audio::dsp::{band, db_to_gain, rms_db};
     use crate::audio::place::DOWNMIX_FC;
 
     /// Film dialogue sits around -27 dBFS RMS (the AC-3 dialnorm default).

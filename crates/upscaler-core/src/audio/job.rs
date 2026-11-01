@@ -9,7 +9,9 @@
 //! 3. For each section not yet in `sections/NNN.wav` (complete files only; every write is
 //!    `*.part` then rename): AI separation + placement, or the classic upmix, or the
 //!    source's own channels; then the optional enhancement (FL/FR as a pair, FC alone,
-//!    SL/SR as a pair, LFE never).
+//!    SL/SR as a pair, LFE never). The AI's stems are kept in a stem cache
+//!    (`<work>/audio/stems/<key>/NNN/`) whose key leaves out the LFE level and the engine,
+//!    so trying another LFE level places the same stems again instead of separating anew.
 //! 4. Stitch the sections with the Hann crossfade (which also smooths the per-section
 //!    enhancement gain steps) straight into the FLAC and, for 5.1, the AC-3 encoder.
 //! 5. Checks that never fail the job: loudness against the source (±1 LU, else a static
@@ -27,7 +29,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::ai::{AudioAi, PACK_MISSING};
+use super::ai::{pack_missing_message, AudioAi, Stems};
 use super::classic::upmix_classic;
 use super::dsp::rms_db;
 use super::enhance::enhance_pcm;
@@ -36,7 +38,7 @@ use super::io::{
     AudioCodec, Pcm, RATE,
 };
 use super::pack;
-use super::place::{place, CENTRE_GAIN, DOWNMIX_FC};
+use super::place::{place, DOWNMIX_FC};
 use super::sections::{self, Section};
 use super::source::{self, SourceAudio};
 use crate::cache;
@@ -46,6 +48,11 @@ use crate::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
 /// Bumped whenever the job's output for the same inputs changes; part of the cache key.
 pub const AUDIO_VERSION: u32 = 6;
+/// Bumped whenever the separated stems for the same input change (how the range is
+/// extracted or cut into sections, or what the worker is asked); part of the stem cache key.
+pub const SEPARATION_VERSION: u32 = 1;
+/// The stem cache's folder in `<work>/audio`.
+pub const STEMS_DIR: &str = "stems";
 /// Frames of silence the AC-3 encoder puts in front of the signal (one block).
 const AC3_PRIMING: usize = 256;
 /// Channel layout of every 5.1 track: FL FR FC LFE SL SR.
@@ -103,8 +110,9 @@ pub fn may_use_ai(s: &Settings) -> bool {
         || (s.audio_mode == AudioMode::Surround && s.surround_engine == SurroundEngine::LocalAi)
 }
 
-/// The cache key: the video's audio identity, the range, every audio setting,
-/// [`AUDIO_VERSION`] and, when the AI may be used, the AI pack's identity.
+/// The cache key: the video's audio identity, the range, the audio settings that shape this
+/// result, [`AUDIO_VERSION`] and, when the AI may be used, the AI pack's identity. The engine
+/// and the LFE level only count when a 5.1 is made, so they never split a stereo job.
 pub fn key(spec: &AudioSpec) -> String {
     key_with(spec, &pack::identity())
 }
@@ -116,11 +124,13 @@ fn key_with(spec: &AudioSpec, pack_identity: &str) -> String {
         spec.start.to_string(),
         spec.end.to_string(),
         format!("{:?}", s.audio_mode),
-        format!("{:?}", s.surround_engine),
-        format!("{:?}", s.lfe_level),
-        format!("enhance={}", s.audio_enhance),
-        format!("audio-v{AUDIO_VERSION}"),
     ];
+    if s.audio_mode == AudioMode::Surround {
+        parts.push(format!("{:?}", s.surround_engine));
+        parts.push(format!("{:?}", s.lfe_level));
+    }
+    parts.push(format!("enhance={}", s.audio_enhance));
+    parts.push(format!("audio-v{AUDIO_VERSION}"));
     if may_use_ai(s) {
         parts.push(pack_identity.to_string());
     }
@@ -128,60 +138,137 @@ fn key_with(spec: &AudioSpec, pack_identity: &str) -> String {
     cache::key(&refs)
 }
 
-/// `<work dir>/audio/<key>`.
-pub fn job_dir(spec: &AudioSpec) -> PathBuf {
-    spec.settings.work_dir().join("audio").join(key(spec))
+/// `<work dir>/audio`: the audio jobs and, in [`STEMS_DIR`], the stem cache.
+fn audio_root(settings: &Settings) -> PathBuf {
+    settings.work_dir().join("audio")
 }
 
-/// In each job folder: the source video's path, so finished jobs of the same video can be
-/// found again by [`prune`].
+/// `<work dir>/audio/<key>`.
+pub fn job_dir(spec: &AudioSpec) -> PathBuf {
+    audio_root(&spec.settings).join(key(spec))
+}
+
+/// The stem cache key: what the separated stems depend on, and nothing else (not the LFE
+/// level, the engine or the enhancement): the audio identity, the range, how it is cut into
+/// sections, the AI pack's identity and [`SEPARATION_VERSION`].
+fn stems_key(spec: &AudioSpec, opts: &JobOptions, pack_identity: &str) -> String {
+    let (_, _, n) = range(&spec.info, spec.start, spec.end);
+    cache::key(&[
+        &audio_identity(&spec.info),
+        &spec.start.to_string(),
+        &spec.end.to_string(),
+        &format!(
+            "sections {n} {} {}",
+            opts.section_frames, opts.overlap_frames
+        ),
+        pack_identity,
+        &format!("separation-v{SEPARATION_VERSION}"),
+    ])
+}
+
+/// `<work dir>/audio/stems/<stem key>`: one folder per section (`NNN/`) with the three stems.
+pub fn stems_dir(spec: &AudioSpec, opts: &JobOptions) -> PathBuf {
+    stems_dir_with(spec, opts, &pack::identity())
+}
+
+fn stems_dir_with(spec: &AudioSpec, opts: &JobOptions, pack_identity: &str) -> PathBuf {
+    audio_root(&spec.settings)
+        .join(STEMS_DIR)
+        .join(stems_key(spec, opts, pack_identity))
+}
+
+/// In each job and stem folder: which video and range it was made from (see [`marker`]), so
+/// [`prune`] can tell a superseded folder from one another range still needs.
 const VIDEO_MARKER: &str = "video.txt";
 /// Audio job folders not touched for this long are removed by [`prune_after`].
 pub const JOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Removes the audio job folders under `root` except `keep`: those whose marker names
-/// `video` (earlier settings or ranges of the same video, superseded by `keep`) and those
-/// whose newest entry is older than `max_age` at `now`. Best effort; returns what it removed.
+/// The marker text: the video's path, its audio identity and the range, one per line.
+fn marker(spec: &AudioSpec) -> String {
+    format!(
+        "{}\n{}\n{} {}",
+        spec.info.path.display(),
+        audio_identity(&spec.info),
+        spec.start,
+        spec.end
+    )
+}
+
+/// Whether a folder marked `old` is superseded by the job marked `current`: the same video
+/// and either the same range (other settings) or a changed file (other identity). Another
+/// range of the same unchanged video is kept, so a short sample never throws away the full
+/// episode. A marker from before the range was recorded counts as superseded.
+fn superseded(old: &str, current: &str) -> bool {
+    let old: Vec<&str> = old.lines().map(str::trim).collect();
+    let cur: Vec<&str> = current.lines().map(str::trim).collect();
+    if old.first() != cur.first() {
+        return false;
+    }
+    match (old.get(1), old.get(2)) {
+        (Some(identity), Some(range)) => cur.get(1) != Some(identity) || cur.get(2) == Some(range),
+        _ => true,
+    }
+}
+
+/// Removes the folders under `root` except `keep` and the stem cache: those [`superseded`]
+/// by `current` (the marker of `keep`'s job) and those whose newest entry is older than
+/// `max_age` at `now`. Best effort; returns what it removed.
 pub fn prune(
     root: &Path,
     keep: &Path,
-    video: &Path,
+    current: &str,
     max_age: Duration,
     now: SystemTime,
 ) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
-    let video = video.display().to_string();
     let mut removed = Vec::new();
     for e in entries.flatten() {
         let dir = e.path();
-        if !e.file_type().is_ok_and(|t| t.is_dir()) || dir == keep {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) || dir == keep || e.file_name() == STEMS_DIR {
             continue;
         }
-        let same_video =
-            std::fs::read_to_string(dir.join(VIDEO_MARKER)).is_ok_and(|v| v.trim() == video);
+        let old = std::fs::read_to_string(dir.join(VIDEO_MARKER)).ok();
+        let replaced = old.is_some_and(|m| superseded(&m, current));
         let stale = newest_mtime(&dir)
             .is_some_and(|t| now.duration_since(t).is_ok_and(|age| age > max_age));
-        if (same_video || stale) && std::fs::remove_dir_all(&dir).is_ok() {
+        if (replaced || stale) && std::fs::remove_dir_all(&dir).is_ok() {
             removed.push(dir);
         }
     }
     removed
 }
 
-/// After `spec`'s job finished: [`prune`] with the work folder's audio jobs, the video's
-/// path and [`JOB_MAX_AGE`].
+/// After `spec`'s export finished: [`prune`] the audio jobs and the stem cache with
+/// [`JOB_MAX_AGE`], keeping this job and the stems of its range (whatever engine it used, so
+/// switching back to the AI later separates nothing again).
 pub fn prune_after(spec: &AudioSpec) -> Vec<PathBuf> {
-    let keep = job_dir(spec);
-    let root = keep.parent().map(Path::to_path_buf).unwrap_or_default();
-    prune(
-        &root,
-        &keep,
-        &spec.info.path,
+    let current = marker(spec);
+    let now = SystemTime::now();
+    let root = audio_root(&spec.settings);
+    let mut removed = prune(&root, &job_dir(spec), &current, JOB_MAX_AGE, now);
+    removed.extend(prune(
+        &root.join(STEMS_DIR),
+        &stems_dir(spec, &JobOptions::default()),
+        &current,
         JOB_MAX_AGE,
-        SystemTime::now(),
-    )
+        now,
+    ));
+    removed
+}
+
+/// Removes the big intermediates (extracted source, sections, temp files) of every audio
+/// job under `work_dir`, keeping the finished tracks and the stem cache.
+pub fn clean_intermediates(work_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(work_dir.join("audio")) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name() != STEMS_DIR && e.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_intermediates(&e.path());
+        }
+    }
 }
 
 /// The newest modification time of `dir` and its direct entries.
@@ -248,8 +335,10 @@ pub enum AudioStage {
     Separating,
     Enhancing,
     Placing,
+    /// Stitching the sections straight into the encoders (the first encode).
     Joining,
     Checking,
+    /// Encoding again with a loudness or peak correction (only when one is needed).
     Encoding,
 }
 
@@ -336,13 +425,47 @@ impl JobPlan {
     pub fn needs_ai(&self) -> bool {
         self.kind == Kind::UpmixAi || self.enhance
     }
+
+    /// The "pack missing" message for what this plan uses the AI for.
+    pub fn pack_missing(&self) -> &'static str {
+        pack_missing_message(self.kind == Kind::UpmixAi, self.enhance)
+    }
+}
+
+/// The export's warning when the pack runs on the CPU and the job separates.
+pub const CPU_SLOW_SEPARATION: &str =
+    "The local AI audio pack runs on the CPU: audio separation will be slow.";
+/// The export's warning when the pack runs on the CPU and the job only enhances.
+pub const CPU_SLOW_ENHANCE: &str =
+    "The local AI audio pack runs on the CPU: the audio enhancement will be slow.";
+
+impl JobPlan {
+    /// The warning for this plan when the pack runs on the CPU.
+    pub fn cpu_warning(&self) -> &'static str {
+        if self.kind == Kind::UpmixAi {
+            CPU_SLOW_SEPARATION
+        } else {
+            CPU_SLOW_ENHANCE
+        }
+    }
+}
+
+/// The refusal of [`plan_job`] for a 5.1 source with 5.1 chosen and no enhancement.
+pub const ALREADY_51: &str =
+    "the source is already 5.1 and the audio is not enhanced: the audio is kept as it is";
+
+/// Whether these settings leave `source`'s audio as it is: no 5.1 to make (none chosen, or
+/// the source is 5.1 already) and no enhancement. The export then copies the original audio
+/// into an MP4, as with "Unchanged", instead of transcoding it to the same thing.
+pub fn keeps_original(settings: &Settings, source: &SourceAudio) -> bool {
+    !settings.audio_enhance && (settings.audio_mode != AudioMode::Surround || source.channels == 6)
 }
 
 /// Decides what the job makes, or why it cannot run; no work is done here.
 ///
 /// The AI is required when it would be used: for AI separation, and for enhancement
-/// (whichever engine). A 5.1 source with the local AI engine and no enhancement uses no AI,
-/// so it does not need the pack.
+/// (whichever engine). A 5.1 source with 5.1 chosen and no enhancement is nothing to do
+/// ([`keeps_original`]).
 pub fn plan_job(
     settings: &Settings,
     source: Option<&SourceAudio>,
@@ -358,6 +481,9 @@ pub fn plan_job(
     }
     if !surround && !settings.audio_enhance {
         bail!("the audio settings keep the original audio: there is no audio job to run");
+    }
+    if keeps_original(settings, src) {
+        bail!(ALREADY_51);
     }
     let kind = match ch {
         6 => Kind::Keep51,
@@ -377,7 +503,7 @@ pub fn plan_job(
         dialnorm: src.dialnorm.unwrap_or(DEFAULT_DIALNORM).clamp(-31, -1),
     };
     if plan.needs_ai() && !has_ai {
-        bail!(PACK_MISSING);
+        bail!(plan.pack_missing());
     }
     Ok(plan)
 }
@@ -410,12 +536,20 @@ pub fn run_with(
     let plan = plan_job(&spec.settings, src.as_ref(), ai.is_some())?;
     let dir = job_dir(spec);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(VIDEO_MARKER), spec.info.path.display().to_string())?;
+    std::fs::write(dir.join(VIDEO_MARKER), marker(spec))?;
     if let Some(done) = load_result(&dir) {
         // A crash right after the result was saved may have left the intermediates.
         remove_intermediates(&dir);
         return Ok(done);
     }
+    let stems = if plan.kind == Kind::UpmixAi {
+        let stems = stems_dir(spec, opts);
+        std::fs::create_dir_all(&stems)?;
+        std::fs::write(stems.join(VIDEO_MARKER), marker(spec))?;
+        Some(stems)
+    } else {
+        None
+    };
     let (t0, dur, n) = range(&spec.info, spec.start, spec.end);
     let total = n as u64;
     let job = Job {
@@ -423,6 +557,7 @@ pub fn run_with(
         plan,
         lfe: spec.settings.lfe_level,
         dir: dir.clone(),
+        stems,
         total,
         opts: *opts,
         sections: sections::plan_with(total, opts.section_frames, opts.overlap_frames),
@@ -446,7 +581,7 @@ pub fn run_with(
     job.render(ai, cancel, emit)?;
 
     emit(AudioEvent::Stage(AudioStage::Joining));
-    let (mut tracks, f32_peak) = job.encode(0.0, false, cancel, emit)?;
+    let (mut tracks, f32_peak) = job.encode(0.0, false, cancel)?;
 
     emit(AudioEvent::Stage(AudioStage::Checking));
     let mut warnings = Vec::new();
@@ -467,7 +602,7 @@ pub fn run_with(
             let (gain, limiter) = correction(&src_level, &res_level);
             if gain.abs() >= MIN_GAIN_DB || limiter {
                 emit(AudioEvent::Stage(AudioStage::Encoding));
-                tracks = job.encode(gain, limiter, cancel, emit)?.0;
+                tracks = job.encode(gain, limiter, cancel)?.0;
                 emit(AudioEvent::Stage(AudioStage::Checking));
                 match measure(tools, &file_input(tracks[0].path()), false, cancel) {
                     Ok(l) => res_level = l,
@@ -567,6 +702,8 @@ struct Job<'a> {
     plan: JobPlan,
     lfe: LfeLevel,
     dir: PathBuf,
+    /// The stem cache folder of this range ([`stems_dir`]) when the AI separates.
+    stems: Option<PathBuf>,
     /// Frames of the whole range.
     total: u64,
     opts: JobOptions,
@@ -581,6 +718,47 @@ fn section_complete(path: &Path, len: u64, channels: usize) -> bool {
         let s = r.spec();
         s.channels as usize == channels && s.sample_rate == RATE && r.duration() as u64 == len
     })
+}
+
+/// The three stems in a stem cache section folder.
+fn stems_in(dir: &Path) -> Stems {
+    Stems {
+        speech: dir.join("speech.wav"),
+        music: dir.join("music.wav"),
+        effects: dir.join("effects.wav"),
+    }
+}
+
+/// The cached stems in `dir`, when all three are there. The folder only ever appears
+/// complete ([`store_stems`] renames it into place), so existing files are finished files.
+fn cached_stems(dir: &Path) -> Option<Stems> {
+    let stems = stems_in(dir);
+    [&stems.speech, &stems.music, &stems.effects]
+        .iter()
+        .all(|p| p.is_file())
+        .then_some(stems)
+}
+
+/// Moves `stems` into the cache folder `dir` atomically: into `NNN.part` first, then the
+/// folder is renamed to `NNN`.
+fn store_stems(stems: &Stems, dir: &Path) -> Result<Stems> {
+    let part = dir.with_extension("part");
+    let _ = std::fs::remove_dir_all(&part);
+    std::fs::create_dir_all(&part)?;
+    let target = stems_in(&part);
+    for (from, to) in [
+        (&stems.speech, &target.speech),
+        (&stems.music, &target.music),
+        (&stems.effects, &target.effects),
+    ] {
+        if std::fs::rename(from, to).is_err() {
+            std::fs::copy(from, to)
+                .with_context(|| format!("could not copy {}", from.display()))?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::rename(&part, dir).context("could not finish the stem cache folder")?;
+    Ok(stems_in(dir))
 }
 
 /// `p` padded with silence or trimmed to `len` frames.
@@ -660,13 +838,13 @@ fn enhance(
 
 /// The mono downmix the sync check compares, on the scale of L + R: for 5.1 the ITU
 /// stereo downmix (L = FL + 0.7071 FC + 0.7071 SL, R likewise) summed, so
-/// FL + FR + sqrt 2 FC + 0.7071 (SL + SR), LFE left out; L + R for stereo. With FC written
-/// at [`CENTRE_GAIN`] this rebuilds the source's L + R plus the surrounds.
+/// FL + FR + 2 · 0.7071 FC + 0.7071 (SL + SR), LFE left out; L + R for stereo. With FC
+/// written at +3 dB this rebuilds the source's L + R plus the surrounds.
 fn downmix(p: &Pcm) -> Vec<f32> {
     p.samples
         .chunks_exact(p.channels.max(1))
         .map(|f| match f.len() {
-            6 => f[0] + f[1] + CENTRE_GAIN * f[2] + DOWNMIX_FC * (f[4] + f[5]),
+            6 => f[0] + f[1] + 2.0 * DOWNMIX_FC * f[2] + DOWNMIX_FC * (f[4] + f[5]),
             _ => f.iter().sum(),
         })
         .collect()
@@ -757,14 +935,10 @@ impl Job<'_> {
             s.start,
             s.len,
         )?;
-        let need_ai = || ai.ok_or_else(|| anyhow!(PACK_MISSING));
+        let need_ai = || ai.ok_or_else(|| anyhow!(self.plan.pack_missing()));
         let mut pcm = match self.plan.kind {
             Kind::UpmixAi => {
-                let ai = need_ai()?;
-                emit(AudioEvent::Stage(AudioStage::Separating));
-                let wav = tmp.join("input.wav");
-                write_wav(&wav, &input)?;
-                let stems = ai.separate(&wav, &tmp.join("stems"), cancel, &mut |_| {})?;
+                let stems = self.stems_for(s, &input, &tmp, ai, cancel, emit)?;
                 let stem = |p: &Path| -> Result<Pcm> {
                     let x = read_wav(p)?;
                     if x.channels != 2 || x.rate != RATE {
@@ -812,6 +986,44 @@ impl Job<'_> {
         Ok(fit(pcm, s.len))
     }
 
+    /// Section `s`'s separated stems: from the stem cache when it has them, else from the AI,
+    /// and then stored in the cache for the next run of the same range.
+    fn stems_for(
+        &self,
+        s: &Section,
+        input: &Pcm,
+        tmp: &Path,
+        ai: Option<&dyn AudioAi>,
+        cancel: &AtomicBool,
+        emit: &(dyn Fn(AudioEvent) + Sync),
+    ) -> Result<Stems> {
+        let cached = self
+            .stems
+            .as_ref()
+            .map(|d| d.join(format!("{:03}", s.index)));
+        if let Some(stems) = cached.as_deref().and_then(cached_stems) {
+            return Ok(stems);
+        }
+        let ai = ai.ok_or_else(|| anyhow!(self.plan.pack_missing()))?;
+        emit(AudioEvent::Stage(AudioStage::Separating));
+        let wav = tmp.join("input.wav");
+        write_wav(&wav, input)?;
+        let out = tmp.join("stems");
+        let _ = std::fs::remove_dir_all(&out);
+        let stems = ai.separate(&wav, &out, cancel, &mut |_| {})?;
+        let Some(cached) = cached else {
+            return Ok(stems);
+        };
+        // A failed store costs only a separation next time.
+        match store_stems(&stems, &cached) {
+            Ok(kept) => Ok(kept),
+            Err(e) => {
+                log::warn!("could not keep the stems in {}: {e:#}", cached.display());
+                Ok(stems)
+            }
+        }
+    }
+
     /// The finished sections, crossfaded, as one stream of `total` frames.
     fn stitch(&self, write: impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
         let ch = self.plan.channels();
@@ -843,7 +1055,6 @@ impl Job<'_> {
         gain_db: f64,
         limiter: bool,
         cancel: &AtomicBool,
-        emit: &(dyn Fn(AudioEvent) + Sync),
     ) -> Result<(Vec<AudioTrack>, f32)> {
         let ch = self.plan.channels();
         let layout = self.plan.layout();
@@ -905,9 +1116,6 @@ impl Job<'_> {
             }
             Ok(())
         })?;
-        if ch == 6 {
-            emit(AudioEvent::Stage(AudioStage::Encoding));
-        }
         for ((mut e, skip), (_, _, codec)) in encoders.into_iter().zip(&outputs) {
             // As much silence as was dropped (less when the whole signal was shorter).
             let padding = match codec {
@@ -1084,7 +1292,7 @@ pub(crate) fn best_lag(src: &[f32], res: &[f32], max_lag: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::ai::Stems;
+    use crate::audio::ai::{PACK_MISSING_BOTH, PACK_MISSING_ENHANCE, PACK_MISSING_SEPARATION};
     use crate::audio::io::{read_wav, write_raw, write_wav};
     use crate::audio::sections;
     use crate::process::is_cancelled;
@@ -1175,39 +1383,121 @@ mod tests {
     fn no_events(_: AudioEvent) {}
 
     #[test]
-    fn prune_removes_same_video_and_stale_jobs() {
+    fn prune_removes_superseded_and_stale_jobs() {
         let root = tempfile::tempdir().unwrap();
-        let job = |name: &str, video: Option<&str>| {
+        let job = |name: &str, marker: Option<&str>| {
             let d = root.path().join(name);
             std::fs::create_dir_all(&d).unwrap();
-            if let Some(v) = video {
-                std::fs::write(d.join(VIDEO_MARKER), v).unwrap();
+            if let Some(m) = marker {
+                std::fs::write(d.join(VIDEO_MARKER), m).unwrap();
             }
             std::fs::write(d.join("result.json"), "{}").unwrap();
             d
         };
-        let keep = job("keep", Some("C:\\v\\a.mkv"));
-        let older = job("older", Some("C:\\v\\a.mkv"));
-        let other = job("other", Some("C:\\v\\b.mkv"));
+        let current = "C:\\v\\a.mkv\nC:\\v\\a.mkv|10|20\n0 1000";
+        let keep = job("keep", Some(current));
+        // Same video and range, other settings: superseded.
+        let older = job("older", Some(current));
+        // Same video, another range (a sample after the full episode): kept.
+        let sample = job("sample", Some("C:\\v\\a.mkv\nC:\\v\\a.mkv|10|20\n100 200"));
+        // Same path, the file changed since: useless whatever the range.
+        let changed = job("changed", Some("C:\\v\\a.mkv\nC:\\v\\a.mkv|10|19\n100 200"));
+        // A marker from before ranges were recorded: superseded.
+        let legacy = job("legacy", Some("C:\\v\\a.mkv"));
+        let other = job("other", Some("C:\\v\\b.mkv\nC:\\v\\b.mkv|1|2\n0 1000"));
         let unmarked = job("unmarked", None);
+        let stems = job(STEMS_DIR, None);
         std::fs::write(root.path().join("loose.txt"), "x").unwrap();
-        let video = Path::new("C:\\v\\a.mkv");
 
-        // Now: only the same video's other job goes.
-        let removed = prune(root.path(), &keep, video, JOB_MAX_AGE, SystemTime::now());
-        assert_eq!(removed, vec![older.clone()]);
-        assert!(keep.is_dir() && other.is_dir() && unmarked.is_dir());
-
-        // 31 days later: every other folder is stale, but `keep` and loose files stay.
-        let later = SystemTime::now() + Duration::from_secs(31 * 24 * 3600);
-        let mut removed = prune(root.path(), &keep, video, JOB_MAX_AGE, later);
+        let mut removed = prune(root.path(), &keep, current, JOB_MAX_AGE, SystemTime::now());
         removed.sort();
-        assert_eq!(removed, vec![other, unmarked]);
-        assert!(keep.is_dir());
+        assert_eq!(removed, vec![changed, legacy, older]);
+        assert!(keep.is_dir() && sample.is_dir() && other.is_dir() && unmarked.is_dir());
+
+        // 31 days later: every other folder is stale, but `keep`, the stem cache (pruned on
+        // its own) and loose files stay.
+        let later = SystemTime::now() + Duration::from_secs(31 * 24 * 3600);
+        let mut removed = prune(root.path(), &keep, current, JOB_MAX_AGE, later);
+        removed.sort();
+        assert_eq!(removed, vec![other, sample, unmarked]);
+        assert!(keep.is_dir() && stems.is_dir());
         assert!(root.path().join("loose.txt").is_file());
 
         // A missing root is fine.
-        assert!(prune(&root.path().join("nope"), &keep, video, JOB_MAX_AGE, later).is_empty());
+        assert!(prune(
+            &root.path().join("nope"),
+            &keep,
+            current,
+            JOB_MAX_AGE,
+            later
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn prune_after_keeps_stems_of_the_range() {
+        let work = tempfile::tempdir().unwrap();
+        let spec = |start: u64, end: u64, lfe: LfeLevel| AudioSpec {
+            info: info(24, 1),
+            start,
+            end,
+            settings: Settings {
+                audio_mode: AudioMode::Surround,
+                lfe_level: lfe,
+                project_dir: Some(work.path().to_path_buf()),
+                ..Settings::default()
+            },
+        };
+        let make = |dir: PathBuf, s: &AudioSpec| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(VIDEO_MARKER), marker(s)).unwrap();
+            dir
+        };
+        let full = spec(0, 1000, LfeLevel::Normal);
+        let full_job = make(job_dir(&full), &full);
+        let full_stems = make(stems_dir(&full, &JobOptions::default()), &full);
+        // Stems of the same range made with another pack: superseded.
+        let old_stems = make(
+            stems_dir_with(&full, &JobOptions::default(), "old pack"),
+            &full,
+        );
+
+        // Another LFE level of the full range: its job replaces the Normal one, the stems stay.
+        let strong = spec(0, 1000, LfeLevel::Strong);
+        let strong_job = make(job_dir(&strong), &strong);
+        let mut removed = prune_after(&strong);
+        removed.sort();
+        assert_eq!(removed, vec![full_job.clone(), old_stems]);
+        assert!(strong_job.is_dir() && full_stems.is_dir());
+
+        // A short sample afterwards removes neither the full range's job nor its stems.
+        let sample = spec(100, 200, LfeLevel::Normal);
+        let sample_job = make(job_dir(&sample), &sample);
+        assert!(prune_after(&sample).is_empty());
+        assert!(strong_job.is_dir() && full_stems.is_dir() && sample_job.is_dir());
+    }
+
+    #[test]
+    fn light_clean_keeps_tracks_and_stems() {
+        let work = tempfile::tempdir().unwrap();
+        let audio = work.path().join("audio");
+        let job = audio.join("somekey");
+        std::fs::create_dir_all(job.join("sections")).unwrap();
+        std::fs::create_dir_all(job.join("tmp").join("000")).unwrap();
+        std::fs::write(job.join("source.f32"), b"x").unwrap();
+        std::fs::write(job.join("surround.flac"), b"x").unwrap();
+        std::fs::write(job.join("result.json"), b"{}").unwrap();
+        let stem = audio.join(STEMS_DIR).join("k").join("000");
+        std::fs::create_dir_all(&stem).unwrap();
+        std::fs::write(stem.join("speech.wav"), b"x").unwrap();
+
+        clean_intermediates(work.path());
+        assert!(!job.join("source.f32").exists());
+        assert!(!job.join("sections").exists() && !job.join("tmp").exists());
+        assert!(job.join("surround.flac").is_file() && job.join("result.json").is_file());
+        assert!(stem.join("speech.wav").is_file());
+        // No audio folder at all is fine.
+        clean_intermediates(&work.path().join("nope"));
     }
 
     /// Fake AI: stems are fixed fractions of the input; enhancement adds a 17 kHz tone.
@@ -1288,6 +1578,7 @@ mod tests {
             plan,
             lfe: LfeLevel::Normal,
             dir: dir.to_path_buf(),
+            stems: None,
             total,
             opts,
             sections: sections::plan_with(total, opts.section_frames, opts.overlap_frames),
@@ -1361,6 +1652,132 @@ mod tests {
             job_dir(&s2),
             PathBuf::from("proj").join("audio").join(&base)
         );
+
+        // Without 5.1 the engine and the LFE level shape nothing: one key for all of them,
+        // and no pack identity when the AI is not used.
+        let mut stereo = spec.clone();
+        stereo.settings.audio_mode = AudioMode::Original;
+        stereo.settings.audio_enhance = true;
+        let stereo_key = key(&stereo);
+        for change in [
+            |s: &mut AudioSpec| s.settings.surround_engine = SurroundEngine::Classic,
+            |s: &mut AudioSpec| s.settings.lfe_level = LfeLevel::Strong,
+        ] {
+            let mut c = stereo.clone();
+            change(&mut c);
+            assert_eq!(key(&c), stereo_key, "{c:?}");
+        }
+        assert_ne!(stereo_key, key_with(&stereo, "another pack"));
+        let mut original = stereo.clone();
+        original.settings.audio_enhance = false;
+        assert_eq!(key(&original), key_with(&original, "another pack"));
+    }
+
+    #[test]
+    fn stems_key_leaves_out_lfe_engine_and_enhance() {
+        let spec = AudioSpec {
+            info: info(24, 1),
+            start: 0,
+            end: 100,
+            settings: settings(AudioMode::Surround, SurroundEngine::LocalAi, false),
+        };
+        let opts = JobOptions::default();
+        let base = stems_dir(&spec, &opts);
+        for change in [
+            |s: &mut AudioSpec| s.settings.lfe_level = LfeLevel::Cinema,
+            |s: &mut AudioSpec| s.settings.surround_engine = SurroundEngine::Classic,
+            |s: &mut AudioSpec| s.settings.audio_enhance = true,
+        ] {
+            let mut c = spec.clone();
+            change(&mut c);
+            assert_eq!(stems_dir(&c, &opts), base, "{c:?}");
+            assert_ne!(job_dir(&c), job_dir(&spec), "{c:?}");
+        }
+        for change in [
+            |s: &mut AudioSpec| s.start = 1,
+            |s: &mut AudioSpec| s.end = 101,
+            |s: &mut AudioSpec| s.info.modified += 1,
+        ] {
+            let mut c = spec.clone();
+            change(&mut c);
+            assert_ne!(stems_dir(&c, &opts), base, "{c:?}");
+        }
+        assert_ne!(stems_dir_with(&spec, &opts, "another pack"), base);
+        let short = JobOptions {
+            section_frames: 48_000,
+            overlap_frames: 4_800,
+        };
+        assert_ne!(stems_dir(&spec, &short), base);
+        assert_eq!(
+            base.parent().unwrap(),
+            job_dir(&spec).parent().unwrap().join(STEMS_DIR)
+        );
+    }
+
+    /// Another LFE level of the same range places the cached stems again: no separation.
+    #[test]
+    fn lfe_change_reuses_cached_stems() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tools();
+        let plan = plan_job(
+            &settings(AudioMode::Surround, SurroundEngine::LocalAi, false),
+            Some(&source(2)),
+            true,
+        )
+        .unwrap();
+        let opts = JobOptions {
+            section_frames: 48_000,
+            overlap_frames: 4_800,
+        };
+        let total = 120_000u64;
+        // 50 Hz bass hits over quiet noise: effects bass that rises above its background.
+        let x: Vec<f32> = noise(total as usize, 5, 0.02)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let t = i as f32 / RATE as f32;
+                let hit = if (t * 2.0).fract() < 0.3 { 0.5 } else { 0.0 };
+                v + hit * (std::f32::consts::TAU * 50.0 * t).sin()
+            })
+            .collect();
+        let src = Pcm::from_channels(RATE, &[x.clone(), x]);
+        let stems = dir.path().join("stems").join("key");
+        let make = |name: &str, lfe: LfeLevel, ai: &FakeAi| -> Vec<f32> {
+            let mut j = job(&tools, plan, &dir.path().join(name), total, opts);
+            j.lfe = lfe;
+            j.stems = Some(stems.clone());
+            write_raw(&j.source_path(), &src).unwrap();
+            j.render(Some(ai), &AtomicBool::new(false), &no_events)
+                .unwrap();
+            let out = Pcm {
+                rate: RATE,
+                channels: 6,
+                samples: stitched(&j),
+            };
+            out.channel(3)
+        };
+        let first = FakeAi::default();
+        let normal = make("normal", LfeLevel::Normal, &first);
+        assert_eq!(first.separations.load(Ordering::SeqCst), 3);
+        assert!(stems.join("002").join("effects.wav").is_file());
+        assert!(!stems.join("002.part").exists());
+
+        let second = FakeAi::default();
+        let strong = make("strong", LfeLevel::Strong, &second);
+        assert_eq!(second.separations.load(Ordering::SeqCst), 0);
+        assert_ne!(normal, strong);
+        assert!(
+            rms_db(&strong) > rms_db(&normal) + 1.0,
+            "LFE Strong {} dB, Normal {} dB",
+            rms_db(&strong),
+            rms_db(&normal)
+        );
+
+        // Without the AI, a range whose stems are all cached still renders.
+        let mut j = job(&tools, plan, &dir.path().join("no-ai"), total, opts);
+        j.stems = Some(stems.clone());
+        write_raw(&j.source_path(), &src).unwrap();
+        j.render(None, &AtomicBool::new(false), &no_events).unwrap();
     }
 
     #[test]
@@ -1404,11 +1821,22 @@ mod tests {
             plan_job(&classic, Some(&source(2)), false).unwrap().kind,
             Kind::UpmixClassic
         );
-        // A 5.1 source is never upmixed.
+        // A 5.1 source is never upmixed; without enhancement there is nothing to do, so the
+        // export keeps the original audio (and needs no pack).
+        let enhanced_51 = settings(AudioMode::Surround, SurroundEngine::LocalAi, true);
         assert_eq!(
-            plan_job(&ai_51, Some(&source(6)), true).unwrap().kind,
+            plan_job(&enhanced_51, Some(&source(6)), true).unwrap().kind,
             Kind::Keep51
         );
+        let err = plan_job(&ai_51, Some(&source(6)), false).unwrap_err();
+        assert_eq!(err.to_string(), ALREADY_51);
+        assert!(keeps_original(&ai_51, &source(6)));
+        assert!(keeps_original(&classic, &source(6)));
+        assert!(!keeps_original(&enhanced_51, &source(6)));
+        assert!(!keeps_original(&ai_51, &source(2)));
+        assert!(!keeps_original(&enhance, &source(2)));
+        let original = settings(AudioMode::Original, SurroundEngine::LocalAi, false);
+        assert!(keeps_original(&original, &source(2)));
         let p = plan_job(&enhance, Some(&source(2)), true).unwrap();
         assert_eq!(
             (p.kind, p.enhance, p.dolby_surround),
@@ -1418,14 +1846,19 @@ mod tests {
             plan_job(&enhance, Some(&source(1)), true).unwrap().kind,
             Kind::MonoToStereo
         );
-        // Local AI without the AI: an error before any work.
+        // Without the AI: an error before any work, suggesting what fits the plan.
         let err = plan_job(&ai_51, Some(&source(2)), false).unwrap_err();
-        assert!(err.to_string().contains("not installed"), "{err}");
-        assert!(plan_job(&enhance, Some(&source(2)), false).is_err());
+        assert_eq!(err.to_string(), PACK_MISSING_SEPARATION);
+        let err = plan_job(&enhance, Some(&source(2)), false).unwrap_err();
+        assert_eq!(err.to_string(), PACK_MISSING_ENHANCE);
+        let err = plan_job(&enhanced_51, Some(&source(6)), false).unwrap_err();
+        assert_eq!(err.to_string(), PACK_MISSING_ENHANCE);
+        let both = settings(AudioMode::Surround, SurroundEngine::LocalAi, true);
+        let err = plan_job(&both, Some(&source(2)), false).unwrap_err();
+        assert_eq!(err.to_string(), PACK_MISSING_BOTH);
         // No audio, odd layouts and nothing to do are errors too.
         assert!(plan_job(&ai_51, None, true).is_err());
         assert!(plan_job(&ai_51, Some(&source(8)), true).is_err());
-        let original = settings(AudioMode::Original, SurroundEngine::LocalAi, false);
         assert!(plan_job(&original, Some(&source(2)), true).is_err());
         // Without a dialnorm from the source, AC-3 gets -27.
         let mut aac = source(2);

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{self, Color32};
-use upscaler_core::audio::ai::{Device, PACK_MISSING};
+use upscaler_core::audio::ai::{
+    Device, PACK_MISSING, PACK_MISSING_BOTH, PACK_MISSING_ENHANCE, PACK_MISSING_SEPARATION,
+};
 use upscaler_core::audio::job::{self as audio_job, AudioStage, Kind};
 use upscaler_core::audio::pack;
 use upscaler_core::audio::source::SourceAudio;
@@ -20,8 +22,14 @@ use crate::worker;
 /// The installed pack's size on disk (about 5.7 GB with the GPU torch), for the install button.
 pub const PACK_SIZE_BYTES: u64 = 5_700_000_000;
 
-/// Rough local-AI speed on a CPU: seconds of work per minute of audio.
+/// Rough local-AI separation speed on a CPU: seconds of work per minute of audio (measured:
+/// 250 s on the CPU against about 20 s on the GPU).
 pub const CPU_SECONDS_PER_AUDIO_MINUTE: f64 = 250.0;
+/// Enhancement (Apollo) per pass on a CPU, seconds per minute of audio. Measured only on the
+/// GPU (about 42 s per minute and pass); assumed to slow down on the CPU as much as the
+/// separation does (250 / 20), so about 525 s. A 5.1 result takes three passes (fronts,
+/// centre, surrounds), stereo and mono one.
+pub const CPU_ENHANCE_SECONDS_PER_AUDIO_MINUTE: f64 = 42.0 * 250.0 / 20.0;
 
 /// The AI audio pack exists for Windows only (AMD ROCm torch wheels); elsewhere only the
 /// classic engine is offered.
@@ -98,11 +106,53 @@ fn lfe_label(l: LfeLevel) -> &'static str {
     }
 }
 
-/// "the CPU – about N h per episode" for a video of `duration` seconds.
-fn cpu_estimate(duration: Option<f64>) -> String {
+/// What the local AI would do in an export started now: separate, and how many
+/// enhancement passes. Judged from the plan when the source is known, else from the settings.
+/// When the settings use no AI at all (the settings tab), the separation stands in.
+fn ai_work(app: &UpscalerApp) -> (bool, u32) {
+    let s = &app.settings;
+    let passes = |channels: usize| match (s.audio_enhance, channels) {
+        (false, _) => 0,
+        (true, 6) => 3,
+        (true, _) => 1,
+    };
+    let planned = match source_of(app) {
+        Source::Some(a) => audio_job::plan_job(s, Some(a), true).ok(),
+        _ => None,
+    };
+    let work = match planned {
+        Some(p) => (p.kind == Kind::UpmixAi, passes(p.channels())),
+        None => {
+            let surround = s.audio_mode == AudioMode::Surround;
+            (
+                surround && s.surround_engine == SurroundEngine::LocalAi,
+                passes(if surround { 6 } else { 2 }),
+            )
+        }
+    };
+    if work == (false, 0) {
+        (true, 0)
+    } else {
+        work
+    }
+}
+
+/// CPU seconds per minute of audio for that work.
+fn cpu_seconds_per_minute((separate, passes): (bool, u32)) -> f64 {
+    let sep = if separate {
+        CPU_SECONDS_PER_AUDIO_MINUTE
+    } else {
+        0.0
+    };
+    sep + passes as f64 * CPU_ENHANCE_SECONDS_PER_AUDIO_MINUTE
+}
+
+/// "the CPU – about N h per episode" for a video of `duration` seconds and `per_minute`
+/// seconds of work per minute of audio.
+fn cpu_estimate(duration: Option<f64>, per_minute: f64) -> String {
     match duration.filter(|d| *d > 0.0) {
         Some(d) => {
-            let secs = d / 60.0 * CPU_SECONDS_PER_AUDIO_MINUTE;
+            let secs = d / 60.0 * per_minute;
             if secs >= 3600.0 {
                 format!(
                     "{} {:.0} {}",
@@ -119,11 +169,12 @@ fn cpu_estimate(duration: Option<f64>) -> String {
                 )
             }
         }
-        None => tr(
-            "processorn – cirka 4 tim per timme ljud",
-            "the CPU – about 4 h per hour of audio",
-        )
-        .into(),
+        None => format!(
+            "{} {:.0} {}",
+            tr("processorn – cirka", "the CPU – about"),
+            (per_minute / 60.0).round().max(1.0),
+            tr("tim per timme ljud", "h per hour of audio")
+        ),
     }
 }
 
@@ -148,7 +199,10 @@ fn device_line(app: &UpscalerApp) -> Option<(Color32, String, Option<String>)> {
             format!(
                 "{} {}",
                 tr("Körs på", "Runs on"),
-                cpu_estimate(app.video.as_ref().map(|v| v.info.duration))
+                cpu_estimate(
+                    app.video.as_ref().map(|v| v.info.duration),
+                    cpu_seconds_per_minute(ai_work(app))
+                )
             ),
             st.cpu_reason.clone(),
         )),
@@ -305,8 +359,8 @@ pub fn side_section(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     })
                     .response
                     .on_hover_text(tr(
-                        "AI delar upp ljudet i tal, musik och effekter och placerar dem i rummet. Klassisk använder ett filter: snabbt, men tal hamnar oftare även i fronthögtalarna.",
-                        "The AI splits the sound into speech, music and effects and places them in the room. Classic uses a filter: fast, but speech more often leaks into the front speakers.",
+                        "AI delar upp ljudet i tal, musik och effekter och placerar dem i rummet. Klassisk tar själv ut det som ligger mitt i stereobilden till mitthögtalaren: snabbt och utan AI, och dialogen hamnar stadigt i mitten, men den skiljer inte tal från musik eller effekter som också ligger i mitten, så de flyttar dit också.",
+                        "The AI splits the sound into speech, music and effects and places them in the room. Classic extracts what sits in the middle of the stereo image to the centre speaker itself: fast and without AI, and dialogue sits firmly in the centre, but it cannot tell speech from music or effects that are also centred, so those move to the centre too.",
                     ))
                     .on_disabled_hover_text(tr(
                         "Källan är redan 5.1: kanalerna behålls, ingen uppmixning.",
@@ -380,6 +434,21 @@ pub fn export_needs_ai(app: &UpscalerApp) -> bool {
     }
 }
 
+/// Whether an export started now makes new audio (and so an MKV), as far as the source is
+/// known: not when nothing changes the audio, such as 5.1 chosen for a 5.1 source without
+/// enhancement.
+pub fn export_makes_audio(app: &UpscalerApp) -> bool {
+    let s = &app.settings;
+    if !s.audio_active() {
+        return false;
+    }
+    match source_of(app) {
+        Source::Some(a) => !audio_job::keeps_original(s, a),
+        Source::None => false,
+        Source::NoVideo | Source::Reading | Source::Failed(_) => true,
+    }
+}
+
 /// Where the work runs, what the file gets, and the "pack missing" warning.
 fn status_lines(
     ui: &mut egui::Ui,
@@ -411,6 +480,17 @@ fn status_lines(
             ))
             .small()
             .color(BAD),
+        );
+        return;
+    }
+    if src.is_some_and(|a| audio_job::keeps_original(s, a)) {
+        ui.label(
+            egui::RichText::new(tr(
+                "Källan är redan 5.1 – ljudet behålls som det är (MP4).",
+                "The source is already 5.1 – the audio is kept as is (MP4).",
+            ))
+            .weak()
+            .small(),
         );
         return;
     }
@@ -450,7 +530,10 @@ fn status_lines(
                     ));
                 }
             }
-            None => pack_missing(ui, app),
+            None => {
+                let (separate, passes) = ai_work(app);
+                pack_missing(ui, app, separate, passes > 0);
+            }
         }
     } else if matches!(&plan, Some(Ok(p)) if p.kind == Kind::UpmixClassic) {
         ui.label(
@@ -473,28 +556,30 @@ fn status_lines(
     ui.label(egui::RichText::new(out).small());
 }
 
-fn pack_missing(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+/// The "pack missing" box, suggesting what fits what the AI is needed for.
+fn pack_missing(ui: &mut egui::Ui, app: &mut UpscalerApp, separate: bool, enhance: bool) {
+    let text = match (separate, enhance) {
+        (true, true) => tr(
+            "Ljud-AI är inte installerat. Installera det, eller välj Klassisk motor och stäng av Förbättra ljudkvaliteten.",
+            "The audio AI is not installed. Install it, or choose the Classic engine and turn off Improve the audio quality.",
+        ),
+        (false, true) => tr(
+            "Ljud-AI är inte installerat. Installera det, eller stäng av Förbättra ljudkvaliteten.",
+            "The audio AI is not installed. Install it, or turn off Improve the audio quality.",
+        ),
+        _ => tr(
+            "Ljud-AI är inte installerat. Installera det, eller välj Klassisk motor.",
+            "The audio AI is not installed. Install it, or choose the Classic engine.",
+        ),
+    };
     egui::Frame::new()
         .fill(WARN.linear_multiply(0.12))
         .stroke(egui::Stroke::new(1.0, WARN.linear_multiply(0.6)))
         .corner_radius(4.0)
         .inner_margin(6.0)
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "⚠ {}",
-                    tr(
-                        "Ljud-AI är inte installerat. Installera det, eller välj Klassisk motor och stäng av Förbättra ljudkvaliteten.",
-                        "The audio AI is not installed. Install it, or choose the Classic engine and turn off Improve the audio quality.",
-                    )
-                ))
-                .small()
-                .color(WARN),
-            );
-            if ui
-                .button(tr("Öppna Ljud-AI…", "Open Audio AI…"))
-                .clicked()
-            {
+            ui.label(egui::RichText::new(format!("⚠ {text}")).small().color(WARN));
+            if ui.button(tr("Öppna Ljud-AI…", "Open Audio AI…")).clicked() {
                 app.settings_ui.open = true;
                 app.settings_ui.tab = crate::ui::settings_window::TAB_AUDIO_AI;
             }
@@ -605,6 +690,7 @@ pub fn pack_tab(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                             ui.label(
                                 egui::RichText::new(cpu_estimate(
                                     app.video.as_ref().map(|v| v.info.duration),
+                                    cpu_seconds_per_minute(ai_work(app)),
                                 ))
                                 .color(WARN),
                             );
@@ -823,9 +909,9 @@ pub fn stage_name(s: AudioStage) -> &'static str {
 
 /// The audio job's English warnings in the UI language; unknown ones as they are, prefixed.
 pub fn warning_text(w: &str) -> String {
-    const CPU: &str = "The local AI audio pack runs on the CPU: audio separation will be slow.";
     if english() {
-        return if w == CPU
+        return if w == audio_job::CPU_SLOW_SEPARATION
+            || w == audio_job::CPU_SLOW_ENHANCE
             || w.starts_with("The new audio")
             || w.starts_with("The loudness check")
             || w.starts_with("The sync check")
@@ -835,8 +921,11 @@ pub fn warning_text(w: &str) -> String {
             format!("Audio warning: {w}")
         };
     }
-    if w == CPU {
+    if w == audio_job::CPU_SLOW_SEPARATION {
         return "Ljud-AI körs på processorn: ljudseparationen blir långsam.".into();
+    }
+    if w == audio_job::CPU_SLOW_ENHANCE {
+        return "Ljud-AI körs på processorn: ljudförbättringen blir långsam.".into();
     }
     if let Some(v) = w
         .strip_prefix("The new audio's loudness differs from the source by ")
@@ -897,17 +986,42 @@ pub fn plan_error_text(e: &str) -> String {
         )
         .into();
     }
+    if e.contains(audio_job::ALREADY_51) {
+        return tr(
+            "Källan är redan 5.1 – ljudet behålls som det är.",
+            "The source is already 5.1 – the audio is kept as is.",
+        )
+        .into();
+    }
     error_text(e)
 }
 
 /// An export error in the UI language when it is a known audio one.
 pub fn error_text(e: &str) -> String {
-    if e.contains(PACK_MISSING) {
-        return tr(
-            "Ljud-AI är inte installerat (eller inte komplett). Installera det under Inställningar ➡ Ljud-AI, eller välj den klassiska 5.1-motorn.",
-            PACK_MISSING,
-        )
-        .into();
+    const INSTALL: &str =
+        "Ljud-AI är inte installerat (eller inte komplett). Installera det under Inställningar ➡ Ljud-AI";
+    for (en, sv_end) in [
+        (
+            PACK_MISSING_BOTH,
+            ", eller välj den klassiska 5.1-motorn och stäng av Förbättra ljudkvaliteten.",
+        ),
+        (
+            PACK_MISSING_SEPARATION,
+            ", eller välj den klassiska 5.1-motorn.",
+        ),
+        (
+            PACK_MISSING_ENHANCE,
+            ", eller stäng av Förbättra ljudkvaliteten.",
+        ),
+        (PACK_MISSING, "."),
+    ] {
+        if e.contains(en) {
+            return if english() {
+                en.to_string()
+            } else {
+                format!("{INSTALL}{sv_end}")
+            };
+        }
     }
     e.to_string()
 }
@@ -983,15 +1097,90 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_english(false);
+        let sep = cpu_seconds_per_minute((true, 0));
+        assert_eq!(sep, 250.0);
         // 45 min × 250 s = 3.1 h.
         assert_eq!(
-            cpu_estimate(Some(45.0 * 60.0)),
+            cpu_estimate(Some(45.0 * 60.0), sep),
             "processorn – cirka 3 tim per avsnitt"
         );
         // 5 min × 250 s ≈ 21 min.
         assert_eq!(
-            cpu_estimate(Some(300.0)),
+            cpu_estimate(Some(300.0), sep),
             "processorn – cirka 21 min för den här videon"
+        );
+        assert_eq!(
+            cpu_estimate(None, sep),
+            "processorn – cirka 4 tim per timme ljud"
+        );
+        // Enhancement counts: one pass for stereo, three for 5.1 (525 s each).
+        assert_eq!(cpu_seconds_per_minute((false, 1)), 525.0);
+        let all = cpu_seconds_per_minute((true, 3));
+        assert_eq!(all, 250.0 + 3.0 * 525.0);
+        // 45 min × 1825 s ≈ 22.8 h.
+        assert_eq!(
+            cpu_estimate(Some(45.0 * 60.0), all),
+            "processorn – cirka 23 tim per avsnitt"
+        );
+    }
+
+    #[test]
+    fn pack_missing_and_cpu_texts_fit_the_job() {
+        let _lang = crate::i18n::TEST_LANGUAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_english(false);
+        let src = SourceAudio {
+            channels: 2,
+            codec: "ac3".into(),
+            dolby_surround: false,
+            dialnorm: None,
+        };
+        let refusal = |mode, enhance| {
+            let s = upscaler_core::settings::Settings {
+                audio_mode: mode,
+                surround_engine: SurroundEngine::LocalAi,
+                audio_enhance: enhance,
+                ..Default::default()
+            };
+            plan_error_text(
+                &audio_job::plan_job(&s, Some(&src), false)
+                    .unwrap_err()
+                    .to_string(),
+            )
+        };
+        // Only the enhancement needs the pack: no "choose Classic".
+        let t = refusal(AudioMode::Original, true);
+        assert!(
+            t.ends_with("eller stäng av Förbättra ljudkvaliteten."),
+            "{t}"
+        );
+        assert!(!t.contains("klassiska"), "{t}");
+        let t = refusal(AudioMode::Surround, false);
+        assert!(t.ends_with("eller välj den klassiska 5.1-motorn."), "{t}");
+        let t = refusal(AudioMode::Surround, true);
+        assert!(
+            t.contains("klassiska") && t.contains("Förbättra ljudkvaliteten"),
+            "{t}"
+        );
+        assert!(error_text(PACK_MISSING).ends_with("Ljud-AI."));
+        assert_eq!(
+            warning_text(audio_job::CPU_SLOW_ENHANCE),
+            "Ljud-AI körs på processorn: ljudförbättringen blir långsam."
+        );
+        let mut five = src.clone();
+        five.channels = 6;
+        let s = upscaler_core::settings::Settings {
+            audio_mode: AudioMode::Surround,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_error_text(
+                &audio_job::plan_job(&s, Some(&five), true)
+                    .unwrap_err()
+                    .to_string()
+            ),
+            "Källan är redan 5.1 – ljudet behålls som det är."
         );
     }
 }

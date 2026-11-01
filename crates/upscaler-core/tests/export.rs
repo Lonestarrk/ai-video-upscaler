@@ -845,6 +845,59 @@ fn failed_mux_leaves_out_untouched() {
     assert_eq!(std::fs::read(&out).unwrap(), before);
 }
 
+/// A 5.1 source with 5.1 chosen and no enhancement has nothing to change: the export takes
+/// the MP4 path with the source audio, like "Unchanged", with no audio job (and no pack, even
+/// with the AI engine chosen).
+#[test]
+fn five_one_source_keeps_its_audio() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("surround.mkv");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=160x90:rate=24:duration=1")
+        .args(["-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:duration=1,aformat=channel_layouts=5.1(side)")
+        .args([
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "ac3",
+            "-shortest",
+        ])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let work = dir.path().join("work");
+    let mut settings = surround_settings(&work);
+    settings.surround_engine = SurroundEngine::LocalAi;
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 12,
+        output: dir.path().join("out.mp4"),
+        settings,
+    };
+    let log = run_events(&tools, &spec);
+    assert_eq!(
+        log.last().unwrap(),
+        &format!("finished {}", spec.output.display()),
+        "{log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("Audio")), "{log:?}");
+    assert!(!dir.path().join("out.mkv").exists());
+    assert!(!work.join("audio").exists(), "no audio job may run");
+    let a = stream_entries(&tools, &spec.output, "a:0", "stream=channels");
+    assert_eq!(entry(&a, "channels").as_deref(), Some("6"), "{a}");
+}
+
 #[test]
 fn missing_pack_fails_before_frames() {
     let Some(tools) = Tools::locate("") else {

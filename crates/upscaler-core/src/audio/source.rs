@@ -88,11 +88,6 @@ pub struct SourceAudio {
 }
 
 impl SourceAudio {
-    /// Stereo can be turned into 5.1 (mono cannot, 5.1 already is).
-    pub fn can_upmix(&self) -> bool {
-        self.channels == 2
-    }
-
     pub fn is_surround(&self) -> bool {
         self.channels >= 6
     }

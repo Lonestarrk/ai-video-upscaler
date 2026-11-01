@@ -13,11 +13,31 @@ const CENTRE_HIGHPASS_HZ: f32 = 70.0;
 /// `L = FL + 0.7071 * FC` then rebuilds the source exactly. Shared with the
 /// classic path.
 pub(crate) const CENTRE_GAIN: f32 = std::f32::consts::SQRT_2;
-/// The ITU downmix coefficient for FC and the surrounds (-3 dB), `1 / CENTRE_GAIN`.
+/// The standard ITU-R BS.775 downmix coefficient for FC and the surrounds: the fixed
+/// -3 dB (1/√2) of `L = FL + 0.7071 FC + 0.7071 SL`. It is a property of the downmix, not
+/// derived from [`CENTRE_GAIN`]; that the two cancel is what makes the downmix rebuild the
+/// source.
 pub(crate) const DOWNMIX_FC: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const SURROUND_GAIN_DB: f32 = -3.0;
+/// Surround channels lag the fronts by 15 ms, as a cinema decoder does.
 const SURROUND_DELAY_S: f32 = 0.015;
 const SURROUND_BAND: (f32, f32) = (100.0, 7000.0);
+
+/// The two surround channels (SL, SR) from a side signal `(L − R) / 2`: band-passed to
+/// 100–7000 Hz, delayed 15 ms, decorrelated (seeds 1 and 2) and at −3 dB. Shared by the AI
+/// placement and the classic upmix.
+pub(crate) fn surrounds(side: &[f32], rate: f32) -> [Vec<f32>; 2] {
+    let side = band(side, SURROUND_BAND.0, SURROUND_BAND.1, rate);
+    let side = delay(&side, (SURROUND_DELAY_S * rate).round() as usize);
+    let g = db_to_gain(SURROUND_GAIN_DB);
+    let surround = |seed: u32| -> Vec<f32> {
+        decorrelate(&side, seed)
+            .into_iter()
+            .map(|v| v * g)
+            .collect()
+    };
+    [surround(1), surround(2)]
+}
 
 /// Channel `i` of `p`, zero-padded or trimmed to `len` samples (AI stems can
 /// differ from the source by a few samples).
@@ -77,20 +97,12 @@ pub fn place(src: &Pcm, speech: &Pcm, music: &Pcm, effects: &Pcm, level: LfeLeve
     let side: Vec<f32> = (0..n)
         .map(|i| ((ml[i] + el[i]) - (mr[i] + er[i])) * 0.5)
         .collect();
-    let side = band(&side, SURROUND_BAND.0, SURROUND_BAND.1, rate);
-    let side = delay(&side, (SURROUND_DELAY_S * rate).round() as usize);
-    let g = db_to_gain(SURROUND_GAIN_DB);
-    let surround = |seed: u32| -> Vec<f32> {
-        decorrelate(&side, seed)
-            .into_iter()
-            .map(|v| v * g)
-            .collect()
-    };
+    let [sl, sr] = surrounds(&side, rate);
 
     let mono_fx = zip2(&el, &er, |a, b| (a + b) * 0.5);
     let lfe = make_lfe(&mono_fx, LfeSource::Effects, level, rate);
 
-    Pcm::from_channels(RATE, &[fl, fr, fc, lfe, surround(1), surround(2)])
+    Pcm::from_channels(RATE, &[fl, fr, fc, lfe, sl, sr])
 }
 
 #[cfg(test)]

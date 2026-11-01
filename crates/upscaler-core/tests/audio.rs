@@ -46,7 +46,7 @@ fn detects_flag_and_layouts() {
     assert_eq!((stereo.channels, stereo.codec.as_str()), (2, "ac3"));
     assert!(stereo.dolby_surround);
     assert!(stereo.dialnorm.is_some());
-    assert!(stereo.can_upmix() && !stereo.is_surround());
+    assert!(stereo.channels == 2 && !stereo.is_surround());
 
     let plain = probe(
         "plain.mkv",
@@ -67,7 +67,7 @@ fn detects_flag_and_layouts() {
         ],
     );
     assert_eq!((mono.channels, mono.codec.as_str()), (1, "aac"));
-    assert!(!mono.can_upmix() && !mono.is_surround() && !mono.dolby_surround);
+    assert!(!mono.is_surround() && !mono.dolby_surround);
 
     let surround = probe(
         "surround.mkv",
@@ -78,7 +78,7 @@ fn detects_flag_and_layouts() {
         ],
     );
     assert_eq!(surround.channels, 6);
-    assert!(!surround.can_upmix() && surround.is_surround());
+    assert!(surround.is_surround());
 
     // No audio at all.
     let silent = dir.path().join("silent.mp4");
@@ -98,7 +98,9 @@ mod io_tests {
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
-    use upscaler_core::audio::io::{encode_stream, extract, read_wav, write_wav, AudioCodec, Pcm};
+    use upscaler_core::audio::io::{
+        encode_stream_filtered, extract, read_wav, write_wav, AudioCodec, Pcm,
+    };
     use upscaler_core::ffmpeg::Tools;
 
     fn tools() -> Option<Tools> {
@@ -195,7 +197,8 @@ mod io_tests {
             (AudioCodec::Ac3At640 { dialnorm: -27 }, "a.ac3"),
         ] {
             let out = dir.path().join(name);
-            let mut enc = encode_stream(&tools, 6, "5.1(side)", codec, &out, &cancel).unwrap();
+            let mut enc =
+                encode_stream_filtered(&tools, 6, "5.1(side)", codec, None, &out, &cancel).unwrap();
             for chunk in pcm.samples.chunks(6 * 4800) {
                 enc.write(chunk).unwrap();
             }
@@ -239,7 +242,7 @@ mod job_tests {
         JobOptions,
     };
     use upscaler_core::ffmpeg::{self, Tools};
-    use upscaler_core::settings::{AudioMode, Settings, SurroundEngine};
+    use upscaler_core::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
     fn tools() -> Option<Tools> {
         let t = Tools::locate("");
@@ -487,7 +490,8 @@ mod job_tests {
             .iter()
             .filter(|e| **e == AudioEvent::Stage(AudioStage::Encoding))
             .count();
-        assert!(encodes >= 2, "no corrective re-encode ({encodes})");
+        // Encoding is reported for the corrective re-encode only, never for the first encode.
+        assert_eq!(encodes, 1, "corrective re-encodes: {encodes}");
         assert!(
             !result
                 .warnings
@@ -498,6 +502,111 @@ mod job_tests {
         );
         let dec = decode(&tools, result.tracks[0].path(), &dir.path().join("out.wav"));
         assert_eq!((dec.channels, dec.frames()), (6, 6 * RATE as usize));
+    }
+
+    /// Fake separation that counts its calls: fixed fractions of the input per stem.
+    #[derive(Default)]
+    struct CountingAi {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl upscaler_core::audio::ai::AudioAi for CountingAi {
+        fn separate(
+            &self,
+            wav: &Path,
+            out_dir: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<upscaler_core::audio::ai::Stems> {
+            use upscaler_core::audio::io::write_wav;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let x = read_wav(wav)?;
+            std::fs::create_dir_all(out_dir)?;
+            let scaled = |g: f32| Pcm {
+                rate: x.rate,
+                channels: x.channels,
+                samples: x.samples.iter().map(|v| v * g).collect(),
+            };
+            let stems = upscaler_core::audio::ai::Stems {
+                speech: out_dir.join("speech.wav"),
+                music: out_dir.join("music.wav"),
+                effects: out_dir.join("effects.wav"),
+            };
+            write_wav(&stems.speech, &scaled(0.3))?;
+            write_wav(&stems.music, &scaled(0.2))?;
+            write_wav(&stems.effects, &scaled(0.5))?;
+            Ok(stems)
+        }
+
+        fn enhance(
+            &self,
+            _wav: &Path,
+            _out: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    /// An LFE A/B on the same range: the second level places the cached stems again, with no
+    /// separation, and only the LFE changes.
+    #[test]
+    fn lfe_change_reuses_the_stems() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("bass.mkv");
+        // Bass hits (50 Hz, 0.3 s each second) over quiet noise.
+        let bass = "0.4*sin(2*PI*50*t)*lt(mod(t\\,1)\\,0.3)";
+        video(
+            &tools,
+            &src,
+            6,
+            &format!("aevalsrc={bass}+0.03*random(0)|{bass}+0.03*random(1):s=48000:d=6"),
+        );
+        let info = ffmpeg::probe(&tools, &src).unwrap();
+        let ai = CountingAi::default();
+        let opts = JobOptions {
+            section_frames: 3 * RATE as u64,
+            overlap_frames: RATE as u64,
+        };
+        let export = |lfe: LfeLevel| {
+            let mut settings = surround_settings(dir.path(), SurroundEngine::LocalAi);
+            settings.lfe_level = lfe;
+            let spec = AudioSpec {
+                info: info.clone(),
+                start: 0,
+                end: 144,
+                settings,
+            };
+            let result = run_with(
+                &tools,
+                &spec,
+                Some(&ai),
+                &AtomicBool::new(false),
+                &|_| {},
+                &opts,
+            )
+            .unwrap();
+            let name = format!("{lfe:?}.wav");
+            decode(&tools, result.tracks[0].path(), &dir.path().join(name))
+        };
+        let normal = export(LfeLevel::Normal);
+        let separated = ai.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(separated, 3, "sections separated on the first run");
+        let strong = export(LfeLevel::Strong);
+        assert_eq!(
+            ai.calls.load(std::sync::atomic::Ordering::SeqCst),
+            separated,
+            "the second LFE level separated again"
+        );
+        let (n, s) = (rms_db(&normal.channel(3)), rms_db(&strong.channel(3)));
+        assert!(s > n + 1.0, "LFE Strong {s:.1} dB, Normal {n:.1} dB");
+        // The other channels come from the same stems.
+        for c in [0, 1, 2, 4, 5] {
+            let d = rms_db(&normal.channel(c)) - rms_db(&strong.channel(c));
+            assert!(d.abs() < 1.5, "channel {c} changed by {d:.2} dB");
+        }
     }
 
     /// Fake separation: everything is speech, so all of a centred source lands in FC.

@@ -23,7 +23,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use image::RgbImage;
 
-use crate::audio::ai::{AudioAi, Device, LocalAi};
+use crate::audio::ai::{AudioAi, Device, LocalAi, PACK_MISSING};
 use crate::audio::job::{self as audio_job, AudioEvent, AudioSpec};
 use crate::cache;
 use crate::ffmpeg::{self, EncodeOptions, Range, Tools, VideoInfo};
@@ -337,6 +337,12 @@ fn prepare_audio(
     let Some(source) = crate::audio::source::analyse(tools, &spec.info)? else {
         return Ok(None);
     };
+    // A 5.1 source with 5.1 chosen and no enhancement: nothing to change, so the original
+    // audio is copied as with "Unchanged" instead of transcoded to the same thing.
+    if audio_job::keeps_original(s, &source) {
+        log::info!("export: the source is already 5.1, its audio is kept as it is");
+        return Ok(None);
+    }
     let (ai, open_error) = if audio_job::may_use_ai(s) {
         match LocalAi::open() {
             Ok(ai) => (Some(ai), None),
@@ -348,9 +354,12 @@ fn prepare_audio(
     let plan = match audio_job::plan_job(s, Some(&source), ai.is_some()) {
         Ok(plan) => plan,
         Err(e) => {
-            // When only the pack is missing, its own error says why (and which button).
+            // The plan's own "pack missing" text says what to change for this job; any other
+            // failure to open the pack says why.
             if let Some(open_error) = open_error {
-                if audio_job::plan_job(s, Some(&source), true).is_ok() {
+                if audio_job::plan_job(s, Some(&source), true).is_ok()
+                    && open_error.to_string() != PACK_MISSING
+                {
                     return Err(open_error);
                 }
             }
@@ -360,7 +369,7 @@ fn prepare_audio(
     // The device recorded when the pack was installed: free to read, unlike asking the
     // worker (which starts Python and loads torch). A CPU never fails the export.
     if plan.needs_ai() && ai.as_ref().is_some_and(|a| a.device == Device::Cpu) {
-        let w = "The local AI audio pack runs on the CPU: audio separation will be slow.";
+        let w = plan.cpu_warning();
         log::warn!("{w}");
         emit(ExportEvent::Audio(AudioEvent::Warning(w.to_string())));
     }
@@ -1530,15 +1539,19 @@ fn review_frame(
     Ok(crate::review::confirm(first, second))
 }
 
-/// Removes the source frames of finished jobs; with `everything` also previews, results and temp files.
+/// Empties the work folder. With `everything`: previews, export jobs, audio jobs (with the
+/// stem cache) and temp files. Otherwise only what can be made again cheaply: the temp files
+/// and the audio jobs' big intermediates (extracted source, sections, temp files), keeping
+/// finished audio tracks and the stem cache, which costs an AI separation to make again.
 pub fn clean_work_dir(settings: &Settings, everything: bool) -> Result<()> {
     let w = settings.work_dir();
     if everything {
-        for sub in ["previews", "jobs", "tmp"] {
+        for sub in ["previews", "jobs", "audio", "tmp"] {
             let _ = std::fs::remove_dir_all(w.join(sub));
         }
     } else {
         let _ = std::fs::remove_dir_all(w.join("tmp"));
+        audio_job::clean_intermediates(&w);
     }
     Ok(())
 }
@@ -1859,5 +1872,46 @@ mod tests {
         let r = st[0].record.clone().unwrap();
         assert_eq!(r.attempts, 2);
         assert!(r.history.is_empty());
+    }
+
+    #[test]
+    fn clean_work_dir_handles_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            project_dir: Some(dir.path().to_path_buf()),
+            ..Settings::default()
+        };
+        let w = settings.work_dir();
+        let ajob = w.join("audio").join("key");
+        let stems = w
+            .join("audio")
+            .join(audio_job::STEMS_DIR)
+            .join("k")
+            .join("000");
+        for d in [
+            w.join("previews"),
+            w.join("jobs").join("j"),
+            w.join("tmp").join("t"),
+            ajob.join("sections"),
+            stems.clone(),
+        ] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        std::fs::write(ajob.join("source.f32"), b"x").unwrap();
+        std::fs::write(ajob.join("surround.flac"), b"x").unwrap();
+        std::fs::write(stems.join("music.wav"), b"x").unwrap();
+
+        // Light: temp files and audio intermediates go; tracks, stems and jobs stay.
+        clean_work_dir(&settings, false).unwrap();
+        assert!(!w.join("tmp").exists());
+        assert!(!ajob.join("source.f32").exists() && !ajob.join("sections").exists());
+        assert!(ajob.join("surround.flac").is_file() && stems.join("music.wav").is_file());
+        assert!(w.join("jobs").join("j").is_dir() && w.join("previews").is_dir());
+
+        // Everything: the audio folder goes too.
+        clean_work_dir(&settings, true).unwrap();
+        for sub in ["previews", "jobs", "audio", "tmp"] {
+            assert!(!w.join(sub).exists(), "{sub}");
+        }
     }
 }

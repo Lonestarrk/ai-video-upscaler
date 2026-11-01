@@ -215,6 +215,9 @@ pub struct UpscalerApp {
     pub settings_ui: SettingsUi,
     pub audio_pack: AudioPackUi,
     pub error: Option<String>,
+    /// An export target the save dialog did not ask about (the forced `.mkv` of a typed
+    /// `.mp4`) that exists: waits for the user's yes before it is overwritten.
+    pub confirm_overwrite: Option<PathBuf>,
     /// Settings that change the result: when they change, the shown result is looked up again.
     result_settings_key: String,
     pub new_preset_name: String,
@@ -261,6 +264,7 @@ impl UpscalerApp {
             settings_ui: SettingsUi::default(),
             audio_pack,
             error: None,
+            confirm_overwrite: None,
             result_settings_key: key,
             new_preset_name: String::new(),
         };
@@ -504,14 +508,14 @@ impl UpscalerApp {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "video".into());
-        let (w, h) = upscaler_core::job::geometry(&self.settings, &v.info).stored;
+        let (_, h) = upscaler_core::job::geometry(&self.settings, &v.info).stored;
         let last = self
             .project
             .as_ref()
             .and_then(|p| p.data.last_output.clone());
         // New audio is muxed into an MKV (core writes `<name>.mkv`): offer and force that
         // name here, so the dialog's overwrite prompt is about the file really written.
-        let audio_path = self.settings.audio_active() && v.info.has_audio;
+        let audio_path = ui::audio::export_makes_audio(self);
         let (filter, ext) = if audio_path {
             ("MKV", "mkv")
         } else {
@@ -534,12 +538,26 @@ impl UpscalerApp {
                 }
             }
         }
-        let Some(mut output) = dialog.save_file() else {
+        let Some(chosen) = dialog.save_file() else {
             return;
         };
+        let mut output = chosen.clone();
         if audio_path || output.extension().is_none() {
             output.set_extension(ext);
         }
+        // The dialog only asked about the name typed (say `x.mp4`); the file really written
+        // (`x.mkv`) is asked about here before it is replaced.
+        if output != chosen && output.exists() && output != v.info.path {
+            self.confirm_overwrite = Some(output);
+            return;
+        }
+        self.launch_export(output);
+    }
+
+    /// Starts the export to `output` (already confirmed by the user).
+    pub fn launch_export(&mut self, output: PathBuf) {
+        let audio_path = ui::audio::export_makes_audio(self);
+        let Some(v) = &self.video else { return };
         if output == v.info.path {
             self.error = Some(
                 tr(
@@ -550,7 +568,6 @@ impl UpscalerApp {
             );
             return;
         }
-        let _ = w;
         if let Some(p) = &mut self.project {
             p.data.last_output = Some(output.clone());
         }
@@ -1217,6 +1234,7 @@ impl eframe::App for UpscalerApp {
         ui::settings_window::show(ui.ctx(), self);
         ui::frames::show(ui.ctx(), self);
         ui::dialogs::show(ui.ctx(), self);
+        ui::dialogs::confirm_overwrite(ui.ctx(), self);
         ui::dialogs::drop_overlay(ui.ctx());
     }
 

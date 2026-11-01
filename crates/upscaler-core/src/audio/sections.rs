@@ -19,8 +19,10 @@ pub struct Section {
 }
 
 /// Plans the sections covering `0..total` frames. Consecutive sections overlap
-/// by exactly `OVERLAP_SECONDS * rate` frames; a short range is one section.
-pub fn plan(total: u64, rate: u32) -> Vec<Section> {
+/// by exactly `OVERLAP_SECONDS * rate` frames; a short range is one section. The job uses
+/// [`plan_with`] with its own sizes; this is the default for the tests.
+#[cfg(test)]
+pub(crate) fn plan(total: u64, rate: u32) -> Vec<Section> {
     plan_with(
         total,
         SECTION_SECONDS * rate as u64,
