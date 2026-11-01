@@ -51,14 +51,14 @@ cargo fmt --all                            # run before committing
   - `audio/` the 5.1 / enhancement audio job (48 kHz f32, channel order FL FR FC LFE SL SR,
     `5.1(side)`): `source.rs` channels, codec, AC-3 Dolby Surround flag and dialnorm;
     `io.rs` exact-range extraction, WAV, streaming FFmpeg encoder; `sections.rs` 300 s
-    sections with 2 s Hann crossfades; `classic.rs` FFmpeg `surround` upmix + delayed,
+    sections with 2 s Hann crossfades; `classic.rs` STFT centre extraction + delayed,
     decorrelated surrounds; `ai.rs` + `pack.rs` the local AI pack (embeddable Python 3.12,
     ROCm or CPU PyTorch, MSST with BandIt Plus separation and Apollo repair; worker
-    `assets/audio_ai.py`) in `tools\audio-ai`; `place.rs` stems → 5.1 (speech in FC at +3 dB,
-    the ITU downmix FL + 0.7071·FC rebuilds the source; classic does the same); `lfe.rs` gated
-    20–90 Hz zero-phase LFE, 16/13/10 dB below the heard level, only bass rising above the
-    scene's steady background (a drone gets none), octave-down synthesis for Biokänsla; `enhance.rs` band-splice of Apollo above the codec
-    cutoff; `dsp.rs` filters; `job.rs` plan, resumable sections, FLAC + AC-3 encode, loudness
+    `assets/audio_ai.py`) in `tools\audio-ai`; `place.rs` stems → 5.1 (speech in FC at
+    +3 dB, the ITU downmix FL + 0.7071·FC rebuilds the source; classic does the same);
+    `lfe.rs` gated 20–90 Hz zero-phase LFE, 16/13/10 dB below the heard level, only bass
+    rising above the scene's steady background (a drone gets none), octave-down synthesis
+    for Biokänsla; `enhance.rs` band-splice of Apollo above the codec cutoff; `dsp.rs` filters; `job.rs` plan, resumable sections, FLAC + AC-3 encode, loudness
     (±1 LU), true peak (≤ -1 dBTP) and sync checks, cache in `<work>\audio\<key>`.
     `job.rs` (export) encodes the video to `video.mkv` in the job folder and
     `ffmpeg::mux` writes the MKV: FLAC 5.1 (default), AC-3 5.1, Original.

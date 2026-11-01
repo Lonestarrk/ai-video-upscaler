@@ -52,8 +52,10 @@ const BG_PERCENTILE: f32 = 0.2;
 const BG_SMOOTH_MS: f32 = 500.0;
 /// Rise gate: closed while the envelope is at most `RISE_CLOSED_DB` above the
 /// background, fully open from `RISE_OPEN_DB`, `RISE_RANGE_DB` when closed.
-const RISE_CLOSED_DB: f32 = 4.0;
-const RISE_OPEN_DB: f32 = 10.0;
+/// 6/12 dB: a drone throbbing +-5 dB at 2 Hz swings its envelope up to about
+/// 6 dB over the 20th percentile; 4/10 let it through at -23 dB instead of -30.
+const RISE_CLOSED_DB: f32 = 6.0;
+const RISE_OPEN_DB: f32 = 12.0;
 const RISE_RANGE_DB: f32 = -30.0;
 /// Opening follows the envelope's attack; closing is slow so a drone that
 /// pokes over the knee for a moment cannot flutter the gain.
@@ -219,9 +221,9 @@ fn soft_limit(x: f32) -> f32 {
 }
 
 /// Builds the LFE channel from `input` (same length as the input). The mains
-/// keep all their bass, so the LFE only adds bass that rises above the scene's
-/// own steady background: a constant drone (engine hum) gets almost none,
-/// explosions, impacts and music swells open it fully.
+/// keep all their bass, so the LFE opens only on bass that rises above the
+/// scene's steady background (explosions, impacts, musical peaks); a steady
+/// engine hum gives no LFE.
 pub fn make_lfe(input: &[f32], source: LfeSource, level: LfeLevel, rate: f32) -> Vec<f32> {
     build_lfe(input, source, level, rate, true)
 }
@@ -534,6 +536,56 @@ mod tests {
             println!("between impacts {gap}, old drone {old_drone}");
             assert!(gap <= old_drone - 20.0, "gap {gap} old drone {old_drone}");
         }
+    }
+
+    /// A pulsing drone (engine throb): the drone above, its level swinging +-5 dB at 2 Hz.
+    #[test]
+    fn pulsing_drone_gets_no_lfe() {
+        let n = 10 * 48_000;
+        let d = drone(n);
+        let x: Vec<f32> = d
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let t = i as f32 / RATE;
+                v * db_to_gain(5.0 * (2.0 * std::f32::consts::PI * 2.0 * t).sin())
+            })
+            .collect();
+        let after = |y: &[f32]| rms_db(&y[3 * 48_000..]);
+        for level in [LfeLevel::Normal, LfeLevel::Cinema] {
+            let old = after(&build_lfe(&x, LfeSource::Effects, level, RATE, false));
+            let new = after(&make_lfe(&x, LfeSource::Effects, level, RATE));
+            println!("{level:?}: pulsing drone LFE old {old} new {new}");
+            // The steady drone gets the full 30 dB; the throb may cost a little of it.
+            assert!(new <= old - 25.0, "{level:?}: old {old} new {new}");
+        }
+    }
+
+    /// Speech in bursts (1 s on, 1 s off) rises above the silent background, so the
+    /// background tracker opens for it: the voice guard alone must keep it out.
+    #[test]
+    fn voice_bursts_stay_out_with_tracker() {
+        let n = 8 * 48_000;
+        let voice: Vec<f32> = (0..n)
+            .map(|i| {
+                if (i / 48_000) % 2 == 1 {
+                    return 0.0;
+                }
+                let t = i as f32 / RATE;
+                let amp = db_to_gain(-23.0) * std::f32::consts::SQRT_2;
+                [90.0f32, 180.0, 270.0]
+                    .iter()
+                    .map(|f| amp * (2.0 * std::f32::consts::PI * f * t).sin())
+                    .sum()
+            })
+            .collect();
+        let lfe = make_lfe(&voice, LfeSource::MonoSum, LfeLevel::Normal, RATE);
+        let open = make_lfe(&voice, LfeSource::Effects, LfeLevel::Normal, RATE);
+        let (g, o) = (rms_db(&lfe), rms_db(&open));
+        println!("voice bursts: guarded {g} unguarded {o}");
+        // Without the guard the bursts do reach the LFE: the tracker is open for them.
+        assert!(o >= g + 10.0, "guarded {g} unguarded {o}");
+        assert!(g < -65.0, "guarded {g}");
     }
 
     #[test]

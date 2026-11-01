@@ -235,7 +235,8 @@ mod job_tests {
 
     use upscaler_core::audio::io::{encode_stream_filtered, read_wav, AudioCodec, Pcm, RATE};
     use upscaler_core::audio::job::{
-        job_dir, run, run_with, AudioEvent, AudioSpec, AudioStage, AudioTrack, JobOptions,
+        job_dir, parse_ebur128, run, run_with, AudioEvent, AudioSpec, AudioStage, AudioTrack,
+        JobOptions,
     };
     use upscaler_core::ffmpeg::{self, Tools};
     use upscaler_core::settings::{AudioMode, Settings, SurroundEngine};
@@ -497,6 +498,111 @@ mod job_tests {
         );
         let dec = decode(&tools, result.tracks[0].path(), &dir.path().join("out.wav"));
         assert_eq!((dec.channels, dec.frames()), (6, 6 * RATE as usize));
+    }
+
+    /// Fake separation: everything is speech, so all of a centred source lands in FC.
+    struct SpeechAi;
+
+    impl upscaler_core::audio::ai::AudioAi for SpeechAi {
+        fn separate(
+            &self,
+            wav: &Path,
+            out_dir: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<upscaler_core::audio::ai::Stems> {
+            use upscaler_core::audio::io::write_wav;
+            let x = read_wav(wav)?;
+            std::fs::create_dir_all(out_dir)?;
+            let silent = Pcm {
+                rate: x.rate,
+                channels: x.channels,
+                samples: vec![0.0; x.samples.len()],
+            };
+            let stems = upscaler_core::audio::ai::Stems {
+                speech: out_dir.join("speech.wav"),
+                music: out_dir.join("music.wav"),
+                effects: out_dir.join("effects.wav"),
+            };
+            write_wav(&stems.speech, &x)?;
+            write_wav(&stems.music, &silent)?;
+            write_wav(&stems.effects, &silent)?;
+            Ok(stems)
+        }
+
+        fn enhance(
+            &self,
+            _wav: &Path,
+            _out: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    /// A hot centred source (L = R at -1 dBFS) puts FC at +2 dBFS in f32 (FC is +3 dB).
+    /// The FLAC of the first pass clips at 0 dBFS, so the peak check must use the f32 peak:
+    /// the final track may have no clipped samples and must stay under -1 dBTP.
+    #[test]
+    fn hot_centre_does_not_clip() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("centre.mkv");
+        // A sweep, not a steady tone: a periodic signal makes the sync check ambiguous.
+        let tone = "0.89*sin(2*PI*(300*t+40*t*t))*(0.8+0.2*sin(2*PI*2*t))";
+        video(
+            &tools,
+            &src,
+            6,
+            &format!("aevalsrc={tone}|{tone}:s=48000:d=6"),
+        );
+        let info = ffmpeg::probe(&tools, &src).unwrap();
+        let ai = SpeechAi;
+        for (engine, ai) in [
+            (
+                SurroundEngine::LocalAi,
+                Some(&ai as &dyn upscaler_core::audio::ai::AudioAi),
+            ),
+            (SurroundEngine::Classic, None),
+        ] {
+            let spec = AudioSpec {
+                info: info.clone(),
+                start: 0,
+                end: 144,
+                settings: surround_settings(dir.path(), engine),
+            };
+            let result = run(&tools, &spec, ai, &AtomicBool::new(false), &|_| {}).unwrap();
+            eprintln!("{engine:?} warnings: {:?}", result.warnings);
+            let flac = result.tracks[0].path();
+            let dec = decode(&tools, flac, &dir.path().join("out.wav"));
+            let fc_peak = dec.channel(2).iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let peak = dec.samples.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let out = std::process::Command::new(&tools.ffmpeg)
+                .args(["-hide_banner", "-nostats", "-i"])
+                .arg(flac)
+                .args(["-af", "ebur128=peak=true", "-f", "null", "-"])
+                .output()
+                .unwrap();
+            let level = parse_ebur128(&String::from_utf8_lossy(&out.stderr)).unwrap();
+            eprintln!(
+                "{engine:?}: sample peak {:.2} dBFS (FC {:.2}), true peak {:.2} dBTP",
+                20.0 * peak.log10(),
+                20.0 * fc_peak.log10(),
+                level.true_peak
+            );
+            assert!(fc_peak > 0.5, "{engine:?}: FC empty ({fc_peak})");
+            assert!(peak < 0.95, "{engine:?}: sample peak {peak}");
+            assert!(level.true_peak <= -0.95, "{engine:?}: {}", level.true_peak);
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("dBTP") || w.contains("sync")),
+                "{:?}",
+                result.warnings
+            );
+        }
     }
 
     /// Pass-through AI: enhancement returns its input unchanged.

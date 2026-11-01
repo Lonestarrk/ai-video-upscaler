@@ -13,8 +13,7 @@ const CENTRE_HIGHPASS_HZ: f32 = 70.0;
 /// `L = FL + 0.7071 * FC` then rebuilds the source exactly. Shared with the
 /// classic path.
 pub(crate) const CENTRE_GAIN: f32 = std::f32::consts::SQRT_2;
-/// The ITU downmix coefficient for FC (-3 dB), `1 / CENTRE_GAIN`.
-#[cfg(test)]
+/// The ITU downmix coefficient for FC and the surrounds (-3 dB), `1 / CENTRE_GAIN`.
 pub(crate) const DOWNMIX_FC: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const SURROUND_GAIN_DB: f32 = -3.0;
 const SURROUND_DELAY_S: f32 = 0.015;

@@ -119,7 +119,7 @@ Som standard kopieras ljudet oförändrat. Under *Ljud* i sidopanelen kan du i s
 
 Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Mono kan inte bli 5.1.
 
-**Bas (LFE):** subwooferkanalen byggs av basen under 90 Hz, bara när det finns riktig bas (explosioner, motorer, musik med djup bas). Dialog öppnar den aldrig. Huvudkanalerna behåller all sin bas, så inget går förlorat om förstärkaren skickar basen till subwoofern ändå.
+**Bas (LFE):** subwooferkanalen byggs av basen under 90 Hz och öppnar bara för bas som stiger över scenens jämna bakgrund (explosioner, nedslag, toppar i musiken). Ett jämnt motorbrus, som skeppets brum på bryggan, ger ingen LFE. Dialog öppnar den aldrig. Huvudkanalerna behåller all sin bas, så inget går förlorat om förstärkaren skickar basen till subwoofern ändå.
 
 | Nivå | Vad den gör |
 |---|---|

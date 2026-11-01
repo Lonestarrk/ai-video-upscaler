@@ -36,7 +36,7 @@ use super::io::{
     AudioCodec, Pcm, RATE,
 };
 use super::pack;
-use super::place::place;
+use super::place::{place, CENTRE_GAIN, DOWNMIX_FC};
 use super::sections::{self, Section};
 use super::source::{self, SourceAudio};
 use crate::cache;
@@ -45,7 +45,7 @@ use crate::process::{self, is_cancelled, Cancelled};
 use crate::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
 /// Bumped whenever the job's output for the same inputs changes; part of the cache key.
-pub const AUDIO_VERSION: u32 = 5;
+pub const AUDIO_VERSION: u32 = 6;
 /// Frames of silence the AC-3 encoder puts in front of the signal (one block).
 const AC3_PRIMING: usize = 256;
 /// Channel layout of every 5.1 track: FL FR FC LFE SL SR.
@@ -59,6 +59,8 @@ pub const LIMITER: &str = "alimiter=limit=0.8414:level=0:latency=1:attack=5:rele
 
 const LOUDNESS_TOLERANCE_LU: f64 = 1.0;
 const TRUE_PEAK_MAX_DBTP: f64 = -1.0;
+/// Inter-sample allowance added to the f32 sample peak when the first encode clipped.
+const CLIPPED_PEAK_MARGIN_DB: f64 = 0.5;
 /// Most the loudness may drop for a static peak cut; beyond this the limiter is used.
 const MAX_PEAK_CUT_DB: f64 = 1.0;
 /// Integrated loudness at or under this is silence: no loudness correction.
@@ -444,7 +446,7 @@ pub fn run_with(
     job.render(ai, cancel, emit)?;
 
     emit(AudioEvent::Stage(AudioStage::Joining));
-    let mut tracks = job.encode(0.0, false, cancel, emit)?;
+    let (mut tracks, f32_peak) = job.encode(0.0, false, cancel, emit)?;
 
     emit(AudioEvent::Stage(AudioStage::Checking));
     let mut warnings = Vec::new();
@@ -454,12 +456,18 @@ pub fn run_with(
     };
     let first = tracks[0].path().to_path_buf();
     match job.check_levels(&first, cancel) {
-        Ok((src_level, res_level)) => {
+        Ok((src_level, mut res_level)) => {
+            // The FLAC clips at 0 dBFS, so its measured peak understates a hotter f32
+            // result (FC is written +3 dB). Then the f32 sample peak, plus the same 0.5 dB
+            // inter-sample allowance the limiter keeps, stands in for the true peak.
+            if f32_peak >= 1.0 {
+                let f32_peak_db = 20.0 * (f32_peak as f64).log10() + CLIPPED_PEAK_MARGIN_DB;
+                res_level.true_peak = res_level.true_peak.max(f32_peak_db);
+            }
             let (gain, limiter) = correction(&src_level, &res_level);
-            let mut res_level = res_level;
             if gain.abs() >= MIN_GAIN_DB || limiter {
                 emit(AudioEvent::Stage(AudioStage::Encoding));
-                tracks = job.encode(gain, limiter, cancel, emit)?;
+                tracks = job.encode(gain, limiter, cancel, emit)?.0;
                 emit(AudioEvent::Stage(AudioStage::Checking));
                 match measure(tools, &file_input(tracks[0].path()), false, cancel) {
                     Ok(l) => res_level = l,
@@ -650,14 +658,15 @@ fn enhance(
     ))
 }
 
-/// The mono downmix the sync check compares: FL + FR + 0.7071 FC + 0.7071 (SL + SR) for
-/// 5.1 (LFE left out), L + R for stereo.
+/// The mono downmix the sync check compares, on the scale of L + R: for 5.1 the ITU
+/// stereo downmix (L = FL + 0.7071 FC + 0.7071 SL, R likewise) summed, so
+/// FL + FR + sqrt 2 FC + 0.7071 (SL + SR), LFE left out; L + R for stereo. With FC written
+/// at [`CENTRE_GAIN`] this rebuilds the source's L + R plus the surrounds.
 fn downmix(p: &Pcm) -> Vec<f32> {
-    let k = std::f32::consts::FRAC_1_SQRT_2;
     p.samples
         .chunks_exact(p.channels.max(1))
         .map(|f| match f.len() {
-            6 => f[0] + f[1] + k * f[2] + k * (f[4] + f[5]),
+            6 => f[0] + f[1] + CENTRE_GAIN * f[2] + DOWNMIX_FC * (f[4] + f[5]),
             _ => f.iter().sum(),
         })
         .collect()
@@ -827,13 +836,15 @@ impl Job<'_> {
 
     /// Stitches into the FLAC (and for 5.1 the AC-3) encoder at once, with `gain_db` applied
     /// and optionally the limiter. Files are finished under a temporary name and renamed.
+    /// Also returns the f32 sample peak written (after the gain, before the limiter and the
+    /// encoders' clipping at 0 dBFS).
     fn encode(
         &self,
         gain_db: f64,
         limiter: bool,
         cancel: &AtomicBool,
         emit: &(dyn Fn(AudioEvent) + Sync),
-    ) -> Result<Vec<AudioTrack>> {
+    ) -> Result<(Vec<AudioTrack>, f32)> {
         let ch = self.plan.channels();
         let layout = self.plan.layout();
         let filter = limiter.then_some(LIMITER);
@@ -873,6 +884,7 @@ impl Job<'_> {
         }
         let gain = 10f32.powf(gain_db as f32 / 20.0);
         let mut scaled = Vec::new();
+        let mut peak = 0.0f32;
         self.stitch(|block| {
             for chunk in block.chunks(CHUNK_FRAMES * ch) {
                 let data = if gain_db == 0.0 {
@@ -882,6 +894,7 @@ impl Job<'_> {
                     scaled.extend(chunk.iter().map(|v| v * gain));
                     &scaled[..]
                 };
+                peak = data.iter().fold(peak, |m, v| m.max(v.abs()));
                 for (e, skip) in encoders.iter_mut() {
                     let drop = (*skip).min(data.len() / ch);
                     *skip -= drop;
@@ -911,7 +924,7 @@ impl Job<'_> {
             std::fs::rename(&part, track.path()).context("could not finish the audio track")?;
             tracks.push(track);
         }
-        Ok(tracks)
+        Ok((tracks, peak))
     }
 
     /// Integrated loudness and true peak of the source range and of `result`.
@@ -1477,9 +1490,8 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()));
         // The ITU downmix FL + 0.7071 FC is the source's left channel (placement loses
         // nothing), across the joins.
-        let fc = crate::audio::place::DOWNMIX_FC;
         let worst = (0..total as usize)
-            .map(|i| (out[6 * i] + fc * out[6 * i + 2] - src.samples[2 * i]).abs())
+            .map(|i| (out[6 * i] + DOWNMIX_FC * out[6 * i + 2] - src.samples[2 * i]).abs())
             .fold(0.0f32, f32::max);
         assert!(
             worst < 1e-3,
