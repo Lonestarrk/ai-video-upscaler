@@ -6,5 +6,6 @@ pub mod dsp;
 pub mod io;
 pub mod lfe;
 pub mod pack;
+pub mod place;
 pub mod sections;
 pub mod source;
