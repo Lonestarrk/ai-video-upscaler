@@ -908,7 +908,7 @@ fn run_with_progress(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("could not start ffmpeg")?;
+    let mut child = crate::process::spawn(&mut cmd).context("could not start ffmpeg")?;
     let stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
     let err_thread = std::thread::spawn(move || {
