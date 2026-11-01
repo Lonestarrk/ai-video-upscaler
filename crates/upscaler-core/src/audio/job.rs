@@ -22,6 +22,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -128,6 +129,69 @@ fn key_with(spec: &AudioSpec, pack_identity: &str) -> String {
 /// `<work dir>/audio/<key>`.
 pub fn job_dir(spec: &AudioSpec) -> PathBuf {
     spec.settings.work_dir().join("audio").join(key(spec))
+}
+
+/// In each job folder: the source video's path, so finished jobs of the same video can be
+/// found again by [`prune`].
+const VIDEO_MARKER: &str = "video.txt";
+/// Audio job folders not touched for this long are removed by [`prune_after`].
+pub const JOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Removes the audio job folders under `root` except `keep`: those whose marker names
+/// `video` (earlier settings or ranges of the same video, superseded by `keep`) and those
+/// whose newest entry is older than `max_age` at `now`. Best effort; returns what it removed.
+pub fn prune(
+    root: &Path,
+    keep: &Path,
+    video: &Path,
+    max_age: Duration,
+    now: SystemTime,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let video = video.display().to_string();
+    let mut removed = Vec::new();
+    for e in entries.flatten() {
+        let dir = e.path();
+        if !e.file_type().is_ok_and(|t| t.is_dir()) || dir == keep {
+            continue;
+        }
+        let same_video =
+            std::fs::read_to_string(dir.join(VIDEO_MARKER)).is_ok_and(|v| v.trim() == video);
+        let stale = newest_mtime(&dir)
+            .is_some_and(|t| now.duration_since(t).is_ok_and(|age| age > max_age));
+        if (same_video || stale) && std::fs::remove_dir_all(&dir).is_ok() {
+            removed.push(dir);
+        }
+    }
+    removed
+}
+
+/// After `spec`'s job finished: [`prune`] with the work folder's audio jobs, the video's
+/// path and [`JOB_MAX_AGE`].
+pub fn prune_after(spec: &AudioSpec) -> Vec<PathBuf> {
+    let keep = job_dir(spec);
+    let root = keep.parent().map(Path::to_path_buf).unwrap_or_default();
+    prune(
+        &root,
+        &keep,
+        &spec.info.path,
+        JOB_MAX_AGE,
+        SystemTime::now(),
+    )
+}
+
+/// The newest modification time of `dir` and its direct entries.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let own = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .chain(own)
+        .max()
 }
 
 /// A finished track. The variant names avoid underscores between digits (`Ac3_51`) to keep
@@ -343,6 +407,8 @@ pub fn run_with(
     let src = source::analyse(tools, &spec.info)?;
     let plan = plan_job(&spec.settings, src.as_ref(), ai.is_some())?;
     let dir = job_dir(spec);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(VIDEO_MARKER), spec.info.path.display().to_string())?;
     if let Some(done) = load_result(&dir) {
         // A crash right after the result was saved may have left the intermediates.
         remove_intermediates(&dir);
@@ -1096,6 +1162,42 @@ mod tests {
     }
 
     fn no_events(_: AudioEvent) {}
+
+    #[test]
+    fn prune_removes_same_video_and_stale_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let job = |name: &str, video: Option<&str>| {
+            let d = root.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            if let Some(v) = video {
+                std::fs::write(d.join(VIDEO_MARKER), v).unwrap();
+            }
+            std::fs::write(d.join("result.json"), "{}").unwrap();
+            d
+        };
+        let keep = job("keep", Some("C:\\v\\a.mkv"));
+        let older = job("older", Some("C:\\v\\a.mkv"));
+        let other = job("other", Some("C:\\v\\b.mkv"));
+        let unmarked = job("unmarked", None);
+        std::fs::write(root.path().join("loose.txt"), "x").unwrap();
+        let video = Path::new("C:\\v\\a.mkv");
+
+        // Now: only the same video's other job goes.
+        let removed = prune(root.path(), &keep, video, JOB_MAX_AGE, SystemTime::now());
+        assert_eq!(removed, vec![older.clone()]);
+        assert!(keep.is_dir() && other.is_dir() && unmarked.is_dir());
+
+        // 31 days later: every other folder is stale, but `keep` and loose files stay.
+        let later = SystemTime::now() + Duration::from_secs(31 * 24 * 3600);
+        let mut removed = prune(root.path(), &keep, video, JOB_MAX_AGE, later);
+        removed.sort();
+        assert_eq!(removed, vec![other, unmarked]);
+        assert!(keep.is_dir());
+        assert!(root.path().join("loose.txt").is_file());
+
+        // A missing root is fine.
+        assert!(prune(&root.path().join("nope"), &keep, video, JOB_MAX_AGE, later).is_empty());
+    }
 
     /// Fake AI: stems are fixed fractions of the input; enhancement adds a 17 kHz tone.
     #[derive(Default)]

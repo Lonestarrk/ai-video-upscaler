@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod dialogs;
 pub mod frames;
 pub mod settings_window;

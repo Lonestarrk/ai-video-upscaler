@@ -141,18 +141,34 @@ pub struct PackStatus {
     pub installed: bool,
     pub device: Option<Device>,
     pub size_bytes: u64,
+    /// Why the pack runs on the CPU (ROCm failed or saw no GPU), when the install knew it.
+    /// English, technical; the GUI shows it as it is.
+    pub cpu_reason: Option<String>,
 }
 
+/// Written by the install when it falls back to CPU torch; copied into `installed.json`.
+const CPU_REASON_FILE: &str = "cpu-reason.txt";
+
+/// Walks the whole pack folder for its size (several GB): call it off the UI thread.
 pub fn status() -> PackStatus {
     status_in(&pack_dir())
 }
 
 pub fn status_in(dir: &Path) -> PackStatus {
     let device = installed_device(dir);
+    let cpu_reason = match device {
+        Some(Device::Cpu) => std::fs::read_to_string(dir.join(INSTALLED_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("cpu_reason")?.as_str().map(str::to_string))
+            .filter(|r| !r.trim().is_empty()),
+        _ => None,
+    };
     PackStatus {
         installed: device.is_some(),
         device,
         size_bytes: dir_size(dir),
+        cpu_reason,
     }
 }
 
@@ -301,16 +317,17 @@ pub fn install_in(
         match rocm {
             Ok(Device::Gpu(name)) => {
                 log::info!("AI audio pack: ROCm PyTorch sees {name}");
+                let _ = std::fs::remove_file(dir.join(CPU_REASON_FILE));
                 Ok(())
             }
             Err(e) if process::is_cancelled(&e) => Err(e),
             other => {
-                match other {
-                    Ok(_) => log::warn!("AI audio pack: ROCm PyTorch sees no GPU; using CPU torch"),
-                    Err(e) => {
-                        log::warn!("AI audio pack: ROCm PyTorch failed ({e:#}); using CPU torch")
-                    }
-                }
+                let reason = match other {
+                    Ok(_) => "ROCm PyTorch sees no GPU".to_string(),
+                    Err(e) => format!("ROCm PyTorch failed: {e:#}"),
+                };
+                log::warn!("AI audio pack: {reason}; using CPU torch");
+                let _ = std::fs::write(dir.join(CPU_REASON_FILE), &reason);
                 report(stage::TORCH_CPU, 0.04, 0.60, 0.5);
                 install_cpu_torch(&py, cancel)
             }
@@ -372,8 +389,13 @@ pub fn install_in(
             return Err(e);
         }
     };
-    let marker =
+    let mut marker =
         serde_json::json!({"version": PACK_VERSION, "device": ai::device_to_json(&device)});
+    if device == Device::Cpu {
+        if let Ok(reason) = std::fs::read_to_string(dir.join(CPU_REASON_FILE)) {
+            marker["cpu_reason"] = serde_json::Value::String(reason.trim().to_string());
+        }
+    }
     write_atomic(&dir.join(INSTALLED_FILE), marker.to_string().as_bytes())?;
     report(stage::CHECK, 0.95, 1.0, 1.0);
     Ok(())
@@ -756,7 +778,8 @@ mod tests {
             PackStatus {
                 installed: false,
                 device: None,
-                size_bytes: 0
+                size_bytes: 0,
+                cpu_reason: None,
             }
         );
         let st = status_in(&dir.path().join("does-not-exist"));
@@ -777,6 +800,24 @@ mod tests {
             Some(Device::Gpu("AMD Radeon RX 7900 XTX".into()))
         );
         assert!(st.size_bytes > 0);
+        assert_eq!(st.cpu_reason, None);
+    }
+
+    #[test]
+    fn cpu_pack_reports_why_when_known() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_pack(dir.path(), r#"{"device":"cpu"}"#);
+        assert_eq!(status_in(dir.path()).cpu_reason, None);
+        std::fs::write(
+            dir.path().join(INSTALLED_FILE),
+            format!(
+                r#"{{"version":{PACK_VERSION},"device":{{"device":"cpu"}},"cpu_reason":"ROCm PyTorch sees no GPU"}}"#
+            ),
+        )
+        .unwrap();
+        let st = status_in(dir.path());
+        assert_eq!(st.device, Some(Device::Cpu));
+        assert_eq!(st.cpu_reason.as_deref(), Some("ROCm PyTorch sees no GPU"));
     }
 
     #[test]

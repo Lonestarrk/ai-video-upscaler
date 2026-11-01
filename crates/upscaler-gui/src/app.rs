@@ -9,6 +9,10 @@ use std::time::Instant;
 
 use eframe::egui;
 use image::RgbImage;
+use upscaler_core::audio::ai::Device;
+use upscaler_core::audio::job::{AudioEvent, AudioStage};
+use upscaler_core::audio::pack::PackStatus;
+use upscaler_core::audio::source::SourceAudio;
 use upscaler_core::ffmpeg::{Tools, VideoInfo};
 use upscaler_core::job::ReviewOutcome;
 use upscaler_core::job::{ExportEvent, ExportSpec, Stage};
@@ -18,7 +22,7 @@ use upscaler_core::settings::Settings;
 
 use crate::i18n::tr;
 use crate::ui;
-use crate::worker::{self, Bus, Event, FrameFetcher, FrameRequest};
+use crate::worker::{self, Bus, Event, FrameFetcher, FrameRequest, PackOp};
 
 pub const VIDEO_EXTENSIONS: [&str; 20] = [
     "mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "3gp", "vob",
@@ -49,6 +53,8 @@ pub struct Video {
     pub aspect_check: upscaler_core::aspect::Check,
     /// The user answered the "flagged wrongly?" warning (chose or kept a shape).
     pub aspect_hint_done: bool,
+    /// The source's audio: `None` while it is being read, `Ok(None)` when there is none.
+    pub audio: Option<Result<Option<SourceAudio>, String>>,
 }
 
 impl Video {
@@ -96,6 +102,12 @@ pub struct ExportState {
     pub unchecked: u64,
     /// Latest rejections, newest last.
     pub review_notes: Vec<String>,
+    /// The export changes the audio (video encoded without audio, audio job, MKV mux).
+    pub audio_path: bool,
+    /// The audio job's current step.
+    pub audio_stage: Option<AudioStage>,
+    /// The audio job's warnings (English from core; translated when shown).
+    pub audio_warnings: Vec<String>,
 }
 
 /// The open project: its folder, its saved state and what is on screen now.
@@ -119,6 +131,43 @@ pub struct SettingsUi {
     pub ffmpeg_message: Option<Result<String, String>>,
     pub work_dir_size: Option<u64>,
     pub show_key: bool,
+    /// The tab shown in the previous frame (`None` while the window is closed), to notice
+    /// when a tab is opened.
+    pub last_tab: Option<usize>,
+}
+
+/// The AI audio pack as the UI knows it. Its status walks a 5.7 GB folder, so it is read in
+/// a worker at start, after install/remove and when the Ljud-AI tab opens, never per frame.
+#[derive(Default)]
+pub struct AudioPackUi {
+    /// `None` until the first status arrives.
+    pub status: Option<PackStatus>,
+    /// A status request is running.
+    pub checking: bool,
+    /// An install is running: stage name, overall fraction, cancel flag.
+    pub installing: Option<(String, f32, Arc<AtomicBool>)>,
+    /// A remove is running, since when.
+    pub removing: Option<Instant>,
+    pub message: Option<Result<String, String>>,
+    /// The device probe is running.
+    pub probing: bool,
+    pub probe: Option<Result<Device, String>>,
+    /// "Remove…" was clicked and waits for "Yes, remove".
+    pub confirm_remove: bool,
+}
+
+impl AudioPackUi {
+    pub fn busy(&self) -> bool {
+        self.installing.is_some() || self.removing.is_some()
+    }
+
+    /// Asks a worker for the pack's status unless a request is already running.
+    pub fn refresh(&mut self, bus: &Bus) {
+        if !self.checking && !self.busy() {
+            self.checking = true;
+            worker::pack_status(bus.clone());
+        }
+    }
 }
 
 /// Zoom and pan shared by both halves of the comparison.
@@ -162,6 +211,7 @@ pub struct UpscalerApp {
     pub project_moving: bool,
     pub frame_browser: ui::frames::FrameBrowser,
     pub settings_ui: SettingsUi,
+    pub audio_pack: AudioPackUi,
     pub error: Option<String>,
     /// Settings that change the result: when they change, the shown result is looked up again.
     result_settings_key: String,
@@ -184,6 +234,8 @@ impl UpscalerApp {
             log::warn!("ffmpeg was not found");
         }
         worker::codex_status(bus.clone(), settings.codex_path.clone());
+        let mut audio_pack = AudioPackUi::default();
+        audio_pack.refresh(&bus);
         let fetcher = FrameFetcher::start(bus.clone());
         let key = result_key(&settings);
         let mut app = UpscalerApp {
@@ -205,6 +257,7 @@ impl UpscalerApp {
             project_moving: false,
             frame_browser: Default::default(),
             settings_ui: SettingsUi::default(),
+            audio_pack,
             error: None,
             result_settings_key: key,
             new_preset_name: String::new(),
@@ -454,18 +507,26 @@ impl UpscalerApp {
             .project
             .as_ref()
             .and_then(|p| p.data.last_output.clone());
-        let mut dialog = rfd::FileDialog::new().add_filter("MP4", &["mp4"]);
+        // New audio is muxed into an MKV (core writes `<name>.mkv`): offer and force that
+        // name here, so the dialog's overwrite prompt is about the file really written.
+        let audio_path = self.settings.audio_active() && v.info.has_audio;
+        let (filter, ext) = if audio_path {
+            ("MKV", "mkv")
+        } else {
+            ("MP4", "mp4")
+        };
+        let mut dialog = rfd::FileDialog::new().add_filter(filter, &[ext]);
         match last
             .as_ref()
-            .and_then(|l| Some((l.parent()?, l.file_name()?)))
+            .and_then(|l| Some((l.parent()?, l.file_stem()?)))
         {
             Some((dir, name)) => {
                 dialog = dialog
                     .set_directory(dir)
-                    .set_file_name(name.to_string_lossy());
+                    .set_file_name(format!("{}.{ext}", name.to_string_lossy()));
             }
             None => {
-                dialog = dialog.set_file_name(format!("{stem}_upscaled_{h}p.mp4"));
+                dialog = dialog.set_file_name(format!("{stem}_upscaled_{h}p.{ext}"));
                 if let Some(dir) = v.info.path.parent() {
                     dialog = dialog.set_directory(dir);
                 }
@@ -474,8 +535,8 @@ impl UpscalerApp {
         let Some(mut output) = dialog.save_file() else {
             return;
         };
-        if output.extension().is_none() {
-            output.set_extension("mp4");
+        if audio_path || output.extension().is_none() {
+            output.set_extension(ext);
         }
         if output == v.info.path {
             self.error = Some(
@@ -533,6 +594,9 @@ impl UpscalerApp {
             kept: 0,
             unchecked: 0,
             review_notes: Vec::new(),
+            audio_path,
+            audio_stage: None,
+            audio_warnings: Vec::new(),
         });
     }
 
@@ -581,6 +645,12 @@ impl UpscalerApp {
                                 info.clone(),
                                 THUMB_COUNT,
                             );
+                            worker::audio_source(
+                                self.bus.clone(),
+                                tools.clone(),
+                                gen,
+                                info.clone(),
+                            );
                         }
                         self.video = Some(Video {
                             info,
@@ -596,6 +666,7 @@ impl UpscalerApp {
                             frame_aspect: None,
                             aspect_check,
                             aspect_hint_done: false,
+                            audio: None,
                         });
                         if let (Some(p), Some(v)) = (&mut self.project, &mut self.video) {
                             if p.restore {
@@ -755,6 +826,51 @@ impl UpscalerApp {
                 });
             }
             Event::WorkDirSize(b) => self.settings_ui.work_dir_size = Some(b),
+            Event::AudioSource { gen, result } if gen == self.gen => {
+                if let Err(e) = &result {
+                    log::warn!("could not read the source audio: {e}");
+                }
+                if let Some(v) = &mut self.video {
+                    v.audio = Some(result);
+                }
+            }
+            Event::PackStatus(s) => {
+                log::info!("AI audio pack: {s:?}");
+                self.audio_pack.checking = false;
+                self.audio_pack.status = Some(s);
+            }
+            Event::PackProgress { stage, fraction } => {
+                if let Some(i) = &mut self.audio_pack.installing {
+                    i.0 = stage;
+                    i.1 = fraction;
+                }
+            }
+            Event::PackDone(r) => {
+                let p = &mut self.audio_pack;
+                p.installing = None;
+                p.removing = None;
+                p.probe = None;
+                // The worker sends the new status right after this.
+                p.checking = true;
+                p.message = Some(match r {
+                    Ok(PackOp::Install) => {
+                        Ok(tr("Ljud-AI är installerat.", "The audio AI is installed.").into())
+                    }
+                    Ok(PackOp::Remove) => {
+                        Ok(tr("Ljud-AI är borttaget.", "The audio AI is removed.").into())
+                    }
+                    Err(e) if e == "cancelled" => Err(tr(
+                        "Avbrutet. Klicka Installera igen för att fortsätta där det slutade.",
+                        "Cancelled. Click Install again to continue where it stopped.",
+                    )
+                    .into()),
+                    Err(e) => Err(e),
+                });
+            }
+            Event::DeviceProbed(r) => {
+                self.audio_pack.probing = false;
+                self.audio_pack.probe = Some(r);
+            }
             Event::ProjectMoved(r) => {
                 self.project_moving = false;
                 match r {
@@ -840,8 +956,18 @@ impl UpscalerApp {
                     }
                 }
             }
-            // Shown (translated) by the audio UI; logged until then.
-            ExportEvent::Audio(a) => log::info!("export audio: {a:?}"),
+            ExportEvent::Audio(a) => {
+                log::info!("export audio: {a:?}");
+                match a {
+                    AudioEvent::Stage(s) => x.audio_stage = Some(s),
+                    AudioEvent::Warning(w) => {
+                        if !x.audio_warnings.contains(&w) {
+                            x.audio_warnings.push(w);
+                        }
+                    }
+                    AudioEvent::Section { .. } => {} // also sent as Progress
+                }
+            }
             ExportEvent::Finished(p) => {
                 log::info!("export finished: {}", p.display());
                 x.outcome = Some(Ok(p));
@@ -1025,6 +1151,10 @@ fn result_key(s: &Settings) -> String {
     s.use_previous_frame = false;
     s.skip_duplicates = false;
     s.scene_cut_threshold = 0.0;
+    s.audio_mode = Default::default();
+    s.surround_engine = Default::default();
+    s.lfe_level = Default::default();
+    s.audio_enhance = false;
     format!("{s:?}")
 }
 
@@ -1055,6 +1185,8 @@ impl eframe::App for UpscalerApp {
         if self.preview.is_some()
             || self.exporting()
             || self.settings_ui.codex_busy.is_some()
+            || self.audio_pack.busy()
+            || self.audio_pack.probing
             || self.loading.is_some()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));

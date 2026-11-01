@@ -33,6 +33,7 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
                     "Grok",
                     "Real-ESRGAN",
                     tr("FFmpeg och mappar", "FFmpeg and folders"),
+                    tr("Ljud-AI", "Audio AI"),
                     tr("Allmänt", "General"),
                 ];
                 for (i, t) in tabs.iter().enumerate() {
@@ -40,9 +41,15 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
                 }
             });
             ui.separator();
+            // The pack's status is read (in a worker) each time its tab is opened.
+            let tab = app.settings_ui.tab;
+            if tab == TAB_AUDIO_AI && app.settings_ui.last_tab != Some(TAB_AUDIO_AI) {
+                app.audio_pack.refresh(&app.bus);
+            }
+            app.settings_ui.last_tab = Some(tab);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
-                .show(ui, |ui| match app.settings_ui.tab {
+                .show(ui, |ui| match tab {
                     0 => chatgpt(ui, app),
                     1 => openai(ui, app),
                     2 => gemini(ui, app),
@@ -50,11 +57,13 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
                     4 => grok(ui, app),
                     5 => realesrgan(ui, app),
                     TAB_FFMPEG => ffmpeg(ui, app),
+                    TAB_AUDIO_AI => super::audio::pack_tab(ui, app),
                     _ => general(ui, app),
                 });
         });
     if !open {
         app.settings_ui.open = false;
+        app.settings_ui.last_tab = None;
     }
 }
 
@@ -212,6 +221,8 @@ fn start(app: &mut UpscalerApp, what: &str, op: CodexOp) {
 }
 
 pub const TAB_FFMPEG: usize = 6;
+pub const TAB_AUDIO_AI: usize = 7;
+pub const TAB_GENERAL: usize = 8;
 
 /// The settings tab of a service.
 pub fn tab_for(p: ProviderKind) -> usize {
@@ -222,7 +233,7 @@ pub fn tab_for(p: ProviderKind) -> usize {
         ProviderKind::Flux => 3,
         ProviderKind::Grok => 4,
         ProviderKind::RealEsrgan => 5,
-        ProviderKind::Basic => 7,
+        ProviderKind::Basic => TAB_GENERAL,
     }
 }
 
@@ -544,8 +555,8 @@ fn realesrgan(ui: &mut egui::Ui, app: &mut UpscalerApp) {
 fn ffmpeg(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     ui.label(egui::RichText::new("FFmpeg").strong().size(16.0));
     ui.label(tr(
-        "FFmpeg läser videon, plockar ut bildrutor och sätter ihop resultatet med originalljudet.",
-        "FFmpeg reads the video, extracts frames and assembles the result with the original audio.",
+        "FFmpeg läser videon, plockar ut bildrutor och sätter ihop resultatet med ljudet.",
+        "FFmpeg reads the video, extracts frames and assembles the result with the audio.",
     ));
     ui.add_space(6.0);
     match &app.tools {

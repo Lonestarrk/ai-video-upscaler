@@ -26,6 +26,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             ui.separator();
             consistency(ui, app);
             ui.separator();
+            super::audio::side_section(ui, app);
+            ui.separator();
             export(ui, app);
             ui.add_space(12.0);
         });
@@ -237,14 +239,6 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         source_aspect(ui, app);
         black_bars(ui, app);
         aspect_change(ui, app);
-        ui.label(
-            egui::RichText::new(tr(
-                "Ljudet kopieras alltid oförändrat från originalet.",
-                "The audio is always copied unchanged from the original.",
-            ))
-            .weak()
-            .small(),
-        );
     });
 }
 
@@ -579,6 +573,17 @@ fn ai_rate_label(r: AiRate) -> &'static str {
     }
 }
 
+/// The audio job's warnings, translated, in yellow.
+fn audio_warnings(ui: &mut egui::Ui, warnings: &[String]) {
+    for w in warnings {
+        ui.label(
+            egui::RichText::new(format!("⚠ {}", super::audio::warning_text(w)))
+                .small()
+                .color(WARN),
+        );
+    }
+}
+
 fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     section(ui, tr("Export", "Export"));
     if let Some(x) = &app.export {
@@ -590,6 +595,10 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 "Finding scene cuts and duplicates…",
             ),
             Stage::Upscaling => tr("Skalar upp bildrutor…", "Upscaling frames…"),
+            Stage::Encoding if x.audio_path => tr(
+                "Kodar videon (utan ljud, det görs sedan)…",
+                "Encoding the video (without audio, that comes next)…",
+            ),
             Stage::Encoding => tr(
                 "Kodar video med originalljud…",
                 "Encoding video with the original audio…",
@@ -601,6 +610,11 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 ui.spinner();
                 ui.label(egui::RichText::new(stage).strong());
             });
+            if x.stage == Stage::Audio {
+                if let Some(s) = x.audio_stage {
+                    ui.label(super::audio::stage_name(s));
+                }
+            }
             let frac = if x.total > 0 {
                 x.done as f32 / x.total as f32
             } else {
@@ -611,7 +625,18 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     .show_percentage()
                     .desired_width(ui.available_width()),
             );
-            ui.label(format!("{} / {}", x.done, x.total));
+            if x.stage == Stage::Audio {
+                ui.label(format!(
+                    "{} {} {} {}",
+                    tr("Ljuddel", "Audio section"),
+                    x.done,
+                    tr("av", "of"),
+                    x.total
+                ));
+            } else {
+                ui.label(format!("{} / {}", x.done, x.total));
+            }
+            audio_warnings(ui, &x.audio_warnings);
             let elapsed = x.started.elapsed().as_secs_f64();
             if x.stage == Stage::Upscaling && x.ai_frames > 0 {
                 let remaining = x.total.saturating_sub(x.done) as f64;
@@ -729,6 +754,7 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                         .strong(),
                 );
                 ui.label(egui::RichText::new(path.display().to_string()).small());
+                audio_warnings(ui, &x.audio_warnings);
                 ui.horizontal(|ui| {
                     if ui.button(tr("Spela upp", "Play")).clicked() {
                         worker::open(path);
@@ -747,7 +773,11 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                         .color(BAD)
                         .strong(),
                 );
-                ui.label(egui::RichText::new(e).small().color(BAD));
+                ui.label(
+                    egui::RichText::new(super::audio::error_text(e))
+                        .small()
+                        .color(BAD),
+                );
                 ui.label(egui::RichText::new(tr("Färdiga bildrutor är sparade. Starta exporten igen för att fortsätta där den stannade.", "Finished frames are saved. Start the export again to continue where it stopped.")).small());
                 if ui.button(tr("Stäng", "Close")).clicked() {
                     close = true;

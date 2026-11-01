@@ -646,6 +646,11 @@ fn export(
         &output,
         cancel,
     )?;
+    // Earlier audio jobs of this video (other settings or ranges) and month-old ones are
+    // not needed any more; this one stays so a re-export reuses it.
+    for d in audio_job::prune_after(&audio_spec) {
+        log::info!("removed old audio job {}", d.display());
+    }
     Ok(output)
 }
 

@@ -8,6 +8,9 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui;
 use image::RgbImage;
+use upscaler_core::audio::ai::{Device, LocalAi};
+use upscaler_core::audio::pack::{self, PackStatus};
+use upscaler_core::audio::source::{self, SourceAudio};
 use upscaler_core::ffmpeg::{self, Tools, VideoInfo};
 use upscaler_core::job::{self, ExportEvent, ExportSpec};
 use upscaler_core::provider::codex::{self, LoginState};
@@ -87,6 +90,28 @@ pub enum Event {
         current: Option<egui::ColorImage>,
         versions: Vec<(PathBuf, job::Rejection, Option<egui::ColorImage>)>,
     },
+    /// What the video's audio is (`Ok(None)`: it has none).
+    AudioSource {
+        gen: u64,
+        result: Result<Option<SourceAudio>, String>,
+    },
+    /// The AI audio pack's state (installed, device, size).
+    PackStatus(PackStatus),
+    /// Install progress: stage name (see `pack::stage`) and overall fraction.
+    PackProgress {
+        stage: String,
+        fraction: f32,
+    },
+    /// The install or remove ended (`Err("cancelled")` when cancelled).
+    PackDone(Result<PackOp, String>),
+    /// The pack's answer to "which device would you use now?".
+    DeviceProbed(Result<Device, String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackOp {
+    Install,
+    Remove,
 }
 
 #[derive(Clone)]
@@ -388,6 +413,68 @@ pub fn move_project(bus: Bus, from: PathBuf, to: PathBuf) {
             .map(|_| to)
             .map_err(|e| format!("{e:#}"));
         bus.send(Event::ProjectMoved(r));
+    });
+}
+
+/// Reads the video's audio stream (channels, AC-3 Dolby Surround flag).
+pub fn audio_source(bus: Bus, tools: Tools, gen: u64, info: VideoInfo) {
+    spawn("audio-source", move || {
+        let result = source::analyse(&tools, &info).map_err(|e| format!("{e:#}"));
+        bus.send(Event::AudioSource { gen, result });
+    });
+}
+
+/// The AI audio pack's state; walks the pack folder (GBs), so never on the UI thread.
+pub fn pack_status(bus: Bus) {
+    spawn("pack-status", move || {
+        bus.send(Event::PackStatus(pack::status()))
+    });
+}
+
+fn op_result(r: anyhow::Result<()>, op: PackOp) -> Result<PackOp, String> {
+    match r {
+        Ok(()) => Ok(op),
+        Err(e) if upscaler_core::process::is_cancelled(&e) => Err("cancelled".into()),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+pub fn install_pack(bus: Bus, cancel: Arc<AtomicBool>) {
+    spawn("pack-install", move || {
+        let b = bus.clone();
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut last_stage = String::new();
+        let r = pack::install(&cancel, |stage, fraction| {
+            if stage != last_stage || last.elapsed().as_millis() > 200 {
+                last = std::time::Instant::now();
+                last_stage = stage.to_string();
+                b.send(Event::PackProgress {
+                    stage: stage.to_string(),
+                    fraction,
+                });
+            }
+        });
+        bus.send(Event::PackDone(op_result(r, PackOp::Install)));
+        bus.send(Event::PackStatus(pack::status()));
+    });
+}
+
+pub fn remove_pack(bus: Bus) {
+    spawn("pack-remove", move || {
+        let r = pack::remove();
+        bus.send(Event::PackDone(op_result(r, PackOp::Remove)));
+        bus.send(Event::PackStatus(pack::status()));
+    });
+}
+
+/// Starts the pack's worker and asks which device it would use (loads torch: seconds).
+pub fn probe_device(bus: Bus) {
+    spawn("pack-device", move || {
+        let cancel = AtomicBool::new(false);
+        let r = LocalAi::open()
+            .and_then(|ai| ai.probe_device(&cancel))
+            .map_err(|e| format!("{e:#}"));
+        bus.send(Event::DeviceProbed(r));
     });
 }
 
