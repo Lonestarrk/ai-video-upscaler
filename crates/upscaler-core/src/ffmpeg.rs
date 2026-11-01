@@ -648,6 +648,36 @@ pub struct EncodeOptions {
     pub hdr: Option<crate::hdr::HdrEncode>,
 }
 
+/// Motion-interpolates `src_dir/%06d.png` (at `in_fps`) to `to_fps` and writes the full-rate
+/// 8-bit frames to `out_dir/%06d.png`. Returns the number of frames written.
+pub fn interpolate_frames(
+    tools: &Tools,
+    src_dir: &Path,
+    in_fps: (u32, u64),
+    to_fps: (u32, u32),
+    out_dir: &Path,
+    cancel: &AtomicBool,
+    progress: impl FnMut(u64),
+) -> Result<u64> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut cmd = tools.ffmpeg_cmd();
+    cmd.arg("-y")
+        .arg("-framerate")
+        .arg(format!("{}/{}", in_fps.0, in_fps.1))
+        .args(["-start_number", "1", "-i"])
+        .arg(src_dir.join("%06d.png"))
+        .arg("-vf")
+        .arg(format!(
+            "minterpolate=fps={}/{}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
+            to_fps.0, to_fps.1
+        ))
+        .args(["-fps_mode", "passthrough", "-pix_fmt", "rgb24"])
+        .args(["-start_number", "1", "-progress", "pipe:1", "-nostats"])
+        .arg(out_dir.join("%06d.png"));
+    run_with_progress(cmd, cancel, progress)?;
+    Ok(count_frames(out_dir))
+}
+
 /// Encodes `frames_dir/%06d.png` to `out`, with audio copied from the source when it fits the
 /// container and re-encoded to AAC when it does not.
 pub fn encode(
@@ -681,16 +711,14 @@ pub fn encode(
         if opts.hdr.is_some() {
             // The frames already hold BT.2020 PQ/HLG code values: the only conversion is RGB
             // to YUV with the BT.2020 non-constant-luminance matrix, full to limited range.
-            // Done first and explicitly, so no later automatic conversion assumes BT.601.
-            let mut f = String::from(
-                "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int",
+            // Done first, explicitly, and pinned to 16-bit 4:4:4, so no later scale or format
+            // negotiation decides the matrix or drops precision. Motion interpolation is not
+            // done here (it is 8-bit only): the job interpolates the SDR frames beforehand.
+            filters.push(
+                "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int,                 format=yuv444p16le"
+                    .to_string(),
             );
-            if opts.interpolate_to.is_some() {
-                f.push_str(",format=yuv444p16le");
-            }
-            filters.push(f);
-        }
-        if let Some((n, d)) = opts.interpolate_to {
+        } else if let Some((n, d)) = opts.interpolate_to {
             filters.push(format!(
                 "minterpolate=fps={n}/{d}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
             ));

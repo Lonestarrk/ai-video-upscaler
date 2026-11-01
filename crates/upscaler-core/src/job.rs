@@ -383,7 +383,15 @@ fn prepare_audio(
 /// What the encoded intermediate video depends on: the encode options and every finished
 /// frame (size and modification time), so a frame made again means a new encode.
 fn video_key(opts: &EncodeOptions, total: u64, frames: impl Iterator<Item = PathBuf>) -> String {
-    let mut parts = vec![format!("{opts:?}"), total.to_string()];
+    // The HDR curve and the interpolation stage change pixels without changing `opts`.
+    let mut parts = vec![
+        format!("{opts:?}"),
+        total.to_string(),
+        format!(
+            "hdr v{} interp v{INTERP_VERSION}",
+            crate::hdr::convert::HDR_VERSION
+        ),
+    ];
     for path in frames {
         let (len, modified) = std::fs::metadata(&path)
             .map(|m| {
@@ -399,6 +407,60 @@ fn video_key(opts: &EncodeOptions, total: u64, frames: impl Iterator<Item = Path
     }
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
     format!("frames {total}\n{}", cache::key(&refs))
+}
+
+/// Interpolated SDR frames for HDR export, and the version of how they are made.
+const INTERP_DIR: &str = "interp";
+const INTERP_VERSION: u32 = 1;
+
+/// Motion-interpolates the SDR frames of `out_dir` to the source rate into `interp_dir`
+/// (8-bit, like the SDR export does), reusing an earlier run made with the same settings
+/// from `out/` frames that have not changed since. Returns the number of frames.
+fn interpolate_sdr(
+    tools: &Tools,
+    spec: &ExportSpec,
+    out_dir: &Path,
+    interp_dir: &Path,
+    total: u64,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<u64> {
+    let info = &spec.info;
+    let want = format!(
+        "fps: {}/{}
+divisor: {}
+frames: {total}
+version: {INTERP_VERSION}
+",
+        info.fps_num,
+        info.fps_den,
+        spec.divisor()
+    );
+    let marker = interp_dir.join("settings.txt");
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let fresh = std::fs::read_to_string(&marker).is_ok_and(|h| h == want)
+        && modified(&marker).is_some_and(|m| {
+            (1..=total).all(|n| modified(&ffmpeg::frame_file(out_dir, n)).is_none_or(|o| o <= m))
+        });
+    if fresh {
+        let n = ffmpeg::count_frames(interp_dir);
+        if n > 0 {
+            progress(n);
+            return Ok(n);
+        }
+    }
+    let _ = std::fs::remove_dir_all(interp_dir);
+    let n = ffmpeg::interpolate_frames(
+        tools,
+        out_dir,
+        (info.fps_num, info.fps_den as u64 * spec.divisor() as u64),
+        (info.fps_num, info.fps_den),
+        interp_dir,
+        cancel,
+        progress,
+    )?;
+    std::fs::write(&marker, want)?;
+    Ok(n)
 }
 
 /// The intermediate video (no audio) and its marker in the job folder.
@@ -534,43 +596,66 @@ fn export(
     check(cancel)?;
 
     // 3b. SDR to HDR (cached in `hdr/` by mode and peak, never touches `out/`), then the light
-    // levels the encoder writes into the stream, measured from the HDR frames.
+    // levels the encoder writes into the stream, measured from the HDR frames. With skipped
+    // frames the SDR frames are motion-interpolated first (`interp/`, 8-bit, as for SDR) and
+    // the HDR stage works at the full rate: interpolating HDR itself would be 8-bit PQ.
+    let info = &spec.info;
+    let divisor = spec.divisor();
     let hdr_frames = crate::hdr::convert::hdr_dir(&dir);
+    let interp_frames = dir.join(INTERP_DIR);
+    let hdr_on = s.hdr_mode != crate::settings::HdrMode::Off;
+    let interp_on = hdr_on && divisor > 1;
     let mut hdr: Option<crate::hdr::HdrEncode> = None;
-    if s.hdr_mode != crate::settings::HdrMode::Off {
-        emit(ExportEvent::Progress {
-            stage: Stage::Hdr,
-            done: 0,
-            total,
-        });
+    // Frames the encoder reads (full rate when HDR interpolated).
+    let mut encode_total = total;
+    if hdr_on {
+        let pq = s.hdr_mode.is_pq();
+        // One monotonic bar over interpolation, conversion and measurement.
+        let weight = if interp_on {
+            spec.end - spec.start
+        } else {
+            total
+        }
+        .max(1);
+        let units = (interp_on as u64 + 1 + pq as u64) * weight;
+        let report = |base: u64, f: u64| {
+            emit(ExportEvent::Progress {
+                stage: Stage::Hdr,
+                done: base + f.min(weight),
+                total: units,
+            })
+        };
+        report(0, 0);
+        let mut base = 0;
+        let mut src: &Path = &out_dir;
+        if interp_on {
+            let n = interpolate_sdr(tools, spec, &out_dir, &interp_frames, total, cancel, |f| {
+                report(0, f)
+            });
+            check(cancel)?;
+            encode_total = n?;
+            src = &interp_frames;
+            base = weight;
+        }
         let r = crate::hdr::convert::convert(
-            &out_dir,
-            &crate::hdr::convert::hdr_dir(&dir),
-            total,
+            src,
+            &hdr_frames,
+            encode_total,
             s.hdr_mode,
             s.hdr_peak_nits,
             cancel,
-            |f| {
-                emit(ExportEvent::Progress {
-                    stage: Stage::Hdr,
-                    done: f,
-                    total,
-                })
-            },
+            |f| report(base, f),
         );
         if let Err(e) = r {
             check(cancel)?;
             return Err(e);
         }
         check(cancel)?;
+        base += weight;
         // HLG carries no static light levels.
-        let (max_cll, max_fall) = if s.hdr_mode.is_pq() {
-            let m = crate::hdr::measure::measure_dir(&hdr_frames, total, cancel, |f| {
-                emit(ExportEvent::Progress {
-                    stage: Stage::Hdr,
-                    done: f,
-                    total,
-                })
+        let (max_cll, max_fall) = if pq {
+            let m = crate::hdr::measure::measure_dir(&hdr_frames, encode_total, cancel, |f| {
+                report(base, f)
             });
             check(cancel)?;
             let m = m?;
@@ -588,28 +673,42 @@ fn export(
         });
     }
     let encode_dir = if hdr.is_some() { &hdr_frames } else { &out_dir };
-    // The HDR frames are only an intermediate: gone once the output exists.
+    // The HDR and interpolated frames are only intermediates: gone once the output exists.
     let finish = |output: PathBuf| -> PathBuf {
         if hdr.is_some() && s.hdr_delete_frames_after {
-            if let Err(e) = std::fs::remove_dir_all(&hdr_frames) {
-                log::warn!("could not delete {}: {e}", hdr_frames.display());
+            for d in [&hdr_frames, &interp_frames] {
+                if d.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(d) {
+                        log::warn!("could not delete {}: {e}", d.display());
+                    }
+                }
             }
         }
         output
     };
 
     // 4. Encode
-    let info = &spec.info;
-    let divisor = spec.divisor();
-    let out_frames_total = if divisor > 1 {
+    let out_frames_total = if hdr.is_some() {
+        encode_total
+    } else if divisor > 1 {
         spec.end - spec.start
     } else {
         total
     };
+    let (in_fps_num, in_fps_den, interpolate_to) = if hdr.is_some() {
+        // Already at the full rate.
+        (info.fps_num, info.fps_den as u64, None)
+    } else {
+        (
+            info.fps_num,
+            info.fps_den as u64 * divisor as u64,
+            (divisor > 1).then_some((info.fps_num, info.fps_den)),
+        )
+    };
     let opts = EncodeOptions {
-        in_fps_num: info.fps_num,
-        in_fps_den: info.fps_den as u64 * divisor as u64,
-        interpolate_to: (divisor > 1).then_some((info.fps_num, info.fps_den)),
+        in_fps_num,
+        in_fps_den,
+        interpolate_to,
         anamorphic: geo.sar.map(|sar| (geo.stored, sar)),
         codec: s.effective_codec(),
         crf: s.crf,

@@ -1299,6 +1299,32 @@ fn hlg_export_has_hlg_transfer() {
     );
 }
 
+/// Distinct luma codes (10-bit) along the middle row of frame `n` of `path`, and the share of
+/// samples on the 8-bit grid (code divisible by 4: 25 % by chance, ~100 % after an 8-bit stage).
+fn luma_levels(tools: &Tools, path: &Path, n: u32) -> (usize, f64) {
+    let info = ffmpeg::probe(tools, path).unwrap();
+    let (w, h) = (info.width as usize, info.height as usize);
+    let raw = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vf", &format!(r"select=eq(n\,{n})"), "-frames:v", "1"])
+        .args(["-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(raw.len() >= w * h * 2, "no frame {n}");
+    let row = (h / 2) * w;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut on_grid = 0;
+    for x in 0..w {
+        let i = (row + x) * 2;
+        let y = u16::from_le_bytes([raw[i], raw[i + 1]]);
+        seen.insert(y);
+        on_grid += (y % 4 == 0) as usize;
+    }
+    (seen.len(), on_grid as f64 / w as f64)
+}
+
 #[test]
 fn hdr_with_interpolation_and_anamorphic() {
     let Some(tools) = Tools::locate("") else {
@@ -1307,10 +1333,14 @@ fn hdr_with_interpolation_and_anamorphic() {
     };
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("dvdlike.mkv");
+    // A smooth horizontal grey ramp (220 legal levels, lossless): in PQ the steps between
+    // neighbouring SDR levels are 1-4 ten-bit codes, so an 8-bit PQ stage would merge many.
     let status = std::process::Command::new(&tools.ffmpeg)
         .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
-        .arg("testsrc2=size=360x240:rate=30000/1001:duration=3,setsar=32/27")
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(
+            "nullsrc=size=1024x64:rate=30000/1001:duration=3,             geq=lum='16+219*X/W':cb=128:cr=128,setsar=32/27",
+        )
+        .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
         .arg(&src)
         .status()
         .unwrap();
@@ -1319,6 +1349,7 @@ fn hdr_with_interpolation_and_anamorphic() {
     assert_eq!((info.fps_num, info.fps_den), (30000, 1001));
     let mut settings = hdr_settings(&dir.path().join("work"), HdrMode::Hdr10);
     settings.ai_rate = AiRate::Half;
+    settings.crf = 6;
     let spec = ExportSpec {
         info,
         start: 4,
@@ -1347,6 +1378,15 @@ fn hdr_with_interpolation_and_anamorphic() {
     assert_eq!(entry(&v, "color_transfer").as_deref(), Some("smpte2084"));
     assert_eq!(entry(&v, "color_primaries").as_deref(), Some("bt2020"));
     assert_eq!(entry(&v, "pix_fmt").as_deref(), Some("yuv420p10le"));
+    // An interpolated (odd) frame still has the fine PQ steps: an 8-bit PQ stage would put
+    // (nearly) every sample on the 8-bit grid (measured 67 % after encoding, vs 26 % here).
+    let (levels, grid) = luma_levels(&tools, &spec.output, 5);
+    assert!(levels > 170, "only {levels} luma levels");
+    assert!(
+        grid < 0.4,
+        "{:.0} % of the samples are on the 8-bit grid",
+        grid * 100.0
+    );
 }
 
 #[test]
@@ -1358,9 +1398,12 @@ fn hdr_frames_deleted_after_export_when_set() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "del.mp4");
     spec.settings.hdr_delete_frames_after = true;
+    // Every 2nd frame: the interpolated SDR frames go too.
+    spec.settings.ai_rate = AiRate::Half;
     let log = run(&tools, &spec);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
     assert!(!upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()).exists());
+    assert!(!spec.job_dir().join("interp").exists());
     assert!(spec.job_dir().join("out").is_dir(), "out/ is never deleted");
 
     let mut keep = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "keep.mp4");
@@ -1368,6 +1411,10 @@ fn hdr_frames_deleted_after_export_when_set() {
     let log = run(&tools, &keep);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
     assert!(upscaler_core::hdr::convert::hdr_dir(&keep.job_dir()).is_dir());
+    assert!(
+        !keep.job_dir().join("interp").exists(),
+        "no interp without skipped frames"
+    );
 }
 
 /// The encoder must apply nothing but RGB to YUV with the BT.2020 matrix, full to limited
@@ -1394,73 +1441,87 @@ fn hdr_encode_keeps_pq_code_values() {
     for n in 1..=3 {
         img.save(ffmpeg::frame_file(&frames, n)).unwrap();
     }
-    let opts = ffmpeg::EncodeOptions {
-        in_fps_num: 24,
-        in_fps_den: 1,
-        interpolate_to: None,
-        anamorphic: None,
-        codec: upscaler_core::settings::VideoCodec::H265,
-        crf: 4,
-        audio_from: None,
-        hdr: Some(upscaler_core::hdr::HdrEncode {
-            mode: HdrMode::Hdr10,
-            peak_nits: 1000,
-            max_cll: 100,
-            max_fall: 100,
-            hdr10plus_json: None,
-        }),
-    };
-    let out = dir.path().join("grey.mkv");
-    ffmpeg::encode(
-        &tools,
-        &frames,
-        3,
-        &opts,
-        &out,
-        &AtomicBool::new(false),
-        |_| {},
-    )
-    .unwrap();
-    let raw = std::process::Command::new(&tools.ffmpeg)
-        .args(["-v", "error", "-i"])
-        .arg(&out)
-        .args([
-            "-frames:v",
-            "1",
-            "-pix_fmt",
-            "yuv444p10le",
-            "-f",
-            "rawvideo",
-            "-",
-        ])
-        .output()
-        .unwrap()
-        .stdout;
-    let plane = 64 * 64;
-    assert_eq!(raw.len(), plane * 3 * 2);
-    let at = |p: usize, x: usize, y: usize| {
-        let i = (p * plane + y * 64 + x) * 2;
-        u16::from_le_bytes([raw[i], raw[i + 1]]) as f64
-    };
-    let expect_y = 64.0 + 876.0 * v as f64;
-    let (y, cb, cr) = (at(0, 8, 32), at(1, 8, 32), at(2, 8, 32));
-    assert!((y - expect_y).abs() <= 4.0, "Y {y} expected {expect_y}");
-    assert!(
-        (cb - 512.0).abs() <= 4.0 && (cr - 512.0).abs() <= 4.0,
-        "{cb} {cr}"
-    );
-    let (r, g) = (code as f64 / 65535.0, code as f64 / 4.0 / 65535.0);
-    let b = g;
-    let ey = 0.2627 * r + 0.6780 * g + 0.0593 * b;
-    let (wy, wcb, wcr) = (
-        64.0 + 876.0 * ey,
-        512.0 + 896.0 * (b - ey) / 1.8814,
-        512.0 + 896.0 * (r - ey) / 1.4746,
-    );
-    let (y, cb, cr) = (at(0, 48, 32), at(1, 48, 32), at(2, 48, 32));
-    assert!((y - wy).abs() <= 6.0, "Y {y} vs {wy}");
-    assert!(
-        (cb - wcb).abs() <= 6.0 && (cr - wcr).abs() <= 6.0,
-        "chroma {cb} {cr} vs {wcb} {wcr}"
-    );
+    // Plain, and squeezed to an anamorphic stored size (a later lanczos scale must not touch
+    // the matrix or the range).
+    for (anamorphic, width, grey_x, colour_x) in [
+        (None, 64usize, 8usize, 48usize),
+        (Some(((48u32, 64u32), (4u32, 3u32))), 48, 6, 36),
+    ] {
+        let opts = ffmpeg::EncodeOptions {
+            in_fps_num: 24,
+            in_fps_den: 1,
+            interpolate_to: None,
+            anamorphic,
+            codec: upscaler_core::settings::VideoCodec::H265,
+            crf: 4,
+            audio_from: None,
+            hdr: Some(upscaler_core::hdr::HdrEncode {
+                mode: HdrMode::Hdr10,
+                peak_nits: 1000,
+                max_cll: 100,
+                max_fall: 100,
+                hdr10plus_json: None,
+            }),
+        };
+        let out = dir.path().join(format!("grey{width}.mkv"));
+        ffmpeg::encode(
+            &tools,
+            &frames,
+            3,
+            &opts,
+            &out,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let raw = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv444p10le",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        let plane = width * 64;
+        assert_eq!(raw.len(), plane * 3 * 2, "width {width}");
+        let at = |p: usize, x: usize, y: usize| {
+            let i = (p * plane + y * width + x) * 2;
+            u16::from_le_bytes([raw[i], raw[i + 1]]) as f64
+        };
+        let expect_y = 64.0 + 876.0 * v as f64;
+        let (y, cb, cr) = (at(0, grey_x, 32), at(1, grey_x, 32), at(2, grey_x, 32));
+        assert!(
+            (y - expect_y).abs() <= 4.0,
+            "width {width}: Y {y} expected {expect_y}"
+        );
+        assert!(
+            (cb - 512.0).abs() <= 4.0 && (cr - 512.0).abs() <= 4.0,
+            "width {width}: {cb} {cr}"
+        );
+        let (r, g) = (code as f64 / 65535.0, code as f64 / 4.0 / 65535.0);
+        let b = g;
+        let ey = 0.2627 * r + 0.6780 * g + 0.0593 * b;
+        let (wy, wcb, wcr) = (
+            64.0 + 876.0 * ey,
+            512.0 + 896.0 * (b - ey) / 1.8814,
+            512.0 + 896.0 * (r - ey) / 1.4746,
+        );
+        let (y, cb, cr) = (
+            at(0, colour_x, 32),
+            at(1, colour_x, 32),
+            at(2, colour_x, 32),
+        );
+        assert!((y - wy).abs() <= 6.0, "width {width}: Y {y} vs {wy}");
+        assert!(
+            (cb - wcb).abs() <= 6.0 && (cr - wcr).abs() <= 6.0,
+            "width {width}: chroma {cb} {cr} vs {wcb} {wcr}"
+        );
+    }
 }
