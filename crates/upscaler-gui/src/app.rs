@@ -840,6 +840,8 @@ impl UpscalerApp {
                     }
                 }
             }
+            // Shown (translated) by the audio UI; logged until then.
+            ExportEvent::Audio(a) => log::info!("export audio: {a:?}"),
             ExportEvent::Finished(p) => {
                 log::info!("export finished: {}", p.display());
                 x.outcome = Some(Ok(p));

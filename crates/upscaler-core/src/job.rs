@@ -5,6 +5,11 @@
 //! named after the video and every setting that changes the pixels, so a stopped or failed
 //! export picks up where it left off (frames already done are never paid for twice).
 //!
+//! When the audio settings change the sound (5.1, better quality), the frames are encoded
+//! without audio to `video.mkv` in the job folder, the audio job runs, and both are muxed
+//! with the untouched original into an MKV. The AI audio pack is checked before any frame
+//! work, so a missing pack fails the export at once.
+//!
 //! Consistency: with "use previous frame" on, frames run in order and each request carries
 //! the previous restored frame as a reference, except after a scene cut. Frames that are
 //! (almost) identical to the previous one reuse its result.
@@ -18,6 +23,8 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use image::RgbImage;
 
+use crate::audio::ai::{AudioAi, Device, LocalAi};
+use crate::audio::job::{self as audio_job, AudioEvent, AudioSpec};
 use crate::cache;
 use crate::ffmpeg::{self, EncodeOptions, Range, Tools, VideoInfo};
 use crate::frame;
@@ -208,6 +215,8 @@ pub enum Stage {
     Analysing,
     Upscaling,
     Encoding,
+    /// The audio job (5.1 / better quality); `done`/`total` count its sections.
+    Audio,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +244,9 @@ pub enum ExportEvent {
         problems: String,
         attempt: u32,
     },
+    /// From the audio job; its warnings are English (the GUI translates them).
+    Audio(AudioEvent),
+    /// The export is done; the path is the file written (`.mkv` when the audio was changed).
     Finished(PathBuf),
     Failed(String),
     Cancelled,
@@ -287,7 +299,7 @@ pub fn run_export(
     emit: &(dyn Fn(ExportEvent) + Sync),
 ) {
     match export(tools, spec, cancel, emit) {
-        Ok(()) => emit(ExportEvent::Finished(spec.output.clone())),
+        Ok(written) => emit(ExportEvent::Finished(written)),
         Err(e) if process::is_cancelled(&e) => emit(ExportEvent::Cancelled),
         Err(e) => {
             log::error!("export failed: {e:#}");
@@ -303,12 +315,92 @@ fn check(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// What the export does with the audio when the settings change it: the AI pack, opened
+/// before any frame work when the job will use it.
+struct AudioWork {
+    ai: Option<LocalAi>,
+}
+
+/// Decides, before any frame work, whether the export runs the audio job, and fails at once
+/// when it cannot (AI pack missing while it is needed, mono source to 5.1, …) instead of
+/// after hours of frames. `None`: the audio is not changed (or there is none), so the export
+/// takes the plain MP4 path with the original audio.
+fn prepare_audio(
+    tools: &Tools,
+    spec: &ExportSpec,
+    emit: &(dyn Fn(ExportEvent) + Sync),
+) -> Result<Option<AudioWork>> {
+    let s = &spec.settings;
+    if !s.audio_active() || !spec.info.has_audio {
+        return Ok(None);
+    }
+    let Some(source) = crate::audio::source::analyse(tools, &spec.info)? else {
+        return Ok(None);
+    };
+    let (ai, open_error) = if audio_job::may_use_ai(s) {
+        match LocalAi::open() {
+            Ok(ai) => (Some(ai), None),
+            Err(e) => (None, Some(e)),
+        }
+    } else {
+        (None, None)
+    };
+    let plan = match audio_job::plan_job(s, Some(&source), ai.is_some()) {
+        Ok(plan) => plan,
+        Err(e) => {
+            // When only the pack is missing, its own error says why (and which button).
+            if let Some(open_error) = open_error {
+                if audio_job::plan_job(s, Some(&source), true).is_ok() {
+                    return Err(open_error);
+                }
+            }
+            return Err(e);
+        }
+    };
+    // The device recorded when the pack was installed: free to read, unlike asking the
+    // worker (which starts Python and loads torch). A CPU never fails the export.
+    if plan.needs_ai() && ai.as_ref().is_some_and(|a| a.device == Device::Cpu) {
+        let w = "The local AI audio pack runs on the CPU: audio separation will be slow.";
+        log::warn!("{w}");
+        emit(ExportEvent::Audio(AudioEvent::Warning(w.to_string())));
+    }
+    Ok(Some(AudioWork {
+        ai: ai.filter(|_| plan.needs_ai()),
+    }))
+}
+
+/// What the encoded intermediate video depends on: the encode options and every finished
+/// frame (size and modification time), so a frame made again means a new encode.
+fn video_key(opts: &EncodeOptions, total: u64, frames: impl Iterator<Item = PathBuf>) -> String {
+    let mut parts = vec![format!("{opts:?}"), total.to_string()];
+    for path in frames {
+        let (len, modified) = std::fs::metadata(&path)
+            .map(|m| {
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                (m.len(), t)
+            })
+            .unwrap_or((0, 0));
+        parts.push(format!("{len}:{modified}"));
+    }
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    format!("frames {total}\n{}", cache::key(&refs))
+}
+
+/// The intermediate video (no audio) and its marker in the job folder.
+pub const VIDEO_FILE: &str = "video.mkv";
+const VIDEO_DONE: &str = "video.done";
+
 fn export(
     tools: &Tools,
     spec: &ExportSpec,
     cancel: &AtomicBool,
     emit: &(dyn Fn(ExportEvent) + Sync),
-) -> Result<()> {
+) -> Result<PathBuf> {
+    let audio = prepare_audio(tools, spec, emit)?;
     let dir = spec.job_dir();
     let src_dir = dir.join(INPUT_DIR);
     let out_dir = dir.join(OUTPUT_DIR);
@@ -430,17 +522,108 @@ fn export(
             )
         }),
     };
-    if let Some(d) = spec.output.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    ffmpeg::encode(tools, &out_dir, total, &opts, &spec.output, cancel, |f| {
+    let progress = |f: u64| {
         emit(ExportEvent::Progress {
             stage: Stage::Encoding,
             done: f.min(out_frames_total),
             total: out_frames_total,
         })
-    })?;
-    Ok(())
+    };
+    let Some(audio) = audio else {
+        if let Some(d) = spec.output.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        ffmpeg::encode(
+            tools,
+            &out_dir,
+            total,
+            &opts,
+            &spec.output,
+            cancel,
+            progress,
+        )?;
+        return Ok(spec.output.clone());
+    };
+
+    // 4b. With new audio: the video without audio to an intermediate MKV (kept, so changing
+    // only the audio settings re-runs the audio and the mux, not the frames or the encode),
+    // then the audio job, then the mux.
+    let opts = EncodeOptions {
+        audio_from: None,
+        ..opts
+    };
+    let video = dir.join(VIDEO_FILE);
+    let done = dir.join(VIDEO_DONE);
+    let key = video_key(
+        &opts,
+        total,
+        (1..=total)
+            .filter(|n| dup_of[*n as usize].is_none())
+            .map(|n| ffmpeg::frame_file(&out_dir, n)),
+    );
+    let reuse = video.is_file() && std::fs::read_to_string(&done).is_ok_and(|k| k == key);
+    if reuse {
+        log::info!("export: reusing {}", video.display());
+    } else {
+        let _ = std::fs::remove_file(&done);
+        let part = dir.join("video.part.mkv");
+        ffmpeg::encode(tools, &out_dir, total, &opts, &part, cancel, progress)?;
+        std::fs::rename(&part, &video).context("could not keep the encoded video")?;
+        std::fs::write(&done, &key)?;
+    }
+    check(cancel)?;
+
+    emit(ExportEvent::Progress {
+        stage: Stage::Audio,
+        done: 0,
+        total: 1,
+    });
+    let audio_spec = AudioSpec {
+        info: info.clone(),
+        start: spec.start,
+        end: spec.end,
+        settings: s.clone(),
+    };
+    let warned = Mutex::new(Vec::<String>::new());
+    let result = audio_job::run(
+        tools,
+        &audio_spec,
+        audio.ai.as_ref().map(|a| a as &dyn AudioAi),
+        cancel,
+        &|e| {
+            match &e {
+                AudioEvent::Warning(w) => warned.lock().unwrap().push(w.clone()),
+                AudioEvent::Section { done, total } => emit(ExportEvent::Progress {
+                    stage: Stage::Audio,
+                    done: *done as u64,
+                    total: *total as u64,
+                }),
+                AudioEvent::Stage(_) => {}
+            }
+            emit(ExportEvent::Audio(e));
+        },
+    )?;
+    // A finished job loaded from its cache reports its warnings only in the result.
+    let warned = warned.into_inner().unwrap();
+    for w in result.warnings.iter().filter(|w| !warned.contains(w)) {
+        emit(ExportEvent::Audio(AudioEvent::Warning(w.clone())));
+    }
+    check(cancel)?;
+
+    let output = spec.output.with_extension("mkv");
+    if let Some(d) = output.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let (start, duration, _) = audio_job::range(info, spec.start, spec.end);
+    ffmpeg::mux(
+        tools,
+        &video,
+        &result.tracks,
+        Some((info.path.clone(), start, duration)),
+        &output,
+        cancel,
+    )?;
+    Ok(output)
 }
 
 const REVIEW_FILE: &str = "review.json";

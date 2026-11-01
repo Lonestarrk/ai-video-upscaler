@@ -7,7 +7,9 @@ use std::sync::Mutex;
 
 use upscaler_core::ffmpeg::{self, Tools};
 use upscaler_core::job::{self, ExportEvent, ExportSpec};
-use upscaler_core::settings::{AiRate, OutputSize, ProviderKind, Settings};
+use upscaler_core::settings::{
+    AiRate, AudioMode, LfeLevel, OutputSize, ProviderKind, Settings, SurroundEngine,
+};
 
 fn make_video(tools: &Tools, path: &Path) {
     let status = std::process::Command::new(&tools.ffmpeg)
@@ -308,6 +310,398 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
         (result.coded_width, result.coded_height, result.sar),
         (1708, 960, (1, 1))
     );
+}
+
+// ---------------------------------------------------------------- surround audio export
+
+/// A 4 s 30000/1001 clip (160x90) with Swedish-tagged stereo AC-3 audio.
+fn make_ntsc_clip(tools: &Tools, path: &Path) {
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=160x90:rate=30000/1001:duration=4")
+        .args(["-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:sample_rate=48000:duration=4,aformat=channel_layouts=stereo")
+        .args([
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "192k",
+            "-metadata:s:a:0",
+            "language=swe",
+            "-shortest",
+        ])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// One stream entry (`stream=...`) of `path` as `key=value` lines.
+fn stream_entries(tools: &Tools, path: &Path, select: &str, entries: &str) -> String {
+    let out = std::process::Command::new(&tools.ffprobe)
+        .args(["-v", "error", "-select_streams", select, "-show_entries"])
+        .arg(entries)
+        .args(["-of", "default=nw=1"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).replace('\r', "")
+}
+
+fn entry(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .map(str::to_string)
+}
+
+/// Samples of audio stream `index` when decoded (at 48 kHz).
+fn decoded_samples(tools: &Tools, path: &Path, index: usize) -> u64 {
+    let out = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", &format!("0:a:{index}"), "-ac", "1", "-ar", "48000"])
+        .args(["-f", "s16le", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout.len() as u64 / 2
+}
+
+/// Video frames in `path`, counted.
+fn video_frames(tools: &Tools, path: &Path) -> u64 {
+    let out = std::process::Command::new(&tools.ffprobe)
+        .args(["-v", "error", "-count_packets", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            "stream=nb_read_packets",
+            "-of",
+            "default=nw=1",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    entry(&text, "nb_read_packets").unwrap().parse().unwrap()
+}
+
+fn surround_settings(work: &Path) -> Settings {
+    let mut s = Settings {
+        provider: ProviderKind::Basic,
+        output_size: OutputSize::Scale2,
+        audio_mode: AudioMode::Surround,
+        surround_engine: SurroundEngine::Classic,
+        ..Settings::default()
+    };
+    s.work_dir = work.display().to_string();
+    s
+}
+
+/// Runs an export and returns every event in a readable form.
+fn run_events(tools: &Tools, spec: &ExportSpec) -> Vec<String> {
+    let log = Mutex::new(Vec::new());
+    job::run_export(tools, spec, &AtomicBool::new(false), &|e| {
+        let line = match &e {
+            ExportEvent::Finished(p) => format!("finished {}", p.display()),
+            ExportEvent::Failed(m) => format!("failed: {m}"),
+            ExportEvent::FrameDone { .. } => "frame".to_string(),
+            ExportEvent::Progress { stage, .. } => format!("progress {stage:?}"),
+            other => format!("{other:?}"),
+        };
+        log.lock().unwrap().push(line);
+    });
+    log.into_inner().unwrap()
+}
+
+#[test]
+fn keeps_exact_frame_rate() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    assert_eq!((info.fps_num, info.fps_den), (30000, 1001));
+
+    // Original audio: the MP4 path.
+    let mut original = surround_settings(&dir.path().join("work"));
+    original.audio_mode = AudioMode::Original;
+    let spec = ExportSpec {
+        info: info.clone(),
+        start: 10,
+        end: 40,
+        output: dir.path().join("orig.mp4"),
+        settings: original,
+    };
+    let log = run_events(&tools, &spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    let v = stream_entries(&tools, &spec.output, "v:0", "stream=r_frame_rate");
+    assert_eq!(entry(&v, "r_frame_rate").as_deref(), Some("30000/1001"));
+
+    // 5.1: the MKV path.
+    let spec = ExportSpec {
+        output: dir.path().join("surround.mp4"),
+        settings: surround_settings(&dir.path().join("work")),
+        ..spec
+    };
+    let log = run_events(&tools, &spec);
+    let mkv = dir.path().join("surround.mkv");
+    assert_eq!(
+        log.last().unwrap(),
+        &format!("finished {}", mkv.display()),
+        "{log:?}"
+    );
+    let v = stream_entries(&tools, &mkv, "v:0", "stream=r_frame_rate");
+    assert_eq!(entry(&v, "r_frame_rate").as_deref(), Some("30000/1001"));
+}
+
+#[test]
+fn audio_matches_video_length() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    // 2.5 s: 75 frames from 0.5 s on.
+    let spec = ExportSpec {
+        info,
+        start: 15,
+        end: 90,
+        output: dir.path().join("out.mkv"),
+        settings: surround_settings(&dir.path().join("work")),
+    };
+    let log = run_events(&tools, &spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    assert_eq!(video_frames(&tools, &spec.output), 75);
+    let video = (75.0 * 1001.0 / 30000.0 * 48000.0_f64).round() as i64;
+    let frame = (1001.0 / 30000.0 * 48000.0_f64).round() as i64;
+    for (i, name) in ["flac 5.1", "ac3 5.1"].iter().enumerate() {
+        let n = decoded_samples(&tools, &spec.output, i) as i64;
+        assert!(
+            (n - video).abs() <= frame,
+            "{name}: {n} samples, video {video}"
+        );
+    }
+    // The original is stream-copied, so it can only be cut on its own (AC-3, 1536-sample)
+    // frame boundaries: one audio frame more is allowed for it.
+    let n = decoded_samples(&tools, &spec.output, 2) as i64;
+    assert!(
+        (n - video).abs() <= frame + 1536,
+        "original: {n} samples, video {video}"
+    );
+}
+
+#[test]
+fn surround_export_has_three_tracks() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 30,
+        output: dir.path().join("three.mkv"),
+        settings: surround_settings(&dir.path().join("work")),
+    };
+    let log = run_events(&tools, &spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    let all = "stream=index,codec_type,codec_name,channels:stream_disposition=default:stream_tags=title,language";
+    let s = |i: usize| stream_entries(&tools, &spec.output, &i.to_string(), all);
+    let v = s(0);
+    assert_eq!(entry(&v, "codec_type").as_deref(), Some("video"));
+    let flac = s(1);
+    assert_eq!(
+        entry(&flac, "codec_name").as_deref(),
+        Some("flac"),
+        "{flac}"
+    );
+    assert_eq!(entry(&flac, "channels").as_deref(), Some("6"));
+    assert_eq!(entry(&flac, "DISPOSITION:default").as_deref(), Some("1"));
+    assert_eq!(entry(&flac, "TAG:title").as_deref(), Some("5.1 (FLAC)"));
+    assert_eq!(entry(&flac, "TAG:language").as_deref(), Some("swe"));
+    let ac3 = s(2);
+    assert_eq!(entry(&ac3, "codec_name").as_deref(), Some("ac3"), "{ac3}");
+    assert_eq!(entry(&ac3, "channels").as_deref(), Some("6"));
+    assert_eq!(entry(&ac3, "DISPOSITION:default").as_deref(), Some("0"));
+    assert_eq!(entry(&ac3, "TAG:title").as_deref(), Some("5.1 (AC-3)"));
+    let orig = s(3);
+    assert_eq!(entry(&orig, "codec_name").as_deref(), Some("ac3"), "{orig}");
+    assert_eq!(entry(&orig, "channels").as_deref(), Some("2"));
+    assert_eq!(entry(&orig, "DISPOSITION:default").as_deref(), Some("0"));
+    assert_eq!(entry(&orig, "TAG:title").as_deref(), Some("Original"));
+    assert_eq!(entry(&orig, "TAG:language").as_deref(), Some("swe"));
+    assert!(stream_entries(&tools, &spec.output, "4", "stream=index").is_empty());
+}
+
+#[test]
+fn audio_only_change_skips_frames() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 20,
+        output: dir.path().join("a.mkv"),
+        settings: surround_settings(&dir.path().join("work")),
+    };
+    let log = run_events(&tools, &spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    assert_eq!(log.iter().filter(|l| *l == "frame").count(), 20);
+    let video = spec.job_dir().join("video.mkv");
+    let before = std::fs::metadata(&video).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let mut changed = spec.clone();
+    changed.settings.lfe_level = LfeLevel::Strong;
+    changed.output = dir.path().join("b.mkv");
+    assert_eq!(changed.job_dir(), spec.job_dir());
+    let log = run_events(&tools, &changed);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    assert!(!log.iter().any(|l| l == "frame"), "{log:?}");
+    let after = std::fs::metadata(&video).unwrap().modified().unwrap();
+    assert_eq!(before, after, "video.mkv must not be encoded again");
+    assert!(changed.output.is_file());
+}
+
+/// Quality improvement without 5.1 yields one stereo FLAC: it leads (default), then the
+/// original. A PCM original is never put in the container as PCM: it becomes FLAC.
+#[test]
+fn mux_stereo_flac_first_and_no_pcm() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ff = |args: &[&str], out: &Path| {
+        let ok = std::process::Command::new(&tools.ffmpeg)
+            .args(["-y", "-loglevel", "error"])
+            .args(args)
+            .arg(out)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    };
+    let video = dir.path().join("video.mkv");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=25:duration=2",
+            "-c:v",
+            "libx264",
+        ],
+        &video,
+    );
+    let flac = dir.path().join("stereo.flac");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=500:sample_rate=48000:duration=2",
+            "-ac",
+            "2",
+            "-c:a",
+            "flac",
+        ],
+        &flac,
+    );
+    let src = dir.path().join("pcm.mkv");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=300:sample_rate=48000:duration=4",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=25:duration=4",
+            "-map",
+            "1:v",
+            "-map",
+            "0:a",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "pcm_s16le",
+        ],
+        &src,
+    );
+    let out = dir.path().join("out.mkv");
+    ffmpeg::mux(
+        &tools,
+        &video,
+        &[upscaler_core::audio::job::AudioTrack::FlacStereo(flac)],
+        Some((src, 1.0, 2.0)),
+        &out,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let all = "stream=codec_name,channels:stream_disposition=default:stream_tags=title";
+    let a = stream_entries(&tools, &out, "a:0", all);
+    assert_eq!(entry(&a, "codec_name").as_deref(), Some("flac"), "{a}");
+    assert_eq!(entry(&a, "channels").as_deref(), Some("2"));
+    assert_eq!(entry(&a, "DISPOSITION:default").as_deref(), Some("1"));
+    assert_eq!(entry(&a, "TAG:title").as_deref(), Some("Stereo (FLAC)"));
+    let o = stream_entries(&tools, &out, "a:1", all);
+    assert_eq!(entry(&o, "codec_name").as_deref(), Some("flac"), "{o}");
+    assert_eq!(entry(&o, "DISPOSITION:default").as_deref(), Some("0"));
+    assert_eq!(entry(&o, "TAG:title").as_deref(), Some("Original"));
+    // PCM is cut sample exactly.
+    assert_eq!(decoded_samples(&tools, &out, 1), 96000);
+    assert!(stream_entries(&tools, &out, "a:2", "stream=index").is_empty());
+    assert!(!out.with_extension("original.part.mka").exists());
+}
+
+#[test]
+fn missing_pack_fails_before_frames() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let empty_pack = dir.path().join("no-pack");
+    std::fs::create_dir_all(&empty_pack).unwrap();
+    // Never the real pack of this machine.
+    std::env::set_var(upscaler_core::audio::pack::DIR_ENV, &empty_pack);
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let mut settings = surround_settings(&dir.path().join("work"));
+    settings.surround_engine = SurroundEngine::LocalAi;
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 10,
+        output: dir.path().join("x.mkv"),
+        settings,
+    };
+    let log = run_events(&tools, &spec);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("failed: "), "{log:?}");
+    assert!(log[0].contains("Settings"), "{log:?}");
+    assert!(!spec.job_dir().join(job::INPUT_DIR).exists());
 }
 
 /// Checks frame accuracy on real files: `UPSCALER_TEST_VIDEOS=a.mp4:b.vob cargo test -- --ignored`

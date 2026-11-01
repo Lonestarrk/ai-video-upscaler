@@ -93,7 +93,7 @@ fn audio_identity(info: &VideoInfo) -> String {
 }
 
 /// Whether these settings may use the AI audio pack (separation or enhancement).
-fn may_use_ai(s: &Settings) -> bool {
+pub fn may_use_ai(s: &Settings) -> bool {
     s.audio_enhance
         || (s.audio_mode == AudioMode::Surround && s.surround_engine == SurroundEngine::LocalAi)
 }
@@ -264,7 +264,8 @@ impl JobPlan {
         }
     }
 
-    fn needs_ai(&self) -> bool {
+    /// The job uses the AI audio pack (separation or enhancement).
+    pub fn needs_ai(&self) -> bool {
         self.kind == Kind::UpmixAi || self.enhance
     }
 }

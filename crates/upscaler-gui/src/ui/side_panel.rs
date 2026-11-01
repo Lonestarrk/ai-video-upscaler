@@ -594,6 +594,7 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 "Kodar video med originalljud…",
                 "Encoding video with the original audio…",
             ),
+            Stage::Audio => tr("Bearbetar ljudet…", "Processing the audio…"),
         };
         if running {
             ui.horizontal(|ui| {

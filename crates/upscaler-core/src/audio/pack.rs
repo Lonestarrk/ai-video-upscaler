@@ -121,8 +121,15 @@ pub mod stage {
     pub const CHECK: &str = "check";
 }
 
+/// Environment variable that points the app at another pack folder (tests use an empty one,
+/// so they never depend on a pack installed on the machine).
+pub const DIR_ENV: &str = "UPSCALER_AUDIO_AI_DIR";
+
 pub fn pack_dir() -> PathBuf {
-    paths::tools_dir().join("audio-ai")
+    match std::env::var_os(DIR_ENV).filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => paths::tools_dir().join("audio-ai"),
+    }
 }
 
 pub fn python_exe(dir: &Path) -> PathBuf {

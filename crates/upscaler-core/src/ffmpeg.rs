@@ -718,6 +718,171 @@ pub fn encode(
     }
 }
 
+/// Codecs the "Original" track keeps by stream copy; anything else (PCM above all, which the
+/// output container must never hold) is encoded to FLAC.
+const COPY_AUDIO: &[&str] = &[
+    "ac3", "eac3", "aac", "mp3", "mp2", "dts", "truehd", "flac", "opus", "vorbis",
+];
+
+/// Codec and language tag of the first audio stream of `path`.
+fn first_audio_stream(tools: &Tools, path: &Path) -> Result<(String, Option<String>)> {
+    let mut cmd = command(&tools.ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name:stream_tags=language",
+        "-print_format",
+        "json",
+    ])
+    .arg(path);
+    let out = process::run(
+        cmd,
+        None,
+        &AtomicBool::new(false),
+        Some(std::time::Duration::from_secs(60)),
+    )?;
+    if !out.success {
+        bail!("ffprobe: {}", out.tail(5));
+    }
+    let v: Value =
+        serde_json::from_str(&out.stdout_text()).context("ffprobe output is not JSON")?;
+    let s = &v["streams"][0];
+    let codec = s["codec_name"].as_str().unwrap_or("?").to_string();
+    let lang = s["tags"]["language"]
+        .as_str()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "und")
+        .map(str::to_string);
+    Ok((codec, lang))
+}
+
+/// Cuts `dur` seconds from `start` of `src`'s first audio stream into the Matroska audio
+/// file `out`: stream-copied when `copy` (cut on the codec's own frame boundaries, so the
+/// track can be up to one audio frame off at each end), else encoded to FLAC (sample exact).
+fn cut_original(
+    tools: &Tools,
+    src: &Path,
+    start: f64,
+    dur: f64,
+    copy: bool,
+    out: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut cmd = tools.ffmpeg_cmd();
+    // Output-side seeking: with stream copy it only reads packets, and it keeps the
+    // sub-frame position of the first kept packet in its timestamp.
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(src)
+        .arg("-ss")
+        .arg(format!("{start:.6}"))
+        .arg("-t")
+        .arg(format!("{dur:.6}"))
+        .args(["-map", "0:a:0", "-vn", "-sn", "-dn"])
+        .args(["-map_metadata", "-1", "-map_chapters", "-1"])
+        .args(["-c:a", if copy { "copy" } else { "flac" }])
+        .args(["-f", "matroska", "-progress", "pipe:1", "-nostats"])
+        .arg(out);
+    run_with_progress(cmd, cancel, |_| {})
+}
+
+/// Muxes the video (copied) with the audio job's tracks and the source's own audio for the
+/// same range into the MKV `out`.
+///
+/// Track order: FLAC (5.1, or stereo when only the quality was improved; default track),
+/// then AC-3 5.1, then the original. Titles "5.1 (FLAC)", "Stereo (FLAC)", "5.1 (AC-3)",
+/// "Original"; every audio track gets the source's language tag when it has one.
+///
+/// `original` is `(source file, start s, duration s)`. Every stream is cut to the video's
+/// length (`duration`, or the probed length of `video` without an original): stream copy
+/// cuts on packets, so a copied track may differ from the video's length by up to one of
+/// its own frames (AC-3: 1536 samples, 32 ms; the original by one at each end).
+pub fn mux(
+    tools: &Tools,
+    video: &Path,
+    tracks: &[crate::audio::job::AudioTrack],
+    original: Option<(PathBuf, f64, f64)>,
+    out: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    use crate::audio::job::AudioTrack;
+    let duration = match &original {
+        Some((_, _, d)) => *d,
+        None => probe(tools, video)?.duration,
+    };
+    let mut ordered: Vec<&AudioTrack> = tracks.iter().collect();
+    ordered.sort_by_key(|t| match t {
+        AudioTrack::Flac51(_) | AudioTrack::FlacStereo(_) => 0,
+        AudioTrack::Ac351(_) => 1,
+    });
+    let mut inputs: Vec<(PathBuf, &str)> = ordered
+        .iter()
+        .map(|t| {
+            let title = match t {
+                AudioTrack::Flac51(_) => "5.1 (FLAC)",
+                AudioTrack::Ac351(_) => "5.1 (AC-3)",
+                AudioTrack::FlacStereo(_) => "Stereo (FLAC)",
+            };
+            (t.path().to_path_buf(), title)
+        })
+        .collect();
+
+    let orig_file = out.with_extension("original.part.mka");
+    let mut language = None;
+    if let Some((src, start, dur)) = &original {
+        let (codec, lang) = first_audio_stream(tools, src)?;
+        language = lang;
+        let copy = COPY_AUDIO.contains(&codec.as_str());
+        let cut = cut_original(tools, src, *start, *dur, copy, &orig_file, cancel);
+        match cut {
+            Ok(()) => {}
+            Err(e) if process::is_cancelled(&e) || !copy => {
+                let _ = std::fs::remove_file(&orig_file);
+                return Err(e.context("could not cut the original audio"));
+            }
+            Err(e) => {
+                log::info!("copying the original audio failed ({e}), encoding it to FLAC");
+                if let Err(e) = cut_original(tools, src, *start, *dur, false, &orig_file, cancel) {
+                    let _ = std::fs::remove_file(&orig_file);
+                    return Err(e.context("could not cut the original audio"));
+                }
+            }
+        }
+        inputs.push((orig_file.clone(), "Original"));
+    }
+
+    let mut cmd = tools.ffmpeg_cmd();
+    // -copyts keeps the original's sub-frame start (its first whole packet may begin a few
+    // ms into the range); the video and the job's tracks all start at 0.
+    cmd.args(["-y", "-copyts", "-i"]).arg(video);
+    for (path, _) in &inputs {
+        cmd.arg("-i").arg(path);
+    }
+    cmd.args(["-map", "0:v:0"]);
+    for i in 0..inputs.len() {
+        cmd.arg("-map").arg(format!("{}:a:0", i + 1));
+    }
+    cmd.args(["-c", "copy", "-t"]).arg(format!("{duration:.6}"));
+    for (i, (_, title)) in inputs.iter().enumerate() {
+        cmd.arg(format!("-disposition:a:{i}"))
+            .arg(if i == 0 { "default" } else { "0" })
+            .arg(format!("-metadata:s:a:{i}"))
+            .arg(format!("title={title}"));
+        if let Some(lang) = &language {
+            cmd.arg(format!("-metadata:s:a:{i}"))
+                .arg(format!("language={lang}"));
+        }
+    }
+    cmd.args(["-f", "matroska", "-progress", "pipe:1", "-nostats"])
+        .arg(out);
+    let result = run_with_progress(cmd, cancel, |_| {});
+    let _ = std::fs::remove_file(&orig_file);
+    result
+}
+
 /// Runs an ffmpeg command that has `-progress pipe:1`, reporting `frame=` values.
 fn run_with_progress(
     mut cmd: std::process::Command,
