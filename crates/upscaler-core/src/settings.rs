@@ -36,6 +36,11 @@ impl ProviderKind {
     ];
 
     /// Generative providers take a prompt and benefit from padding and a reference frame.
+    /// Services whose own model can check finished frames (quality control).
+    pub fn can_review(self) -> bool {
+        matches!(self, ProviderKind::ChatGptSubscription)
+    }
+
     pub fn is_generative(self) -> bool {
         matches!(
             self,
@@ -117,6 +122,7 @@ pub enum AspectChoice {
     Wide16x9,
     Tv4x3,
     Scope239,
+    Scope235,
     Flat185,
     Photo3x2,
     Square1x1,
@@ -125,10 +131,11 @@ pub enum AspectChoice {
 }
 
 impl AspectChoice {
-    pub const ALL: [AspectChoice; 8] = [
+    pub const ALL: [AspectChoice; 9] = [
         AspectChoice::Wide16x9,
         AspectChoice::Tv4x3,
         AspectChoice::Scope239,
+        AspectChoice::Scope235,
         AspectChoice::Flat185,
         AspectChoice::Photo3x2,
         AspectChoice::Square1x1,
@@ -142,6 +149,7 @@ impl AspectChoice {
             AspectChoice::Wide16x9 => 16.0 / 9.0,
             AspectChoice::Tv4x3 => 4.0 / 3.0,
             AspectChoice::Scope239 => 2.39,
+            AspectChoice::Scope235 => 2.35,
             AspectChoice::Flat185 => 1.85,
             AspectChoice::Photo3x2 => 1.5,
             AspectChoice::Square1x1 => 1.0,
@@ -156,6 +164,7 @@ impl AspectChoice {
             AspectChoice::Wide16x9 => "16:9",
             AspectChoice::Tv4x3 => "4:3",
             AspectChoice::Scope239 => "2.39:1",
+            AspectChoice::Scope235 => "2.35:1",
             AspectChoice::Flat185 => "1.85:1",
             AspectChoice::Photo3x2 => "3:2",
             AspectChoice::Square1x1 => "1:1",
@@ -320,6 +329,10 @@ pub struct Settings {
     pub parallel_requests: u32,
     /// Longest side of the reference frame sent to the model.
     pub reference_max_side: u32,
+    /// Let the service's own model check every exported frame once and redo rejected ones.
+    pub review_frames: bool,
+    /// Attempts per frame (the first one included) before a rejected frame is kept anyway.
+    pub review_max_attempts: u32,
 
     // Output video
     pub video_codec: VideoCodec,
@@ -330,6 +343,12 @@ pub struct Settings {
     pub ui_scale: f32,
     /// Measured average seconds per AI frame, per provider id, for time estimates.
     pub seconds_per_frame: Vec<(String, f32)>,
+    /// Project folders opened lately, newest first.
+    pub recent_projects: Vec<PathBuf>,
+
+    /// The open project's folder: previews, export frames and temp files go there.
+    #[serde(skip)]
+    pub project_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -372,11 +391,15 @@ impl Default for Settings {
             ai_rate: AiRate::All,
             parallel_requests: 2,
             reference_max_side: 1536,
+            review_frames: true,
+            review_max_attempts: 3,
             video_codec: VideoCodec::H264,
             crf: 16,
             compare_mode: CompareMode::SideBySide,
             ui_scale: 1.0,
             seconds_per_frame: Vec::new(),
+            recent_projects: Vec::new(),
+            project_dir: None,
         }
     }
 }
@@ -426,7 +449,17 @@ impl Settings {
         std::fs::rename(&tmp, path)
     }
 
+    /// Where previews, export frames and temp files go: the open project's folder, else the
+    /// work folder from the settings.
     pub fn work_dir(&self) -> PathBuf {
+        if let Some(p) = &self.project_dir {
+            return p.clone();
+        }
+        self.global_work_dir()
+    }
+
+    /// The work folder from the settings, used when no project is open.
+    pub fn global_work_dir(&self) -> PathBuf {
         if self.work_dir.trim().is_empty() {
             paths::default_work_dir()
         } else {
@@ -470,6 +503,18 @@ impl Settings {
     /// Whether frames must run one after another (the previous result feeds the next request).
     pub fn sequential(&self) -> bool {
         self.use_previous_frame && self.reference_supported()
+    }
+
+    /// Whether exported frames are checked by the service's own model.
+    pub fn review_active(&self) -> bool {
+        self.review_frames && self.provider.can_review()
+    }
+
+    /// Puts `dir` first in the recent projects list (at most ten).
+    pub fn remember_project(&mut self, dir: &Path) {
+        self.recent_projects.retain(|p| p != dir);
+        self.recent_projects.insert(0, dir.to_path_buf());
+        self.recent_projects.truncate(10);
     }
 
     /// Whether the current service can take the previous frame as a second image.

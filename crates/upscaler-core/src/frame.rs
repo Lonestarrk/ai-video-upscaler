@@ -89,23 +89,67 @@ pub fn prepare_with(img: &RgbImage, aspects: &[f64]) -> Prepared {
     }
 }
 
-/// Cuts the picture back out of a model result (which may have any size) and resizes it to
-/// exactly `target`.
+/// Cuts the picture back out of a model result (which may have any size) and sizes it to
+/// exactly `target` without changing its proportions.
 pub fn finish(result: &RgbImage, prepared: &Prepared, target: (u32, u32)) -> RgbImage {
     let (cw, ch) = prepared.canvas.dimensions();
     let (rw, rh) = result.dimensions();
-    let (sx, sy) = (rw as f64 / cw as f64, rh as f64 / ch as f64);
-    let (x, y, w, h) = prepared.content;
-    let crop_x = ((x as f64 * sx).round() as u32).min(rw.saturating_sub(1));
-    let crop_y = ((y as f64 * sy).round() as u32).min(rh.saturating_sub(1));
-    let crop_w = ((w as f64 * sx).round() as u32).clamp(1, rw - crop_x);
-    let crop_h = ((h as f64 * sy).round() as u32).clamp(1, rh - crop_y);
-    let cropped = imageops::crop_imm(result, crop_x, crop_y, crop_w, crop_h).to_image();
-    if cropped.dimensions() == target {
-        cropped
+    let same_shape = ((rw as f64 / rh as f64) / (cw as f64 / ch as f64) - 1.0).abs() < 0.02;
+    let picture = if same_shape {
+        let (sx, sy) = (rw as f64 / cw as f64, rh as f64 / ch as f64);
+        let (x, y, w, h) = prepared.content;
+        let crop_x = ((x as f64 * sx).round() as u32).min(rw.saturating_sub(1));
+        let crop_y = ((y as f64 * sy).round() as u32).min(rh.saturating_sub(1));
+        let crop_w = ((w as f64 * sx).round() as u32).clamp(1, rw - crop_x);
+        let crop_h = ((h as f64 * sy).round() as u32).clamp(1, rh - crop_y);
+        imageops::crop_imm(result, crop_x, crop_y, crop_w, crop_h).to_image()
+    } else if prepared.padded() {
+        // The model reframed the canvas: our bars are gone or resized, so cut away whatever
+        // black edges are left instead of trusting their old position.
+        trim_black_edges(result)
     } else {
-        imageops::resize(&cropped, target.0, target.1, FilterType::Lanczos3)
+        result.clone()
+    };
+    fit_cover(&picture, target)
+}
+
+/// Removes solid black rows and columns at the edges (at most a quarter of each side).
+fn trim_black_edges(img: &RgbImage) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let dark = |p: &Rgb<u8>| p.0.iter().all(|&c| c < 20);
+    let row_black =
+        |y: u32| (0..w).filter(|&x| dark(img.get_pixel(x, y))).count() * 100 >= w as usize * 98;
+    let col_black =
+        |x: u32| (0..h).filter(|&y| dark(img.get_pixel(x, y))).count() * 100 >= h as usize * 98;
+    let top = (0..h / 4).take_while(|&y| row_black(y)).count() as u32;
+    let bottom = (0..h / 4).take_while(|&i| row_black(h - 1 - i)).count() as u32;
+    let left = (0..w / 4).take_while(|&x| col_black(x)).count() as u32;
+    let right = (0..w / 4).take_while(|&i| col_black(w - 1 - i)).count() as u32;
+    imageops::crop_imm(img, left, top, w - left - right, h - top - bottom).to_image()
+}
+
+/// Scales `img` by the same factor in both directions until it covers `target`, then crops
+/// the overflow evenly from both sides. Never stretches.
+pub fn fit_cover(img: &RgbImage, target: (u32, u32)) -> RgbImage {
+    let (w, h) = img.dimensions();
+    if (w, h) == target {
+        return img.clone();
     }
+    let s = (target.0 as f64 / w as f64).max(target.1 as f64 / h as f64);
+    let sw = ((w as f64 * s).round() as u32).max(target.0);
+    let sh = ((h as f64 * s).round() as u32).max(target.1);
+    let scaled = imageops::resize(img, sw, sh, FilterType::Lanczos3);
+    if (sw, sh) == target {
+        return scaled;
+    }
+    imageops::crop_imm(
+        &scaled,
+        (sw - target.0) / 2,
+        (sh - target.1) / 2,
+        target.0,
+        target.1,
+    )
+    .to_image()
 }
 
 /// Grey used for the empty canvas the AI fills in when it extends the picture.
@@ -140,6 +184,19 @@ pub fn extend_canvas(img: &RgbImage, aspect: f64) -> RgbImage {
         ((ch - h) / 2) as i64,
     );
     canvas
+}
+
+/// The part of an extended `result` where the source picture sits, scaled to `size` (the
+/// source's size).
+pub fn source_area(result: &RgbImage, size: (u32, u32)) -> RgbImage {
+    let (rw, rh) = result.dimensions();
+    let (x, y, w, h) = inner_fraction(size.0 as f64 / size.1 as f64, rw as f64 / rh as f64);
+    let cx = (x * rw as f64).round() as u32;
+    let cy = (y * rh as f64).round() as u32;
+    let cw = ((w * rw as f64).round() as u32).clamp(1, rw - cx.min(rw - 1));
+    let ch = ((h * rh as f64).round() as u32).clamp(1, rh - cy.min(rh - 1));
+    let area = imageops::crop_imm(result, cx, cy, cw, ch).to_image();
+    imageops::resize(&area, size.0, size.1, FilterType::Lanczos3)
 }
 
 /// A plain resize to `target` followed by a gentle unsharp mask.
@@ -181,6 +238,40 @@ mod tests {
         assert_eq!(out.dimensions(), (3840, 2160));
         let c = out.get_pixel(1920, 3);
         assert!(c.0[0] > 150, "padding leaked into the picture: {c:?}");
+    }
+
+    #[test]
+    fn reframed_result_is_not_stretched() {
+        // 4:3 extended to 2.39:1 and padded to 3:2; the model answers 2.34:1 with thin bars.
+        let p = prepare_with(&RgbImage::new(1032, 432), &MODEL_ASPECTS);
+        assert!(p.padded());
+        let mut result = RgbImage::from_pixel(1919, 820, Rgb([0, 0, 0]));
+        for y in 62..758 {
+            for x in 0..1919 {
+                result.put_pixel(x, y, Rgb([200, 200, 200]));
+            }
+        }
+        // A 4x4 white square in the middle must stay square.
+        for y in 408..412 {
+            for x in 958..962 {
+                result.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        let out = finish(&result, &p, (2064, 864));
+        assert_eq!(out.dimensions(), (2064, 864));
+        assert!(out.get_pixel(1032, 2).0[0] > 150, "a black bar was kept");
+        let white = |x: u32, y: u32| out.get_pixel(x, y).0[0] > 240;
+        let wide = (0..2064).filter(|&x| white(x, 432)).count();
+        let tall = (0..864).filter(|&y| white(1032, y)).count();
+        assert!(wide.abs_diff(tall) <= 1, "stretched: {wide}x{tall}");
+    }
+
+    #[test]
+    fn fit_cover_keeps_proportions() {
+        let out = fit_cover(&RgbImage::new(1919, 820), (2064, 864));
+        assert_eq!(out.dimensions(), (2064, 864));
+        let out = fit_cover(&RgbImage::new(1536, 1024), (1536, 1024));
+        assert_eq!(out.dimensions(), (1536, 1024));
     }
 
     #[test]

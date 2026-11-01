@@ -12,6 +12,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         {
             app.open_dialog();
         }
+        project_menu(ui, app);
+        if ui
+            .add_enabled(
+                app.project.is_some(),
+                egui::Button::new(format!("🖼 {}", tr("Bildrutor", "Frames"))),
+            )
+            .on_hover_text(tr(
+                "Bläddra bland exportens färdiga bildrutor, se kvalitetskontrollens omdömen och underkänn bildrutor själv.",
+                "Browse the export's finished frames, see quality control's verdicts and reject frames yourself.",
+            ))
+            .clicked()
+        {
+            app.frame_browser.open = !app.frame_browser.open;
+        }
         ui.separator();
         if let Some(p) = &app.loading {
             ui.spinner();
@@ -78,8 +92,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             {
                 app.settings_ui.open = !app.settings_ui.open;
             }
-            if app.tools.is_none() {
-                if ui
+            if app.tools.is_none()
+                && ui
                     .button(
                         egui::RichText::new(format!("⚠ {}", tr("FFmpeg saknas", "FFmpeg missing")))
                             .color(super::style::WARN),
@@ -89,8 +103,90 @@ pub fn show(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     app.settings_ui.open = true;
                     app.settings_ui.tab = crate::ui::settings_window::TAB_FFMPEG;
                 }
-            }
         });
     });
     ui.add_space(2.0);
+}
+
+fn project_menu(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    let busy = app.exporting();
+    ui.menu_button(format!("📁 {}", tr("Projekt", "Project")), |ui| {
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(tr("Öppna projekt…", "Open project…")),
+            )
+            .on_hover_text(tr(
+                "Välj en projektmapp (med project.json) för att fortsätta där du slutade.",
+                "Pick a project folder (with project.json) to continue where you left off.",
+            ))
+            .clicked()
+        {
+            ui.close();
+            app.open_project_dialog();
+        }
+        let current = app.project.as_ref().map(|p| p.dir.clone());
+        let recent: Vec<_> = app
+            .settings
+            .recent_projects
+            .iter()
+            .filter(|d| Some(*d) != current.as_ref())
+            .cloned()
+            .collect();
+        ui.menu_button(tr("Senaste projekt", "Recent projects"), |ui| {
+            if recent.is_empty() {
+                ui.label(egui::RichText::new(tr("Inga ännu", "None yet")).weak());
+            }
+            for dir in recent {
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if ui
+                    .add_enabled(!busy, egui::Button::new(name))
+                    .on_hover_text(dir.display().to_string())
+                    .clicked()
+                {
+                    ui.close();
+                    app.open_project(dir);
+                }
+            }
+        });
+        ui.separator();
+        let has_project = app.project.is_some();
+        if ui
+            .add_enabled(
+                has_project,
+                egui::Button::new(tr("Öppna projektmappen", "Open the project folder")),
+            )
+            .clicked()
+        {
+            ui.close();
+            if let Some(p) = &app.project {
+                crate::worker::open(&p.dir);
+            }
+        }
+        if ui
+            .add_enabled(
+                has_project && !busy && !app.project_moving,
+                egui::Button::new(tr("Flytta projektmappen…", "Move the project folder…")),
+            )
+            .on_hover_text(tr(
+                "Flytta projektet med alla bildrutor till en annan disk eller mapp.",
+                "Move the project with all its frames to another drive or folder.",
+            ))
+            .clicked()
+        {
+            ui.close();
+            app.move_project_dialog();
+        }
+        if let Some(p) = &app.project {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(p.dir.display().to_string())
+                    .small()
+                    .weak(),
+            );
+        }
+    });
 }

@@ -1,4 +1,5 @@
 pub mod dialogs;
+pub mod frames;
 pub mod settings_window;
 pub mod side_panel;
 pub mod style;

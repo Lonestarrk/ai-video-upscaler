@@ -466,6 +466,7 @@ fn aspect_label(a: AspectChoice) -> String {
         AspectChoice::Wide16x9 => tr("bredbild", "widescreen"),
         AspectChoice::Tv4x3 => tr("TV", "TV"),
         AspectChoice::Scope239 => tr("bio, cinemascope", "cinema, scope"),
+        AspectChoice::Scope235 => tr("bio, äldre cinemascope", "cinema, classic scope"),
         AspectChoice::Flat185 => tr("bio", "cinema"),
         AspectChoice::Photo3x2 => tr("foto", "photo"),
         AspectChoice::Square1x1 => tr("kvadrat", "square"),
@@ -507,6 +508,7 @@ fn consistency(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     "Image models work in 1:1, 3:2 or 2:3. 16:9 frames get black bars so the model does not crop or distort them; the bars are removed afterwards.",
                 ));
         });
+        quality_control(ui, app);
         ui.checkbox(&mut app.settings.skip_duplicates, tr("Återanvänd resultat för identiska bildrutor", "Reuse results for identical frames"));
         ui.horizontal(|ui| {
             ui.label(tr("Skicka till AI", "Send to AI"));
@@ -532,6 +534,41 @@ fn consistency(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             });
         });
     });
+}
+
+fn quality_control(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    let supported = app.settings.provider.can_review();
+    ui.add_enabled_ui(supported, |ui| {
+        ui.checkbox(
+            &mut app.settings.review_frames,
+            tr("Kvalitetskontroll av varje bildruta", "Quality control of every frame"),
+        )
+        .on_hover_text(tr(
+            "Under exporten granskar tjänstens egen AI varje färdig bildruta en gång, i bakgrunden, mot originalet och föregående bildruta: inget får ha ändrats, lagts till eller förvrängts, och bildrutorna ska hänga ihop. Underkända bildrutor görs om med granskarens anmärkningar i prompten. Kostar ett extra anrop per bildruta, men ingen bildgenerering.",
+            "During the export the service's own AI checks every finished frame once, in the background, against the original and the previous frame: nothing may be changed, added or distorted, and the frames must match. Rejected frames are made again with the reviewer's notes in the prompt. Costs one extra request per frame, but no image generation.",
+        ));
+        if app.settings.review_frames && supported {
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.label(tr("Försök per bildruta", "Attempts per frame"));
+                ui.add(egui::DragValue::new(&mut app.settings.review_max_attempts).range(1..=6))
+                    .on_hover_text(tr(
+                        "Efter så många underkända försök behålls den sista versionen och markeras i loggen.",
+                        "After this many rejected attempts the last version is kept and noted in the log.",
+                    ));
+            });
+        }
+    });
+    if !supported && app.settings.provider.is_generative() {
+        ui.label(
+            egui::RichText::new(tr(
+                "Kvalitetskontroll finns än så länge bara med ChatGPT.",
+                "Quality control is only available with ChatGPT for now.",
+            ))
+            .small()
+            .weak(),
+        );
+    }
 }
 
 fn ai_rate_label(r: AiRate) -> &'static str {
@@ -618,6 +655,45 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                         .weak()
                         .small(),
                 );
+            }
+            if x.spec.settings.review_active() {
+                ui.label(format!(
+                    "{}: {} {} · {} {}{}{}",
+                    tr("Kvalitetskontroll", "Quality control"),
+                    x.approved,
+                    tr("godkända", "approved"),
+                    x.rejected,
+                    tr("gjorda om", "made again"),
+                    if x.kept > 0 {
+                        format!(
+                            " · {} {}",
+                            x.kept,
+                            tr("behållna trots fel", "kept despite problems")
+                        )
+                    } else {
+                        String::new()
+                    },
+                    if x.unchecked > 0 {
+                        format!(" · {} {}", x.unchecked, tr("ej granskade", "unchecked"))
+                    } else {
+                        String::new()
+                    },
+                ));
+                if ui
+                    .button(format!("🖼 {}", tr("Visa bildrutor", "Show frames")))
+                    .clicked()
+                {
+                    app.frame_browser.open = true;
+                }
+                if !x.review_notes.is_empty() {
+                    egui::CollapsingHeader::new(tr("Anmärkningar", "Notes"))
+                        .id_salt("review_notes")
+                        .show(ui, |ui| {
+                            for r in x.review_notes.iter().rev().take(8) {
+                                ui.label(egui::RichText::new(r).small().color(WARN));
+                            }
+                        });
+                }
             }
             if !x.retries.is_empty() {
                 egui::CollapsingHeader::new(format!(

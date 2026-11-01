@@ -3,3 +3,6 @@
 /installer/ffmpeg
 /test-videos
 *.log
+settings.json
+.env
+.env.*

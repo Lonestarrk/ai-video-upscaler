@@ -74,6 +74,10 @@ fn main() -> eframe::Result {
     } else {
         eframe::Renderer::Wgpu
     };
+    // wgpu otherwise picks Vulkan, which crashed with a validation error on an AMD RX 7900 XTX.
+    if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "dx12");
+    }
     let options = eframe::NativeOptions {
         viewport,
         renderer,

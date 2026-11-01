@@ -278,7 +278,7 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
     let log = run(&tools, &spec);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
     // The extracted frames are the same frames the preview shows.
-    let first = image::open(spec.job_dir().join("src").join("000001.png"))
+    let first = image::open(spec.job_dir().join(job::INPUT_DIR).join("000001.png"))
         .unwrap()
         .to_rgb8();
     assert!(mean_diff(&first, &frame_by_counting(&tools, &info, 30)) < 1.0);
@@ -288,7 +288,7 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
     assert_eq!((result.coded_width, result.coded_height), (1440, 960));
     assert_eq!(result.sar, (32, 27));
     assert!(result.has_audio);
-    let up = image::open(spec.job_dir().join("out").join("000001.png")).unwrap();
+    let up = image::open(spec.job_dir().join(job::OUTPUT_DIR).join("000001.png")).unwrap();
     assert_eq!(
         (up.width(), up.height()),
         (1708, 960),

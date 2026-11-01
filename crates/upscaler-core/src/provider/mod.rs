@@ -19,6 +19,7 @@ use image::RgbImage;
 
 use crate::frame;
 use crate::prompt::{self, PromptParts};
+use crate::review;
 use crate::settings::{ProviderKind, Settings};
 
 /// One request to a back end.
@@ -35,6 +36,21 @@ pub struct Request<'a> {
     pub work_dir: &'a Path,
 }
 
+/// One finished frame for quality control.
+pub struct ReviewRequest<'a> {
+    /// The original frame as decoded from the video.
+    pub source: &'a RgbImage,
+    /// The restored frame to judge.
+    pub result: &'a RgbImage,
+    /// When the picture was extended: the part of `result` where the source picture sits,
+    /// cut out at the source's size, so framing and faithfulness compare like with like.
+    pub result_area: Option<&'a RgbImage>,
+    /// The previous restored frame of the same shot, for consistency.
+    pub previous: Option<&'a RgbImage>,
+    pub instruction: &'a str,
+    pub work_dir: &'a Path,
+}
+
 pub trait Provider: Send + Sync {
     fn upscale(&self, req: &Request, cancel: &AtomicBool) -> Result<RgbImage>;
 
@@ -42,6 +58,16 @@ pub trait Provider: Send + Sync {
     /// Empty: the model keeps any input shape.
     fn canvas_aspects(&self) -> &'static [f64] {
         &frame::MODEL_ASPECTS
+    }
+
+    /// Whether [`Provider::review`] works for this service.
+    fn can_review(&self) -> bool {
+        false
+    }
+
+    /// Asks the service's own model to judge a finished frame.
+    fn review(&self, _req: &ReviewRequest, _cancel: &AtomicBool) -> Result<review::Verdict> {
+        anyhow::bail!("this service cannot review frames")
     }
 }
 
@@ -58,12 +84,15 @@ pub fn create(settings: &Settings) -> Box<dyn Provider> {
 }
 
 /// Upscales one source frame to `target`: pads, builds the prompt, calls the back end and
-/// crops/resizes the result. `reference` is the previous *final* frame.
+/// crops/resizes the result. `reference` is the previous *final* frame; `feedback` is why
+/// quality control rejected the last attempt at this frame.
+#[allow(clippy::too_many_arguments)]
 pub fn upscale_frame(
     provider: &dyn Provider,
     settings: &Settings,
     source: &RgbImage,
     reference: Option<&RgbImage>,
+    feedback: Option<&str>,
     target: (u32, u32),
     work_dir: &Path,
     cancel: &AtomicBool,
@@ -123,6 +152,7 @@ pub fn upscale_frame(
         padded: prepared.padded(),
         has_reference: reference.is_some(),
         extend: extend.map(|a| (a.name(), a.ratio() > source_aspect)),
+        feedback,
     });
     let req = Request {
         image: &prepared.canvas,

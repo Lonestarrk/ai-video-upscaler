@@ -617,18 +617,58 @@ fn ffmpeg(ui: &mut egui::Ui, app: &mut UpscalerApp) {
 
     ui.separator();
     ui.label(
-        egui::RichText::new(tr("Arbetsmapp", "Work folder"))
+        egui::RichText::new(tr("Projektmapp", "Project folder"))
             .strong()
             .size(16.0),
     );
     ui.label(tr(
-        "Här sparas förhandsvisningar och exportjobb (alla bildrutor som PNG – det kan bli många GB för långa videor). Jobb som avbryts fortsätter härifrån.",
-        "Previews and export jobs are stored here (every frame as PNG – it can be many GB for long videos). Cancelled jobs resume from here.",
+        "Varje video får ett projekt. Projektmappen innehåller projektfilen, förhandsvisningar och exportens bildrutor (src = från videon, out = färdiga), alla som PNG – det kan bli många GB för långa videor. Som standard ligger den bredvid videon i \"AI Video Upscaler\\<videonamn>\".",
+        "Every video gets a project. The project folder holds the project file, previews and the export's frames (src = from the video, out = finished), all as PNG – it can be many GB for long videos. By default it sits next to the video in \"AI Video Upscaler\\<video name>\".",
+    ));
+    match &app.project {
+        Some(p) => {
+            ui.label(egui::RichText::new(p.dir.display().to_string()).monospace());
+            let busy = app.project_moving;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new(tr("Flytta…", "Move…")))
+                    .on_hover_text(tr(
+                        "Flytta projektet med alla bildrutor till en annan disk eller mapp.",
+                        "Move the project with all its frames to another drive or folder.",
+                    ))
+                    .clicked()
+                {
+                    app.move_project_dialog();
+                }
+                if busy {
+                    ui.spinner();
+                    ui.label(tr("Flyttar…", "Moving…"));
+                }
+            });
+        }
+        None => {
+            ui.label(
+                egui::RichText::new(tr("Inget projekt är öppet.", "No project is open.")).weak(),
+            );
+        }
+    }
+    ui.add_space(6.0);
+    ui.label(tr(
+        "Mapp när inget projekt kan skapas bredvid videon (till exempel en DVD):",
+        "Folder when no project can be made next to the video (a DVD, for example):",
     ));
     ui.horizontal(|ui| {
-        let hint = app.settings.work_dir().display().to_string();
+        let hint = app.settings.global_work_dir().display().to_string();
         path_field(ui, &mut app.settings.work_dir, &hint, true);
     });
+    ui.label(
+        egui::RichText::new(tr(
+            "Storlek och tömning gäller mappen som används nu:",
+            "Size and emptying apply to the folder in use now:",
+        ))
+        .small()
+        .weak(),
+    );
     ui.horizontal(|ui| {
         match app.settings_ui.work_dir_size {
             Some(b) => ui.label(format!("{}: {}", tr("Använder", "Uses"), format_bytes(b))),

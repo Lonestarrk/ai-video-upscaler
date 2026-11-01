@@ -17,8 +17,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Result};
 use image::RgbImage;
 
-use super::{Provider, Request};
+use super::{Provider, Request, ReviewRequest};
 use crate::process::{self, command};
+use crate::review::Verdict;
 use crate::settings::Settings;
 
 pub struct Codex {
@@ -171,7 +172,9 @@ impl Codex {
 }
 
 /// The agent instruction around the image prompt.
-pub fn agent_prompt(image_prompt: &str, has_reference: bool) -> String {
+pub fn agent_prompt(image_prompt: &str, has_reference: bool, size: (u32, u32)) -> String {
+    let (w, h) = size;
+    let ratio = w as f64 / h.max(1) as f64;
     let inputs = if has_reference {
         "the attached image `input.png` (the frame to edit) together with the attached reference image `reference.png`"
     } else {
@@ -179,7 +182,7 @@ pub fn agent_prompt(image_prompt: &str, has_reference: bool) -> String {
     };
     format!(
         "You are the image back end of a video upscaling app. Do exactly this, without asking questions:\n\
-         1. Use your built-in image generation tool exactly once to edit {inputs} (both are also in the current directory), following the IMAGE INSTRUCTIONS below. Ask for the largest output size the tool supports, with the same orientation as input.png.\n\
+         1. Use your built-in image generation tool exactly once to edit {inputs} (both are also in the current directory), following the IMAGE INSTRUCTIONS below. input.png is {w}x{h} pixels (aspect ratio {ratio:.3}:1). Ask for the largest output size the tool supports with exactly that aspect ratio; the result must have the same shape as input.png, without added borders or bars.\n\
          2. Save the generated image in the current working directory as `output.png`. If the tool stored it elsewhere, copy that file here as `output.png`.\n\
          Do not write scripts or use Python, ImageMagick or any other program to change the picture, and do not create other files. \
          When output.png exists, reply only with DONE.\n\n\
@@ -249,6 +252,10 @@ fn last_lines(text: &str, n: usize) -> String {
 }
 
 impl Provider for Codex {
+    fn canvas_aspects(&self) -> &'static [f64] {
+        &[] // gpt-image-2 takes free sizes; black bars made it return a reframed picture
+    }
+
     fn upscale(&self, req: &Request, cancel: &AtomicBool) -> Result<RgbImage> {
         let exe = locate(&self.path)
             .ok_or_else(|| anyhow!("Codex CLI was not found: install it in the settings"))?;
@@ -287,7 +294,7 @@ impl Provider for Codex {
                 .arg(format!("model_reasoning_effort={}", self.reasoning));
         }
         cmd.arg("-");
-        let instruction = agent_prompt(req.prompt, reference.is_some());
+        let instruction = agent_prompt(req.prompt, reference.is_some(), req.image.dimensions());
         log::info!("codex exec in {}", dir.display());
         let out = process::run(
             cmd,
@@ -333,6 +340,66 @@ impl Provider for Codex {
         );
         Ok(img)
     }
+
+    fn can_review(&self) -> bool {
+        true
+    }
+
+    fn review(&self, req: &ReviewRequest, cancel: &AtomicBool) -> Result<Verdict> {
+        let exe = locate(&self.path)
+            .ok_or_else(|| anyhow!("Codex CLI was not found: install it in the settings"))?;
+        let dir = req.work_dir;
+        std::fs::create_dir_all(dir)?;
+        // Small copies are enough to judge and keep the turn quick.
+        let mut images = vec![("original.png", req.source), ("result.png", req.result)];
+        if let Some(a) = req.result_area {
+            images.push(("result-source-area.png", a));
+        }
+        if let Some(p) = req.previous {
+            images.push(("previous.png", p));
+        }
+        let mut cmd = base_command(&exe);
+        cmd.current_dir(dir)
+            .arg("exec")
+            .arg("--skip-git-repo-check")
+            .arg("--ephemeral")
+            .args(["--color", "never"])
+            .args(["--sandbox", "read-only"])
+            .arg("--cd")
+            .arg(dir);
+        for (name, img) in &images {
+            let p = dir.join(name);
+            crate::frame::limit_size(img, 1280).save(&p)?;
+            cmd.arg(format!("--image={}", p.display()));
+        }
+        let schema = dir.join("verdict-schema.json");
+        std::fs::write(&schema, crate::review::SCHEMA)?;
+        let answer = dir.join("verdict.json");
+        cmd.arg("--output-schema")
+            .arg(&schema)
+            .arg("-o")
+            .arg(&answer);
+        if !self.model.is_empty() {
+            cmd.args(["-m", &self.model]);
+        }
+        // Judging framing and detail needs more care than driving the image tool.
+        cmd.arg("-c").arg("model_reasoning_effort=medium");
+        cmd.arg("-");
+        log::info!("codex review in {}", dir.display());
+        let out = process::run(
+            cmd,
+            Some(req.instruction.as_bytes()),
+            cancel,
+            Some(self.timeout),
+        )?;
+        let transcript = format!("{}\n{}", out.stderr_text(), out.stdout_text());
+        let _ = std::fs::write(dir.join("codex-output.txt"), &transcript);
+        let text = std::fs::read_to_string(&answer).unwrap_or_default();
+        if text.trim().is_empty() {
+            bail!("Codex review failed: {}", explain_failure(&transcript));
+        }
+        crate::review::parse(&text)
+    }
 }
 
 #[cfg(test)]
@@ -341,11 +408,12 @@ mod tests {
 
     #[test]
     fn prompt_names_files() {
-        let p = agent_prompt("Restore it.", true);
+        let p = agent_prompt("Restore it.", true, (1032, 432));
         assert!(
             p.contains("reference.png") && p.contains("output.png") && p.contains("Restore it.")
         );
-        assert!(!agent_prompt("x", false).contains("reference.png"));
+        assert!(p.contains("1032x432") && p.contains("2.389:1"));
+        assert!(!agent_prompt("x", false, (640, 480)).contains("reference.png"));
     }
 
     #[test]

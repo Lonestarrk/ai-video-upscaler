@@ -9,8 +9,10 @@ pub mod frame;
 pub mod job;
 pub mod paths;
 pub mod process;
+pub mod project;
 pub mod prompt;
 pub mod provider;
+pub mod review;
 pub mod settings;
 
 pub fn version() -> &'static str {

@@ -10,7 +10,9 @@ use std::time::Instant;
 use eframe::egui;
 use image::RgbImage;
 use upscaler_core::ffmpeg::{Tools, VideoInfo};
+use upscaler_core::job::ReviewOutcome;
 use upscaler_core::job::{ExportEvent, ExportSpec, Stage};
+use upscaler_core::project::{self, Project, ProjectSettings};
 use upscaler_core::provider::codex::LoginState;
 use upscaler_core::settings::Settings;
 
@@ -86,6 +88,24 @@ pub struct ExportState {
     pub retries: Vec<String>,
     pub outcome: Option<Result<PathBuf, String>>,
     pub cancelled: bool,
+    /// Quality control in this run: approved, rejected (made again), kept despite problems,
+    /// and unchecked (the review itself failed).
+    pub approved: u64,
+    pub rejected: u64,
+    pub kept: u64,
+    pub unchecked: u64,
+    /// Latest rejections, newest last.
+    pub review_notes: Vec<String>,
+}
+
+/// The open project: its folder, its saved state and what is on screen now.
+pub struct OpenProject {
+    pub dir: PathBuf,
+    pub data: Project,
+    saved: Project,
+    /// Marks and position still to be put back once the video has loaded.
+    restore: bool,
+    last_save: Instant,
 }
 
 #[derive(Default)]
@@ -137,6 +157,10 @@ pub struct UpscalerApp {
     pub preview: Option<PreviewJob>,
     pub preview_error: Option<String>,
     pub export: Option<ExportState>,
+    pub project: Option<OpenProject>,
+    /// The project folder is being moved.
+    pub project_moving: bool,
+    pub frame_browser: ui::frames::FrameBrowser,
     pub settings_ui: SettingsUi,
     pub error: Option<String>,
     /// Settings that change the result: when they change, the shown result is looked up again.
@@ -177,6 +201,9 @@ impl UpscalerApp {
             preview: None,
             preview_error: None,
             export: None,
+            project: None,
+            project_moving: false,
+            frame_browser: Default::default(),
             settings_ui: SettingsUi::default(),
             error: None,
             result_settings_key: key,
@@ -208,7 +235,91 @@ impl UpscalerApp {
         }
     }
 
+    /// Opens a video in its project: the existing one (found next to the video or among the
+    /// recent projects), else a new one in `<video folder>/AI Video Upscaler/<name>`.
     pub fn open_video(&mut self, path: PathBuf) {
+        self.open_video_in(path, None);
+    }
+
+    /// Lets the user pick a project folder and opens it.
+    pub fn open_project_dialog(&mut self) {
+        let mut dialog =
+            rfd::FileDialog::new().set_title(tr("Välj projektmapp", "Choose a project folder"));
+        if let Some(p) = &self.project {
+            if let Some(parent) = p.dir.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        if let Some(dir) = dialog.pick_folder() {
+            self.open_project(dir);
+        }
+    }
+
+    pub fn open_project(&mut self, dir: PathBuf) {
+        match Project::load(&dir) {
+            Ok(p) if p.video.is_file() => self.open_video_in(p.video.clone(), Some(dir)),
+            Ok(p) => {
+                self.error = Some(format!(
+                    "{}\n{}",
+                    tr(
+                        "Projektets video hittades inte:",
+                        "The project's video was not found:"
+                    ),
+                    p.video.display()
+                ))
+            }
+            Err(e) => {
+                self.error = Some(format!(
+                    "{}\n\n{e:#}",
+                    tr(
+                        "Mappen är inte en projektmapp (project.json saknas).",
+                        "The folder is not a project folder (project.json is missing)."
+                    )
+                ))
+            }
+        }
+    }
+
+    /// Moves the open project's folder (previews, frames, project file) somewhere else.
+    pub fn move_project_dialog(&mut self) {
+        let Some(p) = &self.project else { return };
+        if self.exporting() || self.preview.is_some() || self.project_moving {
+            self.error = Some(
+                tr(
+                    "Vänta tills exporten och förhandsvisningen är klara.",
+                    "Wait for the export and the preview to finish.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title(tr(
+                "Var ska projektets bildrutor ligga?",
+                "Where should the project's frames go?",
+            ))
+            .pick_folder()
+        else {
+            return;
+        };
+        let name = p
+            .dir
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        let to = if chosen.file_name() == Some(name.as_os_str()) {
+            chosen
+        } else {
+            chosen.join(&name)
+        };
+        if to == p.dir {
+            return;
+        }
+        self.project_moving = true;
+        worker::move_project(self.bus.clone(), p.dir.clone(), to);
+    }
+
+    fn open_video_in(&mut self, path: PathBuf, dir: Option<PathBuf>) {
         if self.exporting() {
             self.error = Some(
                 tr(
@@ -228,6 +339,39 @@ impl UpscalerApp {
             self.settings_ui.tab = crate::ui::settings_window::TAB_FFMPEG;
             return;
         };
+        self.save_project();
+        let dir = dir
+            .or_else(|| {
+                project::find_for_video(&path, &self.settings.recent_projects, &self.settings)
+            })
+            .unwrap_or_else(|| project::new_dir(&path, &self.settings));
+        let data = match Project::load(&dir) {
+            Ok(p) => {
+                log::info!("project {} opened", dir.display());
+                p.settings.apply(&mut self.settings);
+                Project {
+                    video: path.clone(),
+                    ..p
+                }
+            }
+            Err(_) => {
+                log::info!("new project in {}", dir.display());
+                Project::new(&path, &self.settings)
+            }
+        };
+        if let Err(e) = data.save(&dir) {
+            log::warn!("could not save the project in {}: {e:#}", dir.display());
+        }
+        self.settings.project_dir = Some(dir.clone());
+        self.settings.remember_project(&dir);
+        self.frame_browser.reset();
+        self.project = Some(OpenProject {
+            dir,
+            saved: data.clone(),
+            data,
+            restore: true,
+            last_save: Instant::now(),
+        });
         self.gen += 1;
         self.loading = Some(path.clone());
         self.cancel_preview();
@@ -296,7 +440,7 @@ impl UpscalerApp {
     }
 
     pub fn start_export(&mut self) {
-        let (Some(v), Some(tools)) = (&self.video, &self.tools) else {
+        let (Some(v), true) = (&self.video, self.tools.is_some()) else {
             return;
         };
         let stem = v
@@ -306,11 +450,26 @@ impl UpscalerApp {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "video".into());
         let (w, h) = upscaler_core::job::geometry(&self.settings, &v.info).stored;
-        let mut dialog = rfd::FileDialog::new()
-            .add_filter("MP4", &["mp4"])
-            .set_file_name(format!("{stem}_upscaled_{h}p.mp4"));
-        if let Some(dir) = v.info.path.parent() {
-            dialog = dialog.set_directory(dir);
+        let last = self
+            .project
+            .as_ref()
+            .and_then(|p| p.data.last_output.clone());
+        let mut dialog = rfd::FileDialog::new().add_filter("MP4", &["mp4"]);
+        match last
+            .as_ref()
+            .and_then(|l| Some((l.parent()?, l.file_name()?)))
+        {
+            Some((dir, name)) => {
+                dialog = dialog
+                    .set_directory(dir)
+                    .set_file_name(name.to_string_lossy());
+            }
+            None => {
+                dialog = dialog.set_file_name(format!("{stem}_upscaled_{h}p.mp4"));
+                if let Some(dir) = v.info.path.parent() {
+                    dialog = dialog.set_directory(dir);
+                }
+            }
         }
         let Some(mut output) = dialog.save_file() else {
             return;
@@ -329,6 +488,11 @@ impl UpscalerApp {
             return;
         }
         let _ = w;
+        if let Some(p) = &mut self.project {
+            p.data.last_output = Some(output.clone());
+        }
+        let Some(v) = &self.video else { return };
+        let Some(tools) = &self.tools else { return };
         let (start, end) = v.range();
         let spec = ExportSpec {
             info: v.info.clone(),
@@ -364,6 +528,11 @@ impl UpscalerApp {
             retries: Vec::new(),
             outcome: None,
             cancelled: false,
+            approved: 0,
+            rejected: 0,
+            kept: 0,
+            unchecked: 0,
+            review_notes: Vec::new(),
         });
     }
 
@@ -380,6 +549,9 @@ impl UpscalerApp {
     }
 
     fn handle(&mut self, ctx: &egui::Context, event: Event) {
+        if self.frame_browser.handle(ctx, &event) {
+            return;
+        }
         match event {
             Event::Probed { gen, result } if gen == self.gen => {
                 self.loading = None;
@@ -425,6 +597,19 @@ impl UpscalerApp {
                             aspect_check,
                             aspect_hint_done: false,
                         });
+                        if let (Some(p), Some(v)) = (&mut self.project, &mut self.video) {
+                            if p.restore {
+                                p.restore = false;
+                                let last = v.info.frame_count.saturating_sub(1);
+                                v.current = p.data.current.min(last);
+                                v.in_point = p.data.in_point.filter(|&i| i <= last);
+                                v.out_point = p.data.out_point.filter(|&o| o <= last);
+                                if p.data.frame_aspect.is_some() {
+                                    v.frame_aspect = p.data.frame_aspect;
+                                    v.aspect_hint_done = true;
+                                }
+                            }
+                        }
                         self.view = ViewTransform::default();
                         self.preview_error = None;
                         self.request_frame();
@@ -570,6 +755,30 @@ impl UpscalerApp {
                 });
             }
             Event::WorkDirSize(b) => self.settings_ui.work_dir_size = Some(b),
+            Event::ProjectMoved(r) => {
+                self.project_moving = false;
+                match r {
+                    Ok(to) => {
+                        log::info!("project moved to {}", to.display());
+                        if let Some(p) = &mut self.project {
+                            let old = std::mem::replace(&mut p.dir, to.clone());
+                            self.settings.recent_projects.retain(|d| d != &old);
+                        }
+                        self.settings.project_dir = Some(to.clone());
+                        self.settings.remember_project(&to);
+                        self.settings_ui.work_dir_size = None;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!(
+                            "{}\n\n{e}",
+                            tr(
+                                "Projektmappen kunde inte flyttas.",
+                                "The project folder could not be moved."
+                            )
+                        ))
+                    }
+                }
+            }
             _ => {} // stale events from an earlier video
         }
     }
@@ -601,6 +810,36 @@ impl UpscalerApp {
                 x.retries
                     .push(format!("{} {n}: {error}", tr("Bildruta", "Frame")));
             }
+            ExportEvent::Reviewed {
+                n,
+                outcome,
+                problems,
+                attempt,
+            } => {
+                match outcome {
+                    ReviewOutcome::Approved => x.approved += 1,
+                    ReviewOutcome::Rejected => x.rejected += 1,
+                    ReviewOutcome::Kept => x.kept += 1,
+                    ReviewOutcome::Unchecked => x.unchecked += 1,
+                }
+                if outcome != ReviewOutcome::Approved {
+                    let what = match outcome {
+                        ReviewOutcome::Rejected => tr("underkänd, görs om", "rejected, made again"),
+                        ReviewOutcome::Kept => {
+                            tr("underkänd igen, behålls", "rejected again, kept")
+                        }
+                        _ => tr("kunde inte granskas", "could not be reviewed"),
+                    };
+                    x.review_notes.push(format!(
+                        "{} {n} ({} {attempt}), {what}: {problems}",
+                        tr("Bildruta", "Frame"),
+                        tr("försök", "attempt"),
+                    ));
+                    if x.review_notes.len() > 50 {
+                        x.review_notes.remove(0);
+                    }
+                }
+            }
             ExportEvent::Finished(p) => {
                 log::info!("export finished: {}", p.display());
                 x.outcome = Some(Ok(p));
@@ -610,9 +849,46 @@ impl UpscalerApp {
         }
     }
 
+    /// The open project as it is on screen now.
+    fn refresh_project(&mut self) {
+        let (Some(p), Some(v)) = (&mut self.project, &self.video) else {
+            return;
+        };
+        if p.restore {
+            return; // the saved marks are not on screen yet
+        }
+        p.data.settings = ProjectSettings::from(&self.settings);
+        p.data.current = v.current;
+        p.data.in_point = v.in_point;
+        p.data.out_point = v.out_point;
+        p.data.frame_aspect = v.frame_aspect;
+    }
+
+    /// Writes the open project's file now if it changed.
+    pub fn save_project(&mut self) {
+        self.refresh_project();
+        if let Some(p) = &mut self.project {
+            if p.data != p.saved {
+                match p.data.save(&p.dir) {
+                    Ok(()) => p.saved = p.data.clone(),
+                    Err(e) => log::warn!("could not save the project: {e:#}"),
+                }
+            }
+            p.last_save = Instant::now();
+        }
+    }
+
     /// Saves changed settings (at most every half second) and refreshes the shown result
     /// when a setting that changes it was edited.
     fn persist(&mut self) {
+        self.refresh_project();
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.data != p.saved && p.last_save.elapsed().as_secs() >= 2)
+        {
+            self.save_project();
+        }
         if self.settings != self.saved_settings && self.last_save.elapsed().as_millis() > 500 {
             if let Err(e) = self.settings.save() {
                 log::warn!("could not save settings: {e}");
@@ -801,6 +1077,7 @@ impl eframe::App for UpscalerApp {
         }
         egui::CentralPanel::default().show(ui, |ui| ui::viewer::show(ui, self));
         ui::settings_window::show(ui.ctx(), self);
+        ui::frames::show(ui.ctx(), self);
         ui::dialogs::show(ui.ctx(), self);
         ui::dialogs::drop_overlay(ui.ctx());
     }
@@ -810,6 +1087,7 @@ impl eframe::App for UpscalerApp {
             x.cancel.store(true, Ordering::Relaxed);
         }
         self.cancel_preview();
+        self.save_project();
         let _ = self.settings.save();
     }
 }

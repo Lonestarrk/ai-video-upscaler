@@ -574,7 +574,7 @@ pub fn extract_range(
     divisor: u32,
     dir: &Path,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64),
+    progress: impl FnMut(u64),
 ) -> Result<u64> {
     std::fs::create_dir_all(dir)?;
     let out_frames = range.count.div_ceil(divisor as u64);
@@ -602,7 +602,7 @@ pub fn extract_range(
             "-nostats",
         ])
         .arg(dir.join("%06d.png"));
-    run_with_progress(cmd, cancel, |frame| progress(frame))?;
+    run_with_progress(cmd, cancel, progress)?;
     let written = count_frames(dir);
     if written == 0 {
         bail!("ffmpeg wrote no frames");

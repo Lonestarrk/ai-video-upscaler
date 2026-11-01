@@ -9,6 +9,7 @@
 //! the previous restored frame as a reference, except after a scene cut. Frames that are
 //! (almost) identical to the previous one reuse its result.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -141,6 +142,7 @@ pub fn run_preview(
         settings,
         source,
         None,
+        None,
         target,
         &tmp,
         cancel,
@@ -226,6 +228,13 @@ pub enum ExportEvent {
         n: u64,
         error: String,
     },
+    /// Quality control judged frame `n` (its `attempt`th result).
+    Reviewed {
+        n: u64,
+        outcome: ReviewOutcome,
+        problems: String,
+        attempt: u32,
+    },
     Finished(PathBuf),
     Failed(String),
     Cancelled,
@@ -262,8 +271,12 @@ impl ExportSpec {
 
 /// Frames already finished in an earlier run of the same job.
 pub fn frames_already_done(spec: &ExportSpec) -> u64 {
-    ffmpeg::count_frames(&spec.job_dir().join("out"))
+    ffmpeg::count_frames(&spec.job_dir().join(OUTPUT_DIR))
 }
+
+/// Folders of an export job: the frames taken from the video and the finished frames.
+pub const INPUT_DIR: &str = "src";
+pub const OUTPUT_DIR: &str = "out";
 
 /// Runs the whole export, reporting through `emit`. Never panics on errors: they end in
 /// `Failed` (or `Cancelled`).
@@ -297,8 +310,8 @@ fn export(
     emit: &(dyn Fn(ExportEvent) + Sync),
 ) -> Result<()> {
     let dir = spec.job_dir();
-    let src_dir = dir.join("src");
-    let out_dir = dir.join("out");
+    let src_dir = dir.join(INPUT_DIR);
+    let out_dir = dir.join(OUTPUT_DIR);
     std::fs::create_dir_all(&out_dir)?;
     std::fs::write(
         dir.join("job.txt"),
@@ -377,144 +390,20 @@ fn export(
         }
     }
 
-    // 3. Upscale
+    // 3. Upscale (and review)
     let geo = geometry(s, &spec.info);
-    let target = geo.work;
     let provider = provider::create(s);
-    let done = AtomicU64::new(0);
-    let report = |n: u64, path: PathBuf, seconds: Option<f32>| {
-        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-        emit(ExportEvent::FrameDone { n, path, seconds });
-        emit(ExportEvent::Progress {
-            stage: Stage::Upscaling,
-            done: d,
-            total,
-        });
-    };
-    // Frames from an earlier run count as done right away.
-    for n in 1..=total {
-        let p = ffmpeg::frame_file(&out_dir, n);
-        if p.is_file() {
-            done.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    emit(ExportEvent::Progress {
-        stage: Stage::Upscaling,
-        done: done.load(Ordering::Relaxed),
+    let plan = Plan {
         total,
-    });
-
-    let work = |n: u64, reference: Option<&RgbImage>| -> Result<RgbImage> {
-        let src = image::open(ffmpeg::frame_file(&src_dir, n))?.to_rgb8();
-        let mut attempt = 0;
-        loop {
-            check(cancel)?;
-            let tmp = temp_dir(s);
-            let started = Instant::now();
-            let r = provider::upscale_frame(
-                provider.as_ref(),
-                s,
-                &src,
-                reference,
-                target,
-                &tmp,
-                cancel,
-            );
-            match r {
-                Ok(img) => {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    let path = ffmpeg::frame_file(&out_dir, n);
-                    save_atomic(&img, &path)?;
-                    report(n, path, Some(started.elapsed().as_secs_f32()));
-                    return Ok(img);
-                }
-                Err(e) if process::is_cancelled(&e) => return Err(e),
-                Err(e) if attempt < 2 => {
-                    attempt += 1;
-                    log::warn!("frame {n} failed (attempt {attempt}): {e:#}");
-                    emit(ExportEvent::Retry {
-                        n,
-                        error: format!("{e:#}"),
-                    });
-                    std::thread::sleep(std::time::Duration::from_secs(5 * attempt));
-                }
-                Err(e) => return Err(e.context(format!("frame {n} (kept: {})", tmp.display()))),
-            }
-        }
+        dup_of: &dup_of,
+        cut: &cut,
+        src_dir: &src_dir,
+        out_dir: &out_dir,
+        review_file: &dir.join(REVIEW_FILE),
+        rejects_dir: &dir.join(REJECTS_DIR),
+        target: geo.work,
     };
-    let copy_dup = |n: u64, of: u64| -> Result<()> {
-        let path = ffmpeg::frame_file(&out_dir, n);
-        std::fs::copy(ffmpeg::frame_file(&out_dir, of), &path)?;
-        report(n, path, None);
-        Ok(())
-    };
-
-    if s.sequential() {
-        let mut prev_out: Option<RgbImage> = None;
-        for n in 1..=total {
-            check(cancel)?;
-            let path = ffmpeg::frame_file(&out_dir, n);
-            if path.is_file() {
-                prev_out = None; // loaded lazily below if the next frame needs it
-                continue;
-            }
-            if let Some(of) = dup_of[n as usize] {
-                copy_dup(n, of)?;
-                prev_out = None;
-                continue;
-            }
-            let reference = if n > 1 && !cut[n as usize] {
-                if prev_out.is_none() {
-                    prev_out = image::open(ffmpeg::frame_file(&out_dir, n - 1))
-                        .ok()
-                        .map(|i| i.to_rgb8());
-                }
-                prev_out.as_ref()
-            } else {
-                None
-            };
-            let img = work(n, reference)?;
-            prev_out = Some(img);
-        }
-    } else {
-        let todo: Vec<u64> = (1..=total)
-            .filter(|n| {
-                dup_of[*n as usize].is_none() && !ffmpeg::frame_file(&out_dir, *n).is_file()
-            })
-            .collect();
-        let next = AtomicU64::new(0);
-        let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let workers = s.parallel_requests.clamp(1, 16) as usize;
-        std::thread::scope(|scope| {
-            for _ in 0..workers.min(todo.len().max(1)) {
-                scope.spawn(|| loop {
-                    if first_error.lock().unwrap().is_some() || cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed) as usize;
-                    let Some(&n) = todo.get(i) else { return };
-                    if let Err(e) = work(n, None) {
-                        let mut slot = first_error.lock().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
-                        return;
-                    }
-                });
-            }
-        });
-        if let Some(e) = first_error.into_inner().unwrap() {
-            return Err(e);
-        }
-        check(cancel)?;
-        for n in 1..=total {
-            if let Some(of) = dup_of[n as usize] {
-                if !ffmpeg::frame_file(&out_dir, n).is_file() {
-                    copy_dup(n, of)?;
-                }
-            }
-        }
-    }
+    upscale_all(&plan, s, provider.as_ref(), cancel, emit)?;
     check(cancel)?;
 
     // 4. Encode
@@ -553,6 +442,691 @@ fn export(
     Ok(())
 }
 
+const REVIEW_FILE: &str = "review.json";
+const REJECTS_DIR: &str = "rejects";
+
+/// An export job found in a work folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobSummary {
+    pub dir: PathBuf,
+    /// "frames: a..b" from the job's description (source frame numbers).
+    pub range: (u64, u64),
+    /// Frames the job works on (after "every 2nd/3rd").
+    pub total: u64,
+    pub modified: std::time::SystemTime,
+}
+
+/// The export jobs in `work_dir`, newest first.
+pub fn list_jobs(work_dir: &Path) -> Vec<JobSummary> {
+    let Ok(rd) = std::fs::read_dir(work_dir.join("jobs")) else {
+        return Vec::new();
+    };
+    let mut jobs: Vec<JobSummary> = rd
+        .flatten()
+        .filter_map(|e| {
+            let dir = e.path();
+            let total = std::fs::read_to_string(dir.join("extracted"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            let desc = std::fs::read_to_string(dir.join("job.txt")).unwrap_or_default();
+            let range = desc
+                .lines()
+                .find_map(|l| l.strip_prefix("frames: "))
+                .and_then(|r| r.split_once(".."))
+                .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+                .unwrap_or((0, total));
+            let modified = std::fs::metadata(dir.join(REVIEW_FILE))
+                .or_else(|_| std::fs::metadata(dir.join("extracted")))
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some(JobSummary {
+                dir,
+                range,
+                total,
+                modified,
+            })
+        })
+        .collect();
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.modified));
+    jobs
+}
+
+/// One frame of a job as the frame browser shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameStatus {
+    pub n: u64,
+    /// The finished frame exists.
+    pub done: bool,
+    pub record: Option<Record>,
+    /// Rejected by hand and waiting for the export to make it again.
+    pub pending_reject: bool,
+}
+
+/// Every frame of the job in `dir` with what is known about it.
+pub fn job_frames(dir: &Path, total: u64) -> Vec<FrameStatus> {
+    let records: std::collections::BTreeMap<u64, Record> =
+        std::fs::read_to_string(dir.join(REVIEW_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+    let names = |sub: &str| -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir.join(sub))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let out = names(OUTPUT_DIR);
+    let rejects = names(REJECTS_DIR);
+    (1..=total)
+        .map(|n| FrameStatus {
+            n,
+            done: out.contains(&format!("{n:06}.png")),
+            record: records.get(&n).cloned(),
+            pending_reject: rejects.contains(&format!("{n}.txt")),
+        })
+        .collect()
+}
+
+/// The finished and the source frame `n` of the job in `dir`.
+pub fn job_frame_files(dir: &Path, n: u64) -> (PathBuf, PathBuf) {
+    (
+        ffmpeg::frame_file(&dir.join(INPUT_DIR), n),
+        ffmpeg::frame_file(&dir.join(OUTPUT_DIR), n),
+    )
+}
+
+/// Rejects frame `n` by hand: the export (running now, or the next time it is started)
+/// makes it again with `note` as the reason, and quality control looks at it again.
+pub fn reject_frame(dir: &Path, n: u64, note: &str) -> Result<()> {
+    let inbox = dir.join(REJECTS_DIR);
+    std::fs::create_dir_all(&inbox)?;
+    let tmp = inbox.join(format!("{n}.tmp"));
+    std::fs::write(&tmp, note.trim())?;
+    std::fs::rename(&tmp, inbox.join(format!("{n}.txt")))?;
+    Ok(())
+}
+
+/// Takes back a hand rejection that the export has not acted on yet.
+pub fn undo_reject(dir: &Path, n: u64) -> bool {
+    std::fs::remove_file(dir.join(REJECTS_DIR).join(format!("{n}.txt"))).is_ok()
+}
+
+/// The frames of one export and where they live.
+struct Plan<'a> {
+    total: u64,
+    /// Frames that reuse an earlier frame's result (index 1..=total).
+    dup_of: &'a [Option<u64>],
+    /// Frames that start a new shot.
+    cut: &'a [bool],
+    src_dir: &'a Path,
+    out_dir: &'a Path,
+    review_file: &'a Path,
+    /// Frames rejected by hand, one `<n>.txt` (with the reason) per frame.
+    rejects_dir: &'a Path,
+    target: (u32, u32),
+}
+
+impl Plan<'_> {
+    fn base(&self, n: u64) -> u64 {
+        self.dup_of[n as usize].unwrap_or(n)
+    }
+
+    /// The frame before `n` in the same shot (whose result is `n`'s reference).
+    fn previous_of(&self, n: u64) -> Option<u64> {
+        (n > 1 && !self.cut[n as usize]).then(|| self.base(n - 1))
+    }
+
+    fn out(&self, n: u64) -> PathBuf {
+        ffmpeg::frame_file(self.out_dir, n)
+    }
+
+    fn src(&self, n: u64) -> PathBuf {
+        ffmpeg::frame_file(self.src_dir, n)
+    }
+}
+
+/// Quality control's word on one frame, saved so a resumed export does not ask again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewOutcome {
+    Approved,
+    /// Rejected; the frame is made again.
+    Rejected,
+    /// Rejected on the last allowed attempt and kept anyway.
+    Kept,
+    /// The review itself failed; the frame is kept unchecked.
+    Unchecked,
+}
+
+impl ReviewOutcome {
+    fn is_final(self) -> bool {
+        self != ReviewOutcome::Rejected
+    }
+}
+
+/// What is known about one frame of an export (saved in `review.json`).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Record {
+    /// Results made since the last manual rejection.
+    pub attempts: u32,
+    pub outcome: Option<ReviewOutcome>,
+    /// Why it was last rejected or kept.
+    pub problems: String,
+    /// Times it was rejected, by quality control or by hand.
+    pub rejections: u32,
+    /// The last rejection was made by hand.
+    pub manual: bool,
+}
+
+#[derive(Default)]
+struct Slot {
+    generating: bool,
+    reviewing: bool,
+    /// Has a result that needs no (further) review.
+    settled: bool,
+    /// Bumped whenever a new result is written, so a late verdict on an old one is ignored.
+    version: u64,
+}
+
+struct Board {
+    slots: Vec<Slot>,
+    records: std::collections::BTreeMap<u64, Record>,
+    /// Frames without a result, not being made.
+    missing: BTreeSet<u64>,
+    /// Frames with a result waiting for review.
+    unreviewed: BTreeSet<u64>,
+    /// Frames (counting their duplicates) that are finished, for the progress bar.
+    settled_weight: u64,
+    error: Option<anyhow::Error>,
+    /// When the folder of hand-rejected frames was last read.
+    inbox_checked: Option<Instant>,
+}
+
+impl Board {
+    fn record(&mut self, n: u64) -> &mut Record {
+        self.records.entry(n).or_default()
+    }
+
+    fn save(&self, path: &Path) {
+        if let Ok(text) = serde_json::to_string(&self.records) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+}
+
+/// Makes every missing frame and, when quality control is on, has each one reviewed once in
+/// a background thread. Rejected frames are deleted and made again (with the reasons in the
+/// prompt); the frame after one that was made again is reviewed again, since it was judged
+/// (and, in order, made) against the old one.
+fn upscale_all(
+    plan: &Plan,
+    s: &Settings,
+    provider: &dyn provider::Provider,
+    cancel: &AtomicBool,
+    emit: &(dyn Fn(ExportEvent) + Sync),
+) -> Result<()> {
+    let total = plan.total;
+    let review = s.review_frames && provider.can_review();
+    let max_attempts = s.review_max_attempts.max(1);
+    let mut weight = vec![0u64; total as usize + 1];
+    for n in 1..=total {
+        weight[plan.base(n) as usize] += 1;
+    }
+    let records: std::collections::BTreeMap<u64, Record> =
+        std::fs::read_to_string(plan.review_file)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+    let mut board = Board {
+        slots: (0..=total).map(|_| Slot::default()).collect(),
+        records,
+        missing: BTreeSet::new(),
+        unreviewed: BTreeSet::new(),
+        settled_weight: 0,
+        error: None,
+        inbox_checked: None,
+    };
+    for n in 1..=total {
+        if plan.dup_of[n as usize].is_some() {
+            continue;
+        }
+        if plan.out(n).is_file() {
+            let settled = !review
+                || board
+                    .records
+                    .get(&n)
+                    .and_then(|r| r.outcome)
+                    .is_some_and(ReviewOutcome::is_final);
+            if settled {
+                board.slots[n as usize].settled = true;
+                board.settled_weight += weight[n as usize];
+            } else {
+                board.unreviewed.insert(n);
+            }
+        } else {
+            board.missing.insert(n);
+        }
+    }
+    let board = Mutex::new(board);
+    let progress = |b: &Board| {
+        emit(ExportEvent::Progress {
+            stage: Stage::Upscaling,
+            done: b.settled_weight,
+            total,
+        })
+    };
+    progress(&board.lock().unwrap());
+
+    let finished = |b: &Board| {
+        b.missing.is_empty()
+            && b.unreviewed.is_empty()
+            && b.slots.iter().all(|x| !x.generating && !x.reviewing)
+    };
+    let stop = |b: &Board| b.error.is_some() || cancel.load(Ordering::Relaxed);
+    let idle = || std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Marks `n` as having a new result; the next frame of the shot must be judged again.
+    let new_result = |b: &mut Board, n: u64| {
+        let slot = &mut b.slots[n as usize];
+        slot.version += 1;
+        if slot.settled {
+            slot.settled = false;
+            b.settled_weight -= weight[n as usize];
+        }
+        if review {
+            b.unreviewed.insert(n);
+        } else {
+            b.slots[n as usize].settled = true;
+            b.settled_weight += weight[n as usize];
+        }
+        if let Some(m) = ((n + 1)..=total)
+            .take_while(|m| plan.base(*m) == n || plan.previous_of(*m) == Some(n))
+            .find(|m| plan.dup_of[*m as usize].is_none())
+        {
+            let next = &mut b.slots[m as usize];
+            if review && next.settled && plan.out(m).is_file() {
+                next.settled = false;
+                b.settled_weight -= weight[m as usize];
+                b.unreviewed.insert(m);
+            }
+        }
+    };
+
+    // Frames rejected by hand (in the frame browser) are dropped and made again.
+    let take_rejects = |b: &mut Board| {
+        if b.inbox_checked
+            .is_some_and(|t| t.elapsed().as_millis() < 1000)
+        {
+            return;
+        }
+        b.inbox_checked = Some(Instant::now());
+        let Ok(rd) = std::fs::read_dir(plan.rejects_dir) else {
+            return;
+        };
+        let mut changed = false;
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("txt") {
+                continue;
+            }
+            let Some(n) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| (1..=total).contains(n))
+            else {
+                continue;
+            };
+            let n = plan.base(n);
+            if b.slots[n as usize].generating {
+                continue; // picked up once the frame in progress is saved
+            }
+            let note = std::fs::read_to_string(&path).unwrap_or_default();
+            let slot = &mut b.slots[n as usize];
+            slot.version += 1; // a review in progress no longer counts
+            if slot.settled {
+                slot.settled = false;
+                b.settled_weight -= weight[n as usize];
+            }
+            b.unreviewed.remove(&n);
+            let _ = std::fs::remove_file(plan.out(n));
+            b.missing.insert(n);
+            let problems = if note.trim().is_empty() {
+                "rejected by the user".to_string()
+            } else {
+                format!("rejected by the user: {}", note.trim())
+            };
+            {
+                let r = b.record(n);
+                r.attempts = 0;
+                r.outcome = Some(ReviewOutcome::Rejected);
+                r.problems = problems.clone();
+                r.rejections += 1;
+                r.manual = true;
+            }
+            let _ = std::fs::remove_file(&path);
+            log::info!("frame {n} {problems}");
+            emit(ExportEvent::Reviewed {
+                n,
+                outcome: ReviewOutcome::Rejected,
+                problems,
+                attempt: 0,
+            });
+            changed = true;
+        }
+        if changed {
+            b.save(plan.review_file);
+            progress(b);
+        }
+    };
+
+    take_rejects(&mut board.lock().unwrap());
+    let workers = if s.sequential() {
+        1
+    } else {
+        s.parallel_requests.clamp(1, 16) as usize
+    };
+    // The reviewer stops only after the generators: they are the ones that pick up frames
+    // rejected by hand, which may turn a finished job into an unfinished one.
+    let generators_left = AtomicU64::new(workers as u64);
+
+    let generator = || loop {
+        let claimed = {
+            let mut b = board.lock().unwrap();
+            take_rejects(&mut b);
+            if stop(&b) || finished(&b) {
+                generators_left.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let pick = b.missing.iter().copied().find(|&n| {
+                !s.sequential()
+                    || plan
+                        .previous_of(n)
+                        .is_none_or(|r| !b.slots[r as usize].generating && plan.out(r).is_file())
+            });
+            match pick {
+                Some(n) => {
+                    b.missing.remove(&n);
+                    b.slots[n as usize].generating = true;
+                    let reference = if s.sequential() {
+                        plan.previous_of(n)
+                            .and_then(|r| image::open(plan.out(r)).ok())
+                            .map(|i| i.to_rgb8())
+                    } else {
+                        None
+                    };
+                    let rec = b.record(n).clone();
+                    let feedback =
+                        (rec.outcome == Some(ReviewOutcome::Rejected)).then_some(rec.problems);
+                    Some((n, reference, feedback))
+                }
+                None => None,
+            }
+        };
+        let Some((n, reference, feedback)) = claimed else {
+            idle();
+            continue;
+        };
+        let started = Instant::now();
+        let result = make_frame(
+            plan,
+            s,
+            provider,
+            n,
+            reference.as_ref(),
+            feedback.as_deref(),
+            cancel,
+            emit,
+        );
+        let mut b = board.lock().unwrap();
+        b.slots[n as usize].generating = false;
+        match result {
+            Ok(()) => {
+                b.record(n).attempts += 1;
+                new_result(&mut b, n);
+                b.save(plan.review_file);
+                emit(ExportEvent::FrameDone {
+                    n,
+                    path: plan.out(n),
+                    seconds: Some(started.elapsed().as_secs_f32()),
+                });
+                progress(&b);
+            }
+            Err(e) => {
+                b.missing.insert(n);
+                if b.error.is_none() {
+                    b.error = Some(e);
+                }
+                generators_left.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+        }
+    };
+
+    let reviewer = || loop {
+        let claimed = {
+            let mut b = board.lock().unwrap();
+            if stop(&b) || (generators_left.load(Ordering::SeqCst) == 0 && b.unreviewed.is_empty())
+            {
+                return;
+            }
+            let pick = b.unreviewed.iter().copied().find(|&n| {
+                !b.slots[n as usize].generating
+                    && plan
+                        .previous_of(n)
+                        .is_none_or(|r| b.slots[r as usize].settled)
+            });
+            pick.map(|n| {
+                b.unreviewed.remove(&n);
+                let slot = &mut b.slots[n as usize];
+                slot.reviewing = true;
+                (n, slot.version)
+            })
+        };
+        let Some((n, version)) = claimed else {
+            idle();
+            continue;
+        };
+        let verdict = review_frame(plan, s, provider, n, cancel);
+        let mut b = board.lock().unwrap();
+        b.slots[n as usize].reviewing = false;
+        if b.slots[n as usize].version != version {
+            continue; // made again meanwhile; the new result gets its own review
+        }
+        let attempts = b.record(n).attempts.max(1);
+        let (outcome, problems) = match verdict {
+            Ok(v) if v.approved => (ReviewOutcome::Approved, String::new()),
+            Ok(v) if attempts >= max_attempts => (ReviewOutcome::Kept, v.summary()),
+            Ok(v) => (ReviewOutcome::Rejected, v.summary()),
+            Err(e) if process::is_cancelled(&e) => {
+                b.unreviewed.insert(n);
+                return;
+            }
+            Err(e) => (ReviewOutcome::Unchecked, format!("{e:#}")),
+        };
+        log::info!("review of frame {n} (attempt {attempts}): {outcome:?} {problems}");
+        {
+            let r = b.record(n);
+            r.outcome = Some(outcome);
+            r.problems = problems.clone();
+            if outcome != ReviewOutcome::Approved && outcome != ReviewOutcome::Unchecked {
+                r.rejections += 1;
+                r.manual = false;
+            }
+        }
+        b.save(plan.review_file);
+        if outcome.is_final() {
+            b.slots[n as usize].settled = true;
+            b.settled_weight += weight[n as usize];
+        } else {
+            let _ = std::fs::remove_file(plan.out(n));
+            b.missing.insert(n);
+        }
+        emit(ExportEvent::Reviewed {
+            n,
+            outcome,
+            problems,
+            attempt: attempts,
+        });
+        progress(&b);
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(generator);
+        }
+        if review {
+            scope.spawn(reviewer);
+        }
+    });
+    let mut b = board.into_inner().unwrap();
+    if let Some(e) = b.error.take() {
+        return Err(e);
+    }
+    check(cancel)?;
+    // Duplicates get their frame's final result.
+    for n in 1..=total {
+        if let Some(of) = plan.dup_of[n as usize] {
+            std::fs::copy(plan.out(of), plan.out(n))?;
+        }
+    }
+    emit(ExportEvent::Progress {
+        stage: Stage::Upscaling,
+        done: total,
+        total,
+    });
+    Ok(())
+}
+
+/// Makes frame `n` (retrying failed requests twice) and saves it.
+#[allow(clippy::too_many_arguments)]
+fn make_frame(
+    plan: &Plan,
+    s: &Settings,
+    provider: &dyn provider::Provider,
+    n: u64,
+    reference: Option<&RgbImage>,
+    feedback: Option<&str>,
+    cancel: &AtomicBool,
+    emit: &(dyn Fn(ExportEvent) + Sync),
+) -> Result<()> {
+    let src = image::open(plan.src(n))?.to_rgb8();
+    let mut attempt = 0;
+    loop {
+        check(cancel)?;
+        let tmp = temp_dir(s);
+        let r = provider::upscale_frame(
+            provider,
+            s,
+            &src,
+            reference,
+            feedback,
+            plan.target,
+            &tmp,
+            cancel,
+        );
+        match r {
+            Ok(img) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                save_atomic(&img, &plan.out(n))?;
+                return Ok(());
+            }
+            Err(e) if process::is_cancelled(&e) => return Err(e),
+            Err(e) if attempt < 2 => {
+                attempt += 1;
+                log::warn!("frame {n} failed (attempt {attempt}): {e:#}");
+                emit(ExportEvent::Retry {
+                    n,
+                    error: format!("{e:#}"),
+                });
+                std::thread::sleep(std::time::Duration::from_secs(5 * attempt));
+            }
+            Err(e) => return Err(e.context(format!("frame {n} (kept: {})", tmp.display()))),
+        }
+    }
+}
+
+/// Quality control for frame `n`; a failing request is tried twice more.
+fn review_frame(
+    plan: &Plan,
+    s: &Settings,
+    provider: &dyn provider::Provider,
+    n: u64,
+    cancel: &AtomicBool,
+) -> Result<crate::review::Verdict> {
+    let source = image::open(plan.src(n))?.to_rgb8();
+    let result = image::open(plan.out(n))?.to_rgb8();
+    let previous = plan
+        .previous_of(n)
+        .and_then(|r| image::open(plan.out(r)).ok())
+        .map(|i| i.to_rgb8());
+    let extend = s.aspect_change().filter(|a| {
+        (a.ratio() / (source.width() as f64 / source.height() as f64) - 1.0).abs() > 0.01
+    });
+    let result_area = extend.map(|_| frame::source_area(&result, source.dimensions()));
+    let instruction = crate::review::instruction(&crate::review::Context {
+        has_previous: previous.is_some(),
+        extend: extend.map(|a| {
+            (
+                a.name(),
+                a.ratio() > source.width() as f64 / source.height() as f64,
+            )
+        }),
+        user_prompt: &s.prompt,
+    });
+    let ask = || -> Result<crate::review::Verdict> {
+        let mut attempt = 0;
+        loop {
+            check(cancel)?;
+            let tmp = temp_dir(s);
+            let r = provider.review(
+                &provider::ReviewRequest {
+                    source: &source,
+                    result: &result,
+                    result_area: result_area.as_ref(),
+                    previous: previous.as_ref(),
+                    instruction: &instruction,
+                    work_dir: &tmp,
+                },
+                cancel,
+            );
+            match r {
+                Ok(v) => {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Ok(v);
+                }
+                Err(e) if process::is_cancelled(&e) => return Err(e),
+                Err(e) if attempt < 2 => {
+                    attempt += 1;
+                    log::warn!("review of frame {n} failed (attempt {attempt}): {e:#}");
+                    std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
+                }
+                Err(e) => return Err(e.context(format!("kept: {}", tmp.display()))),
+            }
+        }
+    };
+    // Single reviews are noisy; a rejection needs a second, independent opinion. That costs
+    // one more look, which is far cheaper than making the frame again for nothing.
+    let first = ask()?;
+    if first.approved {
+        return Ok(first);
+    }
+    let second = ask()?;
+    if second.approved {
+        log::info!("frame {n}: rejection not confirmed ({})", first.summary());
+    }
+    Ok(crate::review::confirm(first, second))
+}
+
 /// Removes the source frames of finished jobs; with `everything` also previews, results and temp files.
 pub fn clean_work_dir(settings: &Settings, everything: bool) -> Result<()> {
     let w = settings.work_dir();
@@ -583,4 +1157,158 @@ pub fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Provider, Request, ReviewRequest};
+    use crate::review::Verdict;
+    use image::Rgb;
+
+    /// Paints results grey, or white when the prompt carries quality-control feedback, and
+    /// rejects the first (grey) result of the frame whose source is 30.
+    struct Fake {
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Provider for Fake {
+        fn upscale(&self, req: &Request, _: &AtomicBool) -> Result<RgbImage> {
+            let id = req.image.get_pixel(0, 0).0[0];
+            let retry = req
+                .prompt
+                .contains("rejected by quality control because: face changed");
+            self.log.lock().unwrap().push(format!(
+                "make {id} ref={} retry={retry} user={}",
+                req.reference.is_some(),
+                req.prompt.contains("rejected by the user: too dark")
+            ));
+            let v = if retry { 255 } else { 128 };
+            Ok(RgbImage::from_pixel(8, 6, Rgb([v, v, id])))
+        }
+
+        fn canvas_aspects(&self) -> &'static [f64] {
+            &[]
+        }
+
+        fn can_review(&self) -> bool {
+            true
+        }
+
+        fn review(&self, req: &ReviewRequest, _: &AtomicBool) -> Result<Verdict> {
+            let id = req.source.get_pixel(0, 0).0[0];
+            let grey = req.result.get_pixel(0, 0).0[0] == 128;
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("review {id} prev={}", req.previous.is_some()));
+            Ok(if id == 30 && grey {
+                Verdict {
+                    approved: false,
+                    problems: vec!["face changed".into()],
+                }
+            } else {
+                Verdict {
+                    approved: true,
+                    problems: vec![],
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn rejected_frames_are_made_again_and_the_next_one_rechecked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src_dir, out_dir) = (dir.path().join("in"), dir.path().join("out"));
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let total = 6u64;
+        for n in 1..=total {
+            let id = (n.min(5) * 10) as u8; // frame 6 is a copy of frame 5
+            RgbImage::from_pixel(4, 3, Rgb([id, id, id]))
+                .save(ffmpeg::frame_file(&src_dir, n))
+                .unwrap();
+        }
+        let mut dup_of = vec![None; total as usize + 1];
+        dup_of[6] = Some(5);
+        let mut cut = vec![false; total as usize + 1];
+        cut[1] = true;
+        let review_file = dir.path().join(REVIEW_FILE);
+        let rejects_dir = dir.path().join(REJECTS_DIR);
+        let plan = Plan {
+            total,
+            dup_of: &dup_of,
+            cut: &cut,
+            src_dir: &src_dir,
+            out_dir: &out_dir,
+            review_file: &review_file,
+            rejects_dir: &rejects_dir,
+            target: (8, 6),
+        };
+        let mut s = Settings::default();
+        s.project_dir = Some(dir.path().to_path_buf());
+        let fake = Fake {
+            log: Mutex::new(Vec::new()),
+        };
+        let events = Mutex::new(Vec::new());
+        upscale_all(&plan, &s, &fake, &AtomicBool::new(false), &|e| {
+            if let ExportEvent::Reviewed { n, outcome, .. } = e {
+                events.lock().unwrap().push((n, outcome));
+            }
+        })
+        .unwrap();
+
+        let log = fake.log.into_inner().unwrap();
+        let makes: Vec<&String> = log.iter().filter(|l| l.starts_with("make 30")).collect();
+        assert_eq!(makes.len(), 2, "{log:#?}");
+        assert!(makes[1].contains("retry=true") && makes[1].contains("ref=true"));
+        assert!(log.iter().any(|l| l == "review 10 prev=false"));
+        let reviews_of_4 = log.iter().filter(|l| l.starts_with("review 40")).count();
+        assert!(reviews_of_4 >= 1, "{log:#?}");
+        let ev = events.into_inner().unwrap();
+        assert!(ev.contains(&(3, ReviewOutcome::Rejected)));
+        assert!(ev.contains(&(3, ReviewOutcome::Approved)));
+        // Final frame 3 is the white retry; frame 6 copies frame 5.
+        let f3 = image::open(ffmpeg::frame_file(&out_dir, 3))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(f3.get_pixel(0, 0).0[0], 255);
+        let f6 = image::open(ffmpeg::frame_file(&out_dir, 6))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(f6.get_pixel(0, 0).0[2], 50);
+        let saved = std::fs::read_to_string(&review_file).unwrap();
+        assert!(saved.contains("approved"));
+
+        // A second run finds everything approved and asks nobody.
+        let again = Fake {
+            log: Mutex::new(Vec::new()),
+        };
+        upscale_all(&plan, &s, &again, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert!(again.log.into_inner().unwrap().is_empty());
+
+        // Rejected by hand: made again with the note, checked again, and so is the next one.
+        reject_frame(dir.path(), 2, "too dark").unwrap();
+        let st = job_frames(dir.path(), total);
+        assert!(st[1].pending_reject && st[1].done);
+        let manual = Fake {
+            log: Mutex::new(Vec::new()),
+        };
+        upscale_all(&plan, &s, &manual, &AtomicBool::new(false), &|_| {}).unwrap();
+        let log = manual.log.into_inner().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("make 20") && l.ends_with("user=true")),
+            "{log:#?}"
+        );
+        assert!(log.iter().any(|l| l.starts_with("review 20")));
+        assert!(log.iter().any(|l| l.starts_with("review 30")), "{log:#?}");
+        let st = job_frames(dir.path(), total);
+        let r2 = st[1].record.clone().unwrap();
+        assert!(!st[1].pending_reject && st[1].done);
+        assert_eq!(r2.outcome, Some(ReviewOutcome::Approved));
+        assert_eq!(r2.rejections, 1);
+        assert!(r2.manual);
+        assert_eq!(st[2].record.as_ref().unwrap().rejections, 1); // frame 3 from the AI
+    }
 }

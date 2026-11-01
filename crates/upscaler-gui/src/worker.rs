@@ -59,6 +59,27 @@ pub enum Event {
     },
     FfmpegDownloaded(Result<(), String>),
     WorkDirSize(u64),
+    /// The project folder was moved (to the given folder) or the move failed.
+    ProjectMoved(Result<PathBuf, String>),
+    /// Export jobs found in the project, and the frames of the one asked about.
+    FrameStatuses {
+        jobs: Vec<job::JobSummary>,
+        dir: Option<PathBuf>,
+        frames: Vec<job::FrameStatus>,
+    },
+    FrameThumb {
+        dir: PathBuf,
+        n: u64,
+        stamp: u64,
+        image: Option<egui::ColorImage>,
+    },
+    /// The source and finished frame for the large view.
+    FramePair {
+        dir: PathBuf,
+        n: u64,
+        source: Option<egui::ColorImage>,
+        result: Option<egui::ColorImage>,
+    },
 }
 
 #[derive(Clone)]
@@ -272,6 +293,69 @@ pub fn download_ffmpeg(bus: Bus, cancel: Arc<AtomicBool>) {
             }
         });
         bus.send(Event::FfmpegDownloaded(r.map_err(|e| format!("{e:#}"))));
+    });
+}
+
+/// Lists the export jobs in `work_dir` and reads the frames of `dir` (or the newest job).
+pub fn frame_statuses(bus: Bus, work_dir: PathBuf, dir: Option<PathBuf>) {
+    spawn("frame-status", move || {
+        let jobs = job::list_jobs(&work_dir);
+        let chosen = dir
+            .and_then(|d| jobs.iter().find(|j| j.dir == d).cloned())
+            .or_else(|| jobs.first().cloned());
+        let frames = chosen
+            .as_ref()
+            .map(|j| job::job_frames(&j.dir, j.total))
+            .unwrap_or_default();
+        bus.send(Event::FrameStatuses {
+            jobs,
+            dir: chosen.map(|j| j.dir),
+            frames,
+        });
+    });
+}
+
+/// Small copies of finished frames, one event each.
+pub fn frame_thumbs(bus: Bus, dir: PathBuf, frames: Vec<(u64, u64)>) {
+    spawn("frame-thumbs", move || {
+        for (n, stamp) in frames {
+            let (_, out) = job::job_frame_files(&dir, n);
+            let image = image::open(&out)
+                .ok()
+                .map(|i| to_color_image(&i.thumbnail(360, 220).to_rgb8()));
+            bus.send(Event::FrameThumb {
+                dir: dir.clone(),
+                n,
+                stamp,
+                image,
+            });
+        }
+    });
+}
+
+pub fn frame_pair(bus: Bus, dir: PathBuf, n: u64) {
+    spawn("frame-pair", move || {
+        let (src, out) = job::job_frame_files(&dir, n);
+        let load = |p: &std::path::Path| {
+            image::open(p)
+                .ok()
+                .map(|i| to_color_image(&upscaler_core::frame::limit_size(&i.to_rgb8(), 2048)))
+        };
+        bus.send(Event::FramePair {
+            source: load(&src),
+            result: load(&out),
+            dir,
+            n,
+        });
+    });
+}
+
+pub fn move_project(bus: Bus, from: PathBuf, to: PathBuf) {
+    spawn("move-project", move || {
+        let r = upscaler_core::project::move_dir(&from, &to)
+            .map(|_| to)
+            .map_err(|e| format!("{e:#}"));
+        bus.send(Event::ProjectMoved(r));
     });
 }
 
