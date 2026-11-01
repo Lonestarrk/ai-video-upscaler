@@ -2,4 +2,5 @@
 
 pub mod dsp;
 pub mod lfe;
+pub mod sections;
 pub mod source;
