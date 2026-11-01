@@ -199,6 +199,75 @@ pub fn source_area(result: &RgbImage, size: (u32, u32)) -> RgbImage {
     imageops::resize(&area, size.0, size.1, FilterType::Lanczos3)
 }
 
+/// Whether the AI left the extension canvas as flat grey: true when a region of `result`
+/// outside the source picture (`source_size` is the picture's size, which gives its aspect) is
+/// mostly flat mid-grey. Measured on a 4x downscaled copy, in 8x8 blocks whose channel means
+/// are within 128 +/- 12 and whose mean absolute deviation is below 4; a region counts when
+/// at least 80 % of its blocks do. False when there is no extension.
+pub fn canvas_left_grey(result: &RgbImage, source_size: (u32, u32)) -> bool {
+    let (rw, rh) = result.dimensions();
+    if rw < 4 || rh < 4 || source_size.1 == 0 {
+        return false;
+    }
+    let small = imageops::resize(result, rw / 4, rh / 4, FilterType::Triangle);
+    let (sw, sh) = small.dimensions();
+    let (x, y, w, h) = inner_fraction(
+        source_size.0 as f64 / source_size.1 as f64,
+        rw as f64 / rh as f64,
+    );
+    let (x0, y0) = (
+        (x * sw as f64).round() as u32,
+        (y * sh as f64).round() as u32,
+    );
+    let (x1, y1) = (
+        (((x + w) * sw as f64).round() as u32).min(sw),
+        (((y + h) * sh as f64).round() as u32).min(sh),
+    );
+    // Side regions for a wider target, top/bottom for a taller one, kept 2 px (of the small
+    // copy) away from the picture so its edge does not bleed into the measurement.
+    let (x0, y0) = (x0.saturating_sub(2), y0.saturating_sub(2));
+    let (x1, y1) = (
+        if x1 < sw { (x1 + 2).min(sw) } else { sw },
+        if y1 < sh { (y1 + 2).min(sh) } else { sh },
+    );
+    let regions = [
+        (0, 0, x0, sh),
+        (x1, 0, sw, sh),
+        (0, 0, sw, y0),
+        (0, y1, sw, sh),
+    ];
+    regions.iter().any(|&(ax, ay, bx, by)| {
+        let (mut blocks, mut grey) = (0u32, 0u32);
+        for by0 in (ay..by).step_by(8) {
+            for bx0 in (ax..bx).step_by(8) {
+                let (bx1, by1) = ((bx0 + 8).min(bx), (by0 + 8).min(by));
+                let n = ((bx1 - bx0) * (by1 - by0)) as f64;
+                let mut mean = [0f64; 3];
+                for py in by0..by1 {
+                    for px in bx0..bx1 {
+                        for (m, &c) in mean.iter_mut().zip(&small.get_pixel(px, py).0) {
+                            *m += c as f64 / n;
+                        }
+                    }
+                }
+                let mut dev = 0f64;
+                for py in by0..by1 {
+                    for px in bx0..bx1 {
+                        for (m, &c) in mean.iter().zip(&small.get_pixel(px, py).0) {
+                            dev += (c as f64 - m).abs() / (3.0 * n);
+                        }
+                    }
+                }
+                blocks += 1;
+                if dev < 4.0 && mean.iter().all(|m| (m - 128.0).abs() <= 12.0) {
+                    grey += 1;
+                }
+            }
+        }
+        blocks > 0 && grey * 5 >= blocks * 4
+    })
+}
+
 /// A plain resize to `target` followed by a gentle unsharp mask.
 pub fn basic_upscale(img: &RgbImage, target: (u32, u32)) -> RgbImage {
     let up = imageops::resize(img, target.0, target.1, FilterType::Lanczos3);
@@ -300,6 +369,42 @@ mod tests {
         assert_eq!(tall.dimensions(), (400, 711));
         let (x, y, w, h) = inner_fraction(4.0 / 3.0, 16.0 / 9.0);
         assert!((w - 0.75).abs() < 1e-9 && h == 1.0 && (x - 0.125).abs() < 1e-9 && y == 0.0);
+    }
+
+    fn noisy(img: &mut RgbImage, x0: u32, x1: u32) {
+        for y in 0..img.height() {
+            for x in x0..x1 {
+                let v = ((x * 37 + y * 91) % 200 + 20) as u8;
+                img.put_pixel(x, y, Rgb([v, 255 - v, v / 2 + 40]));
+            }
+        }
+    }
+
+    #[test]
+    fn grey_canvas_is_detected_and_painted_one_is_not() {
+        let src = RgbImage::from_pixel(400, 300, Rgb([255, 0, 0]));
+        let mut canvas = extend_canvas(&src, 16.0 / 9.0);
+        assert!(canvas_left_grey(&canvas, (400, 300)));
+        // Texture on both sides: filled.
+        let w = canvas.width();
+        noisy(&mut canvas, 0, 66);
+        noisy(&mut canvas, w - 66, w);
+        assert!(!canvas_left_grey(&canvas, (400, 300)));
+        // Only one side painted: still grey on the other.
+        let mut half = extend_canvas(&src, 16.0 / 9.0);
+        noisy(&mut half, 0, 66);
+        assert!(canvas_left_grey(&half, (400, 300)));
+        // Taller target: grey above and below.
+        assert!(canvas_left_grey(
+            &extend_canvas(&src, 9.0 / 16.0),
+            (400, 300)
+        ));
+    }
+
+    #[test]
+    fn no_extension_means_not_grey() {
+        let grey = RgbImage::from_pixel(400, 300, EXTEND_FILL);
+        assert!(!canvas_left_grey(&grey, (400, 300)));
     }
 
     #[test]

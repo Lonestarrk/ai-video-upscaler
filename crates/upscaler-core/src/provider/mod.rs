@@ -182,7 +182,28 @@ pub fn upscale_frame_with_prompt(
         work_dir,
     };
     let result = provider.upscale(&req, cancel)?;
-    Ok((frame::finish(&result, &prepared, target), text))
+    let finished = frame::finish(&result, &prepared, target);
+    if extend.is_some() && frame::canvas_left_grey(&finished, source.dimensions()) {
+        return Err(GreyCanvasLeft.into());
+    }
+    Ok((finished, text))
+}
+
+/// The AI returned the extended picture with the grey canvas still in it.
+#[derive(Debug)]
+pub struct GreyCanvasLeft;
+
+impl std::fmt::Display for GreyCanvasLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the AI left the grey canvas unfilled")
+    }
+}
+
+impl std::error::Error for GreyCanvasLeft {}
+
+/// Whether `e` is (or was caused by) [`GreyCanvasLeft`].
+pub fn is_grey_canvas_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<GreyCanvasLeft>())
 }
 
 /// Decodes PNG/JPEG/WebP bytes to RGB.

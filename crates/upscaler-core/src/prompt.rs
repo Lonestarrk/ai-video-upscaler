@@ -12,8 +12,24 @@ pub struct PromptParts<'a> {
     pub feedback: Option<&'a str>,
 }
 
+/// Text that appears in the instructions only when the picture is to be extended.
+const EXTEND_MARKER: &str = "EXTENSION TASK";
+
+/// Whether `instructions` (from [`build`]) contain the aspect-ratio extension task.
+pub fn has_extension_task(instructions: &str) -> bool {
+    instructions.contains(EXTEND_MARKER)
+}
+
 pub fn build(p: &PromptParts) -> String {
     let mut s = String::new();
+    if let Some((name, sides)) = p.extend {
+        let where_ = if sides {
+            "left and right of"
+        } else {
+            "above and below"
+        };
+        s.push_str(&format!("{EXTEND_MARKER}: this frame must be changed to the aspect ratio {name}. The plain mid-grey areas {where_} the picture are empty canvas and MUST be completely replaced by newly painted scene; leaving any of that grey in the result is a failure. The restoration rules below (recover what is there, do not invent) apply only inside the original picture area, never to the grey canvas.\n\n"));
+    }
     s.push_str(p.user_prompt.trim());
     s.push_str("\n\nTechnical requirements (this is one frame of a video):\n");
     if let Some((name, sides)) = p.extend {
@@ -98,5 +114,9 @@ mod tests {
         );
         assert!(!plain.contains("study the strips"));
         assert!(!ext.contains("Keep exactly the same framing, camera angle, aspect ratio"));
+        let task = ext.find("MUST be completely replaced").expect("task");
+        assert!(task < ext.find("Restore.").unwrap());
+        assert!(ext.contains("apply only inside the original picture"));
+        assert!(has_extension_task(&ext) && !has_extension_task(&plain));
     }
 }

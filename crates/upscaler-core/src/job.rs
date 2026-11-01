@@ -1168,6 +1168,19 @@ fn upscale_all(
     Ok(())
 }
 
+/// The feedback for an attempt: quality control's problems, plus a note when the previous
+/// attempt left the grey extension canvas unfilled.
+fn retry_feedback(feedback: Option<&str>, grey_left: bool) -> Option<String> {
+    const GREY: &str = "the grey canvas areas were left unfilled; paint the full new scene there";
+    let base = feedback.map(str::trim).filter(|f| !f.is_empty());
+    match (base, grey_left) {
+        (Some(f), true) => Some(format!("{}; {GREY}", f.trim_end_matches('.'))),
+        (Some(f), false) => Some(f.to_string()),
+        (None, true) => Some(GREY.to_string()),
+        (None, false) => None,
+    }
+}
+
 /// Makes frame `n` (retrying failed requests twice) and saves it.
 #[allow(clippy::too_many_arguments)]
 fn make_frame(
@@ -1182,15 +1195,17 @@ fn make_frame(
 ) -> Result<String> {
     let src = image::open(plan.src(n))?.to_rgb8();
     let mut attempt = 0;
+    let mut grey = false;
     loop {
         check(cancel)?;
         let tmp = temp_dir(s);
+        let retry = retry_feedback(feedback, grey);
         let r = provider::upscale_frame_with_prompt(
             provider,
             s,
             &src,
             reference,
-            feedback,
+            retry.as_deref(),
             plan.target,
             &tmp,
             cancel,
@@ -1204,6 +1219,7 @@ fn make_frame(
             Err(e) if process::is_cancelled(&e) => return Err(e),
             Err(e) if attempt < 2 => {
                 attempt += 1;
+                grey = provider::is_grey_canvas_error(&e);
                 log::warn!("frame {n} failed (attempt {attempt}): {e:#}");
                 emit(ExportEvent::Retry {
                     n,
@@ -1323,6 +1339,25 @@ pub fn dir_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grey_canvas_retry_feedback_is_combined() {
+        let grey = anyhow::Error::new(provider::GreyCanvasLeft);
+        assert!(provider::is_grey_canvas_error(&grey));
+        assert!(!provider::is_grey_canvas_error(&anyhow::anyhow!("other")));
+        assert_eq!(
+            retry_feedback(Some("a face"), false).as_deref(),
+            Some("a face")
+        );
+        assert_eq!(retry_feedback(None, false), None);
+        let both = retry_feedback(Some("a face"), true).unwrap();
+        assert!(
+            both.starts_with("a face") && both.contains("grey canvas areas were left unfilled")
+        );
+        assert!(retry_feedback(None, true)
+            .unwrap()
+            .contains("paint the full new scene"));
+    }
     use crate::provider::{Provider, Request, ReviewRequest};
     use crate::review::Verdict;
     use image::Rgb;

@@ -180,12 +180,17 @@ pub fn agent_prompt(image_prompt: &str, has_reference: bool, size: (u32, u32)) -
     } else {
         "the attached image `input.png`"
     };
+    let grey = if crate::prompt::has_extension_task(image_prompt) {
+        "The output must contain no flat grey areas: every grey area of input.png has to be painted over with new scenery. "
+    } else {
+        ""
+    };
     format!(
         "You are the image back end of a video upscaling app. Do exactly this, without asking questions:\n\
          1. Use your built-in image generation tool exactly once to edit {inputs} (both are also in the current directory), following the IMAGE INSTRUCTIONS below. input.png is {w}x{h} pixels (aspect ratio {ratio:.3}:1). Ask for the largest output size the tool supports with exactly that aspect ratio; the result must have the same shape as input.png, without added borders or bars.\n\
          2. Save the generated image in the current working directory as `output.png`. If the tool stored it elsewhere, copy that file here as `output.png`.\n\
          Do not write scripts or use Python, ImageMagick or any other program to change the picture, and do not create other files. \
-         When output.png exists, reply only with DONE.\n\n\
+         {grey}When output.png exists, reply only with DONE.\n\n\
          === IMAGE INSTRUCTIONS ===\n{image_prompt}\n=== END OF IMAGE INSTRUCTIONS ===\n"
     )
 }
@@ -414,6 +419,15 @@ mod tests {
         );
         assert!(p.contains("1032x432") && p.contains("2.389:1"));
         assert!(!agent_prompt("x", false, (640, 480)).contains("reference.png"));
+        assert!(!p.contains("no flat grey"));
+        let task = crate::prompt::build(&crate::prompt::PromptParts {
+            user_prompt: "x",
+            padded: false,
+            has_reference: false,
+            extend: Some(("16:9", true)),
+            feedback: None,
+        });
+        assert!(agent_prompt(&task, false, (640, 480)).contains("no flat grey"));
     }
 
     #[test]
