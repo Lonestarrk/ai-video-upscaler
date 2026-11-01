@@ -1,9 +1,8 @@
 //! Quality enhancement by band-splice: the original below the source's codec cutoff, only
 //! the top band from the AI (Apollo) above it, level-controlled per 1/3 octave.
 //!
-//! The paths cross at `crossover = cutoff * 2^(1/3)` (a third of an octave above the
-//! detected cutoff, where the original has already dropped 15 dB), with a zero-phase LR4
-//! high-pass HP there. The result is
+//! The paths cross at the detected cutoff, with a zero-phase LR4 high-pass HP there. The
+//! result is
 //! `original - (1 - K) * HP(original) + G * HP(model)`, where `G` and `K` are static
 //! per-band curves (one set per call; the audio job calls this per section of about
 //! 300 s) applied with a zero-phase FIR. Every path is zero-phase, so they line up.
@@ -19,12 +18,13 @@
 //!     from there at -12 dB/octave.
 //!
 //!   When the two bounds conflict (the original itself above the cap) the original's level
-//!   wins. Between the cutoff and the crossover the model shows through the high-pass
-//!   skirt only, so `G` is limited to +12 dB there and the band may stay short of the
-//!   model's level (never below the original's). A band the model cannot bring up to the
-//!   original's level keeps the original's band (`G = 0`, `K = 1`).
-//! - A crossover at or above 20 kHz (cutoff above about 15.9 kHz) leaves the original
-//!   unchanged.
+//!   wins. `G` is limited to +12 dB: a band that stays short of the model's level at that
+//!   limit but still reaches the original's keeps it, and a band the model cannot bring up
+//!   to the original's level keeps the original's band (`G = 0`, `K = 1`).
+//! - A cutoff of 20 kHz or more leaves the original unchanged.
+//!
+//! The spectral curves, not the high-pass, decide what is kept below the cutoff, so the
+//! crossover sits right at the cutoff without the model's skirt denting the original.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,22 +269,15 @@ fn convolve_centered(x: &[f32], h: &[f32]) -> Vec<f32> {
     full
 }
 
-/// Where the two paths cross: a third of an octave above the detected cutoff, where the
-/// original has already dropped 15 dB. Capped at 20 kHz.
-pub fn crossover_hz(cutoff: f32) -> f32 {
-    (cutoff * 2f32.powf(1.0 / 3.0)).min(NO_CUTOFF_HZ)
-}
-
-/// Whether splicing at `cutoff` changes anything (the crossover is below 20 kHz).
+/// Whether splicing at `cutoff` changes anything (there is a drop below 20 kHz).
 fn worth_splicing(cutoff: f32) -> bool {
-    cutoff < NO_CUTOFF_HZ && crossover_hz(cutoff) < NO_CUTOFF_HZ
+    cutoff < NO_CUTOFF_HZ
 }
 
 /// One channel of [`splice`]. Takes the model by value so it is freed after the analysis.
 fn splice_channel(o: &[f32], m: Vec<f32>, cutoff: f32) -> Vec<f32> {
     let rate = RATE as f32;
-    let crossover = crossover_hz(cutoff);
-    let hp = |s: &[f32]| zero_phase(s, |v| lr4_highpass(v, crossover, rate));
+    let hp = |s: &[f32]| zero_phase(s, |v| lr4_highpass(v, cutoff, rate));
     let ho = hp(o);
     let hm = hp(&m);
 
@@ -344,8 +337,7 @@ fn splice_channel(o: &[f32], m: Vec<f32>, cutoff: f32) -> Vec<f32> {
         } else if g <= max_gain {
             gain[b] = g as f32;
         } else if pm > 1e-20 && level(max_gain) >= po {
-            // Short of the model's level (the band between the cutoff and the crossover
-            // sees the model only through the skirt), but not duller than the original.
+            // Short of the model's level, but not duller than the original.
             gain[b] = max_gain as f32;
         } else {
             // The model has (almost) nothing here: keep the original's band.
@@ -378,8 +370,7 @@ fn splice_channel(o: &[f32], m: Vec<f32>, cutoff: f32) -> Vec<f32> {
 
 /// The original below `cutoff`, the model's top band above it (see the module docs).
 /// The model is padded or trimmed to the original's length; its channel count must match
-/// (asserted). Returns the original unchanged when the crossover (a third of an octave
-/// above `cutoff`) would reach 20 kHz. 48 kHz.
+/// (asserted). A cutoff of 20 kHz or more returns the original unchanged. 48 kHz.
 pub fn splice(original: &Pcm, model: &Pcm, cutoff: f32) -> Pcm {
     if !worth_splicing(cutoff) || original.frames() == 0 {
         return original.clone();
@@ -438,9 +429,8 @@ pub fn from_mid_side(p: &Pcm) -> Pcm {
 /// with enhancement. With `dolby_surround` and two channels the pair is sent as M/S and
 /// spliced in M/S, so the surround matrix in S gets its own level control.
 ///
-/// A part with nothing to splice (no drop, or a cutoff so high that the crossover would
-/// reach 20 kHz) is returned as it is without an AI call (and nothing is written). Temp
-/// files are removed on success and kept on error.
+/// A part whose spectrum does not drop below 20 kHz is returned as it is without an AI
+/// call (and nothing is written). Temp files are removed on success and kept on error.
 pub fn enhance_pcm(
     ai: &dyn AudioAi,
     pcm: &Pcm,
@@ -770,7 +760,7 @@ mod tests {
     fn enhance_with_fake_ai() {
         let orig = shelved(&noise(N, 10, 0.5), 14_000.0, 0.0);
         let pcm = Pcm::from_channels(RATE, &[orig.clone(), orig.clone()]);
-        // 16 kHz lies between the cutoff and the crossover, 19 kHz above the crossover.
+        // Tones in the first and in the top band above the cutoff.
         let tone = sine(16_000.0, 0.3, N);
         let tone19 = sine(19_000.0, 0.3, N);
         let ai =
@@ -803,17 +793,16 @@ mod tests {
         assert!(tone_band.2 < raw - 6.0, "tone {} vs raw {raw}", tone_band.2);
         let cap = top_band_cap(&orig, cutoff, 16_000.0);
         assert!(
-            tone_band.2 <= cap + 0.5,
+            (tone_band.2 - cap).abs() < 0.5,
             "tone {} vs cap {cap}",
             tone_band.2
         );
-        // Above the crossover the model comes through fully, so the cap is met exactly.
         let band19 = top_bands(&orig, &left, cutoff)
             .into_iter()
             .rfind(|b| b.0 <= 19_000.0)
             .unwrap();
         let cap19 = top_band_cap(&orig, cutoff, 19_000.0);
-        assert!(band19.0 >= crossover_hz(cutoff) * 0.999, "{band19:?}");
+        assert!(band19.0 > tone_band.0, "{band19:?}");
         assert!(
             (band19.2 - cap19).abs() < 0.5,
             "19 kHz tone {} vs cap {cap19}",
@@ -822,6 +811,30 @@ mod tests {
         // Below the cutoff the original is kept.
         let level = |x: &[f32]| rms_db(mid(&band(x, 100.0, 12_000.0, RATE as f32)));
         assert!((level(&left) - level(&orig)).abs() < 0.1);
+    }
+
+    #[test]
+    fn cutoff_at_16k_is_enhanced() {
+        // MP3 / AAC style: a cutoff at 16 kHz still gets its top band from the AI.
+        let orig = shelved(&noise(N, 25, 0.5), 16_000.0, 0.0);
+        let pcm = mono(orig.clone());
+        let cutoff = detect_cutoff(&pcm);
+        assert!((15_500.0..=16_500.0).contains(&cutoff), "cutoff {cutoff}");
+        let tone = sine(18_000.0, 0.01, N);
+        let ai = FakeAi::new(|x: &[f32]| x.iter().zip(&tone).map(|(a, b)| a + b).collect());
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let out = enhance_pcm(&ai, &pcm, false, dir.path(), &cancel, &mut |_| {}).unwrap();
+        assert_eq!(ai.calls.load(Ordering::SeqCst), 1);
+        let band = top_bands(&orig, &out.samples, cutoff)
+            .into_iter()
+            .rfind(|b| b.0 <= 18_000.0)
+            .unwrap();
+        assert!(band.2 > band.1 + 20.0, "{band:?}");
+        assert!(
+            band.2 <= top_band_cap(&orig, cutoff, 18_000.0) + 0.5,
+            "{band:?}"
+        );
     }
 
     /// The cap for the band holding `f`: the fit through the original's levels between
@@ -834,7 +847,7 @@ mod tests {
 
     #[test]
     fn quiet_top_band_passes_unchanged() {
-        // Content the AI adds below the cap and above the original is kept as it is (above\n        // the crossover).
+        // Content the AI adds below the cap and above the original is kept as it is.
         let orig = shelved(&noise(N, 11, 0.5), 14_000.0, 0.0);
         let full = noise(N, 12, 0.5);
         let low = shelved(&full, 14_000.0, 0.0);
@@ -848,20 +861,8 @@ mod tests {
         let out = splice(&mono(orig.clone()), &mono(model.clone()), cutoff);
         let want = top_bands(&orig, &model, cutoff);
         let got = top_bands(&orig, &out.samples, cutoff);
-        let crossover = crossover_hz(cutoff);
+        assert!(want.len() >= 2);
         for (w, g) in want.iter().zip(&got) {
-            if w.0 < crossover * 0.999 {
-                // Between the cutoff and the crossover the model shows through the skirt
-                // only: short of the model, but never below the original.
-                assert!(
-                    g.2 >= w.1 - 0.5,
-                    "band from {}: {} vs original {}",
-                    w.0,
-                    g.2,
-                    w.1
-                );
-                continue;
-            }
             assert!(
                 (w.2 - g.2).abs() < 0.5,
                 "band from {}: {} vs {}",
