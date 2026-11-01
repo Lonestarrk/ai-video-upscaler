@@ -379,6 +379,8 @@ impl UpscalerApp {
     }
 
     fn open_video_in(&mut self, path: PathBuf, dir: Option<PathBuf>) {
+        // A pending overwrite question belongs to the video open now: another video cancels it.
+        self.confirm_overwrite = None;
         if self.exporting() {
             self.error = Some(
                 tr(
@@ -547,7 +549,7 @@ impl UpscalerApp {
         }
         // The dialog only asked about the name typed (say `x.mp4`); the file really written
         // (`x.mkv`) is asked about here before it is replaced.
-        if output != chosen && output.exists() && output != v.info.path {
+        if !same_path(&output, &chosen) && output.exists() && !same_path(&output, &v.info.path) {
             self.confirm_overwrite = Some(output);
             return;
         }
@@ -1095,6 +1097,10 @@ impl UpscalerApp {
     }
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
+        // Files dropped while the overwrite question is open are ignored.
+        if self.confirm_overwrite.is_some() {
+            return;
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1245,5 +1251,36 @@ impl eframe::App for UpscalerApp {
         self.cancel_preview();
         self.save_project();
         let _ = self.settings.save();
+    }
+}
+
+/// Whether two paths name the same file; Windows file names ignore case.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::same_path;
+    use std::path::Path;
+
+    #[test]
+    fn same_path_ignores_case_on_windows() {
+        assert!(same_path(
+            Path::new("C:\\v\\x.mkv"),
+            Path::new("C:\\v\\x.mkv")
+        ));
+        assert_eq!(
+            same_path(Path::new("C:\\v\\X.MKV"), Path::new("C:\\v\\x.mkv")),
+            cfg!(windows)
+        );
+        assert!(!same_path(
+            Path::new("C:\\v\\x.mp4"),
+            Path::new("C:\\v\\x.mkv")
+        ));
     }
 }

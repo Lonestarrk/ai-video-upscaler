@@ -119,7 +119,8 @@ Som standard kopieras ljudet oförändrat. Under *Ljud* i sidopanelen kan du i s
 
 Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Utan *Förbättra
 ljudkvaliteten* finns då inget att göra, så originalljudet kopieras som det är (MP4), precis som
-med *Oförändrat*. Mono kan inte bli 5.1.
+med *Oförändrat*. Ett 5.1-format som MP4 inte kan ta som det är (TrueHD, PCM, DTS) blir i stället
+förlustfri FLAC 5.1 i MKV. Mono kan inte bli 5.1.
 
 **Bas (LFE):** subwooferkanalen byggs av basen under 90 Hz och öppnar bara för bas som stiger över scenens jämna bakgrund (explosioner, nedslag, toppar i musiken). Ett jämnt motorbrus, som skeppets brum på bryggan, ger ingen LFE. Dialog öppnar den aldrig. Huvudkanalerna behåller all sin bas, så inget går förlorat om förstärkaren skickar basen till subwoofern ändå.
 

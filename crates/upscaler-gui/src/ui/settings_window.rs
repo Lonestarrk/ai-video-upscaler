@@ -702,6 +702,10 @@ fn ffmpeg(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     "Empty (previews and jobs)",
                 )),
             )
+            .on_hover_text(tr(
+                "Tar bort förhandsvisningar, exportjobb och ljudjobb, även det AI-separerade ljudet (stammarna). Nästa ljudexport med AI separerar då om ljudet.",
+                "Removes previews, export jobs and audio jobs, including the AI-separated audio (stems). The next audio export with the AI then separates the audio again.",
+            ))
             .clicked()
         {
             let _ = upscaler_core::job::clean_work_dir(&app.settings, true);

@@ -119,7 +119,9 @@ pub fn login(configured: &str, cancel: &AtomicBool) -> Result<String> {
     let exe = locate(configured).ok_or_else(|| anyhow!("Codex CLI was not found"))?;
     let mut cmd = base_command(&exe);
     cmd.arg("login");
-    let out = process::run(cmd, None, cancel, Some(Duration::from_secs(900)))?;
+    // Untied: Codex opens the sign-in page, and a browser started from inside the app's job
+    // would be killed when the app closes.
+    let out = process::run_untied(cmd, None, cancel, Some(Duration::from_secs(900)))?;
     if !out.success {
         bail!("{}", out.tail(6));
     }

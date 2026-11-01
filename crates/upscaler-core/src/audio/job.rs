@@ -457,9 +457,18 @@ pub const ALREADY_51: &str =
 /// Whether these settings leave `source`'s audio as it is: no 5.1 to make (none chosen, or
 /// the source is 5.1 already) and no enhancement. The export then copies the original audio
 /// into an MP4, as with "Unchanged", instead of transcoding it to the same thing.
+///
+/// Only when MP4 can take the 5.1 by stream copy ([`MP4_COPY_CODECS`]): a TrueHD, PCM or
+/// DTS(-HD) 5.1 would be converted to AAC on that path, so it goes through the job instead
+/// and becomes a lossless FLAC 5.1 (plus AC-3 and the original) in an MKV.
 pub fn keeps_original(settings: &Settings, source: &SourceAudio) -> bool {
-    !settings.audio_enhance && (settings.audio_mode != AudioMode::Surround || source.channels == 6)
+    !settings.audio_enhance
+        && (settings.audio_mode != AudioMode::Surround
+            || (source.channels == 6 && MP4_COPY_CODECS.contains(&source.codec.as_str())))
 }
+
+/// Audio codecs the MP4 export path keeps by stream copy (others are converted to AAC).
+pub const MP4_COPY_CODECS: &[&str] = &["aac", "ac3", "eac3", "mp3", "mp2", "opus", "flac", "alac"];
 
 /// Decides what the job makes, or why it cannot run; no work is done here.
 ///
@@ -740,25 +749,45 @@ fn cached_stems(dir: &Path) -> Option<Stems> {
 }
 
 /// Moves `stems` into the cache folder `dir` atomically: into `NNN.part` first, then the
-/// folder is renamed to `NNN`.
-fn store_stems(stems: &Stems, dir: &Path) -> Result<Stems> {
+/// folder is renamed to `NNN`. Never fails: it returns where the three stems are now, which
+/// is the cache when all went well and otherwise wherever each file ended up (a failed
+/// store costs only a separation next time; `NNN` never appears incomplete).
+fn store_stems(stems: &Stems, dir: &Path) -> Stems {
     let part = dir.with_extension("part");
     let _ = std::fs::remove_dir_all(&part);
-    std::fs::create_dir_all(&part)?;
+    if let Err(e) = std::fs::create_dir_all(&part) {
+        log::warn!("could not keep the stems in {}: {e}", part.display());
+        return stems.clone();
+    }
     let target = stems_in(&part);
-    for (from, to) in [
-        (&stems.speech, &target.speech),
-        (&stems.music, &target.music),
-        (&stems.effects, &target.effects),
-    ] {
-        if std::fs::rename(from, to).is_err() {
-            std::fs::copy(from, to)
-                .with_context(|| format!("could not copy {}", from.display()))?;
+    let moved = |from: &PathBuf, to: &PathBuf| -> PathBuf {
+        match std::fs::rename(from, to) {
+            Ok(()) => to.clone(),
+            Err(e) => {
+                log::warn!("could not move {} to the stem cache: {e}", from.display());
+                from.clone()
+            }
         }
+    };
+    let now = Stems {
+        speech: moved(&stems.speech, &target.speech),
+        music: moved(&stems.music, &target.music),
+        effects: moved(&stems.effects, &target.effects),
+    };
+    if now != target {
+        return now;
     }
     let _ = std::fs::remove_dir_all(dir);
-    std::fs::rename(&part, dir).context("could not finish the stem cache folder")?;
-    Ok(stems_in(dir))
+    match std::fs::rename(&part, dir) {
+        Ok(()) => stems_in(dir),
+        Err(e) => {
+            log::warn!(
+                "could not finish the stem cache folder {}: {e}",
+                dir.display()
+            );
+            target
+        }
+    }
 }
 
 /// `p` padded with silence or trimmed to `len` frames.
@@ -1011,17 +1040,10 @@ impl Job<'_> {
         let out = tmp.join("stems");
         let _ = std::fs::remove_dir_all(&out);
         let stems = ai.separate(&wav, &out, cancel, &mut |_| {})?;
-        let Some(cached) = cached else {
-            return Ok(stems);
-        };
-        // A failed store costs only a separation next time.
-        match store_stems(&stems, &cached) {
-            Ok(kept) => Ok(kept),
-            Err(e) => {
-                log::warn!("could not keep the stems in {}: {e:#}", cached.display());
-                Ok(stems)
-            }
-        }
+        Ok(match cached {
+            Some(cached) => store_stems(&stems, &cached),
+            None => stems,
+        })
     }
 
     /// The finished sections, crossfaded, as one stream of `total` frames.
@@ -1477,6 +1499,59 @@ mod tests {
         assert!(strong_job.is_dir() && full_stems.is_dir() && sample_job.is_dir());
     }
 
+    /// A failed cache store never loses the stems: the returned paths are where they are now.
+    #[test]
+    fn failed_stem_store_returns_usable_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let make = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let s = stems_in(dir);
+            for p in [&s.speech, &s.music, &s.effects] {
+                std::fs::write(p, b"stem").unwrap();
+            }
+            s
+        };
+        let all_there = |s: &Stems| {
+            [&s.speech, &s.music, &s.effects]
+                .iter()
+                .all(|p| p.is_file())
+        };
+
+        // Normal case: the folder appears complete, the temp files are gone.
+        let ok = store_stems(
+            &make(&root.path().join("t1")),
+            &root.path().join("c").join("000"),
+        );
+        assert_eq!(ok, stems_in(&root.path().join("c").join("000")));
+        assert!(all_there(&ok));
+
+        // The final rename fails (a file is in the way): the stems inside NNN.part are used.
+        let blocked = root.path().join("c").join("001");
+        std::fs::write(&blocked, b"in the way").unwrap();
+        // On Windows a file can be deleted unless it is held open without sharing.
+        #[cfg(windows)]
+        let _hold = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&blocked)
+                .unwrap()
+        };
+        let got = store_stems(&make(&root.path().join("t2")), &blocked);
+        assert_eq!(got, stems_in(&root.path().join("c").join("001.part")));
+        assert!(all_there(&got));
+        assert!(cached_stems(&blocked).is_none());
+
+        // The cache folder cannot be made at all: the original files are used.
+        let file_parent = root.path().join("not-a-dir");
+        std::fs::write(&file_parent, b"x").unwrap();
+        let src = make(&root.path().join("t3"));
+        let got = store_stems(&src, &file_parent.join("000"));
+        assert_eq!(got, src);
+        assert!(all_there(&got));
+    }
+
     #[test]
     fn light_clean_keeps_tracks_and_stems() {
         let work = tempfile::tempdir().unwrap();
@@ -1833,6 +1908,18 @@ mod tests {
         assert!(keeps_original(&ai_51, &source(6)));
         assert!(keeps_original(&classic, &source(6)));
         assert!(!keeps_original(&enhanced_51, &source(6)));
+        // A 5.1 that MP4 cannot copy (TrueHD, PCM, DTS) is not converted to AAC: the job
+        // writes it as a lossless FLAC 5.1 in MKV, without the AI.
+        for codec in ["truehd", "pcm_s24le", "dts"] {
+            let mut lossless = source(6);
+            lossless.codec = codec.into();
+            assert!(!keeps_original(&ai_51, &lossless), "{codec}");
+            let p = plan_job(&ai_51, Some(&lossless), false).unwrap();
+            assert_eq!(
+                (p.kind, p.needs_ai(), p.channels()),
+                (Kind::Keep51, false, 6)
+            );
+        }
         assert!(!keeps_original(&ai_51, &source(2)));
         assert!(!keeps_original(&enhance, &source(2)));
         let original = settings(AudioMode::Original, SurroundEngine::LocalAi, false);

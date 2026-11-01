@@ -26,11 +26,21 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// worker's own helpers) when the app ends, so nothing keeps running and holding the GPU
 /// after the window is closed or the app crashes. Every long-running child (FFmpeg, the
 /// audio worker, the pack installer, Codex) is started through this.
+///
+/// Not for commands that may start a long-lived app of the user's: a browser launched from
+/// inside the job (`codex login` opens the sign-in page) would join it and be killed with
+/// this app. Those use [`spawn_untied`] / [`run_untied`].
 pub fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
     let child = cmd.spawn()?;
     #[cfg(windows)]
     kill_on_exit::adopt(&child);
     Ok(child)
+}
+
+/// Starts `cmd` outside the app's job object: it, and anything it opens (such as the user's
+/// browser), keeps running when the app ends.
+pub fn spawn_untied(cmd: &mut Command) -> std::io::Result<Child> {
+    cmd.spawn()
 }
 
 #[cfg(windows)]
@@ -42,7 +52,7 @@ mod kill_on_exit {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     /// The app's job object (its handle as an integer, so it can live in a static), or 0
@@ -60,7 +70,10 @@ mod kill_on_exit {
                     return 0;
                 }
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                // Breakaway allowed: a child that starts a process with
+                // CREATE_BREAKAWAY_FROM_JOB (sandboxes do) is not refused.
+                info.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
                 let ok = SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
@@ -111,6 +124,23 @@ mod kill_on_exit {
             let _ = child.wait();
             assert!(ok != 0 && inside != 0, "the child is not in the app's job");
         }
+
+        /// What may open the user's browser stays out of the job, so it survives the app.
+        #[test]
+        fn untied_children_stay_out_of_the_job() {
+            let mut cmd = crate::process::command("cmd");
+            cmd.args(["/C", "ping", "-n", "2", "127.0.0.1"])
+                .stdout(std::process::Stdio::null());
+            let mut child = crate::process::spawn_untied(&mut cmd).unwrap();
+            let mut inside = 1;
+            // SAFETY: valid handles; `inside` is a valid out pointer.
+            let ok = unsafe { IsProcessInJob(child.as_raw_handle() as _, job() as _, &mut inside) };
+            let _ = child.wait();
+            assert!(
+                ok != 0 && inside == 0,
+                "the untied child is in the app's job"
+            );
+        }
     }
 }
 
@@ -139,11 +169,33 @@ impl Finished {
 }
 
 /// Runs `cmd` to completion, feeding it `stdin`; kills it when `cancel` is set or `timeout` passes.
+/// The child is tied to the app ([`spawn`]).
 pub fn run(
+    cmd: Command,
+    stdin: Option<&[u8]>,
+    cancel: &AtomicBool,
+    timeout: Option<Duration>,
+) -> Result<Finished> {
+    run_started_by(cmd, stdin, cancel, timeout, spawn)
+}
+
+/// [`run`] for a command that may open a long-lived app of the user's (`codex login` opens
+/// the browser): started with [`spawn_untied`], so closing this app never kills it.
+pub fn run_untied(
+    cmd: Command,
+    stdin: Option<&[u8]>,
+    cancel: &AtomicBool,
+    timeout: Option<Duration>,
+) -> Result<Finished> {
+    run_started_by(cmd, stdin, cancel, timeout, spawn_untied)
+}
+
+fn run_started_by(
     mut cmd: Command,
     stdin: Option<&[u8]>,
     cancel: &AtomicBool,
     timeout: Option<Duration>,
+    start: fn(&mut Command) -> std::io::Result<Child>,
 ) -> Result<Finished> {
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
@@ -153,7 +205,7 @@ pub fn run(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let mut child = spawn(&mut cmd).with_context(|| format!("could not start {program}"))?;
+    let mut child = start(&mut cmd).with_context(|| format!("could not start {program}"))?;
     if let Some(input) = stdin {
         let mut pipe = child.stdin.take().expect("piped stdin");
         let input = input.to_vec();
