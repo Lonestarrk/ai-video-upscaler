@@ -45,7 +45,7 @@ use crate::process::{self, is_cancelled, Cancelled};
 use crate::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
 /// Bumped whenever the job's output for the same inputs changes; part of the cache key.
-pub const AUDIO_VERSION: u32 = 3;
+pub const AUDIO_VERSION: u32 = 4;
 /// Frames of silence the AC-3 encoder puts in front of the signal (one block).
 const AC3_PRIMING: usize = 256;
 /// Channel layout of every 5.1 track: FL FR FC LFE SL SR.

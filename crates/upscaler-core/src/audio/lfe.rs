@@ -1,6 +1,7 @@
 //! LFE (subwoofer) channel generation. The LFE is built from the bass of the
-//! mix, gated so that dialogue and ordinary music never open it, filtered
-//! zero-phase to 20..90 Hz and written 10..16 dB below the heard level.
+//! mix, gated so that dialogue, ordinary music and a steady background drone
+//! never open it, filtered zero-phase to 20..90 Hz and written 10..16 dB below
+//! the heard level.
 
 use super::dsp::{band, db_to_gain, envelope_db, lr4_highpass, lr4_lowpass, zero_phase};
 use crate::settings::LfeLevel;
@@ -37,12 +38,104 @@ const SYNTH_MIX_DB: f32 = -9.0;
 /// square edges account for the difference).
 const SYNTH_NORM: f32 = 1.37;
 
+/// Background tracker: the detection envelope is averaged per block, the
+/// background is a low percentile over a centred window of blocks, then a
+/// centred moving average so it moves without steps.
+const BG_BLOCK_MS: f32 = 10.0;
+/// 8 s, centred: Voyager's big bass moments (1:00:34 in the pilot) rumble
+/// for about 5 s, and a 3 s window closed the LFE in the middle of them. A
+/// drone that starts or stops leaks into the LFE for at most ~2.4 s.
+const BG_WINDOW_MS: f32 = 8000.0;
+/// 20th percentile: a burst shorter than 80 % of the window (6.4 s) never
+/// lifts the background, a steady or fluctuating drone defines it.
+const BG_PERCENTILE: f32 = 0.2;
+const BG_SMOOTH_MS: f32 = 500.0;
+/// Rise gate: closed while the envelope is at most `RISE_CLOSED_DB` above the
+/// background, fully open from `RISE_OPEN_DB`, `RISE_RANGE_DB` when closed.
+const RISE_CLOSED_DB: f32 = 4.0;
+const RISE_OPEN_DB: f32 = 10.0;
+const RISE_RANGE_DB: f32 = -30.0;
+/// Opening follows the envelope's attack; closing is slow so a drone that
+/// pokes over the knee for a moment cannot flutter the gain.
+const RISE_RELEASE_MS: f32 = 150.0;
+
 /// Smooth per-sample gate gain in dB (0 = open, `GATE_CLOSED_DB` = closed).
 fn open_amount(value_db: f32, closed_at: f32, knee: f32) -> f32 {
     ((value_db - closed_at) / knee).clamp(0.0, 1.0)
 }
 
-fn gate_gain_db(input: &[f32], source: LfeSource, rate: f32) -> Vec<f32> {
+/// Steady background level of `env` (dB per sample), same length.
+fn background_db(env: &[f32], rate: f32) -> Vec<f32> {
+    let n = env.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let block = ((rate * BG_BLOCK_MS / 1000.0).round() as usize).max(1);
+    let blocks: Vec<f32> = env
+        .chunks(block)
+        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+        .collect();
+    let m = blocks.len();
+    let half = (BG_WINDOW_MS / BG_BLOCK_MS / 2.0).round() as usize;
+    let mut scratch = Vec::with_capacity(2 * half + 1);
+    let pct: Vec<f32> = (0..m)
+        .map(|i| {
+            scratch.clear();
+            scratch.extend_from_slice(&blocks[i.saturating_sub(half)..(i + half + 1).min(m)]);
+            let k = ((scratch.len() - 1) as f32 * BG_PERCENTILE).round() as usize;
+            *scratch.select_nth_unstable_by(k, f32::total_cmp).1
+        })
+        .collect();
+    let sh = (BG_SMOOTH_MS / BG_BLOCK_MS / 2.0).round() as usize;
+    let mut prefix = vec![0.0f64; m + 1];
+    for (i, &v) in pct.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + v as f64;
+    }
+    let smooth: Vec<f32> = (0..m)
+        .map(|i| {
+            let (lo, hi) = (i.saturating_sub(sh), (i + sh + 1).min(m));
+            ((prefix[hi] - prefix[lo]) / (hi - lo) as f64) as f32
+        })
+        .collect();
+    // Linear interpolation between block centres.
+    (0..n)
+        .map(|s| {
+            let pos = (s as f32 - (block as f32 - 1.0) / 2.0) / block as f32;
+            if pos <= 0.0 {
+                return smooth[0];
+            }
+            let i = pos.floor() as usize;
+            if i + 1 >= m {
+                return smooth[m - 1];
+            }
+            let t = pos - i as f32;
+            smooth[i] * (1.0 - t) + smooth[i + 1] * t
+        })
+        .collect()
+}
+
+/// Gain in dB that lets through only what rises above the steady background:
+/// 0 dB for impacts, `RISE_RANGE_DB` for a constant drone.
+fn rise_gain_db(env: &[f32], rate: f32) -> Vec<f32> {
+    let bg = background_db(env, rate);
+    let coef = |ms: f32| (-1.0 / (rate * ms / 1000.0)).exp();
+    let (att, rel) = (coef(GATE_ATTACK_MS), coef(RISE_RELEASE_MS));
+    let mut state = None::<f32>;
+    env.iter()
+        .zip(&bg)
+        .map(|(&e, &b)| {
+            let target = RISE_RANGE_DB
+                * (1.0 - open_amount(e - b, RISE_CLOSED_DB, RISE_OPEN_DB - RISE_CLOSED_DB));
+            let s = state.unwrap_or(target);
+            let c = if target > s { att } else { rel };
+            let next = c * s + (1.0 - c) * target;
+            state = Some(next);
+            next
+        })
+        .collect()
+}
+
+fn gate_gain_db(input: &[f32], source: LfeSource, rate: f32, follow_background: bool) -> Vec<f32> {
     let detect = band(input, 30.0, 100.0, rate);
     let env = envelope_db(&detect, rate, GATE_ATTACK_MS, GATE_RELEASE_MS);
     let threshold = match source {
@@ -53,6 +146,11 @@ fn gate_gain_db(input: &[f32], source: LfeSource, rate: f32) -> Vec<f32> {
         .iter()
         .map(|&e| GATE_CLOSED_DB * (1.0 - open_amount(e, threshold - GATE_KNEE_DB, GATE_KNEE_DB)))
         .collect();
+    if follow_background {
+        for (g, r) in gain.iter_mut().zip(rise_gain_db(&env, rate)) {
+            *g = g.min(r);
+        }
+    }
     if source == LfeSource::MonoSum {
         let lo = envelope_db(
             &band(input, 30.0, 60.0, rate),
@@ -120,9 +218,24 @@ fn soft_limit(x: f32) -> f32 {
     }
 }
 
-/// Builds the LFE channel from `input` (same length as the input).
+/// Builds the LFE channel from `input` (same length as the input). The mains
+/// keep all their bass, so the LFE only adds bass that rises above the scene's
+/// own steady background: a constant drone (engine hum) gets almost none,
+/// explosions, impacts and music swells open it fully.
 pub fn make_lfe(input: &[f32], source: LfeSource, level: LfeLevel, rate: f32) -> Vec<f32> {
-    let gate = gate_gain_db(input, source, rate);
+    build_lfe(input, source, level, rate, true)
+}
+
+/// `follow_background = false` is the gate without the background tracker
+/// (the behaviour before AUDIO_VERSION 4); the tests compare against it.
+fn build_lfe(
+    input: &[f32],
+    source: LfeSource,
+    level: LfeLevel,
+    rate: f32,
+    follow_background: bool,
+) -> Vec<f32> {
+    let gate = gate_gain_db(input, source, rate, follow_background);
     let gated: Vec<f32> = input
         .iter()
         .zip(&gate)
@@ -315,21 +428,33 @@ mod tests {
             })
             .collect();
         let mid = |x: &[f32]| rms_db(&x[n / 4..n * 3 / 4]);
-        let guarded = mid(&make_lfe(
+        // The steady voice is also closed by the background tracker, so the
+        // guard itself is checked with the tracker off; the real path must
+        // stay at least as quiet.
+        let guarded = mid(&build_lfe(
+            &voice,
+            LfeSource::MonoSum,
+            LfeLevel::Normal,
+            RATE,
+            false,
+        ));
+        let open = mid(&build_lfe(
+            &voice,
+            LfeSource::Effects,
+            LfeLevel::Normal,
+            RATE,
+            false,
+        ));
+        let real = mid(&make_lfe(
             &voice,
             LfeSource::MonoSum,
             LfeLevel::Normal,
             RATE,
         ));
-        let open = mid(&make_lfe(
-            &voice,
-            LfeSource::Effects,
-            LfeLevel::Normal,
-            RATE,
-        ));
-        println!("deep voice guarded {guarded} unguarded {open}");
+        println!("deep voice guarded {guarded} unguarded {open} real {real}");
         assert!(guarded < -65.0, "guarded {guarded}");
         assert!(open >= guarded + 10.0, "guarded {guarded} open {open}");
+        assert!(real <= guarded + 0.1, "guarded {guarded} real {real}");
     }
 
     #[test]
@@ -343,6 +468,72 @@ mod tests {
             (first - steady).abs() <= 3.0,
             "first {first} steady {steady}"
         );
+    }
+
+    /// Engine hum: 60 + 90 Hz at -30 dBFS RMS each (about the drone's level
+    /// in the bass band of the Voyager bridge scenes), with a slow 0.3 Hz
+    /// +-1.5 dB wobble so the background tracker sees a living drone.
+    fn drone(n: usize) -> Vec<f32> {
+        let a = sine(60.0, -30.0, n);
+        let b = sine(90.0, -30.0, n);
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE;
+                let wobble = db_to_gain(1.5 * (2.0 * std::f32::consts::PI * 0.3 * t).sin());
+                (a[i] + b[i]) * wobble
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steady_drone_gets_no_lfe() {
+        let n = 10 * 48_000;
+        let x = drone(n);
+        let after = |y: &[f32]| rms_db(&y[3 * 48_000..]);
+        for level in [LfeLevel::Normal, LfeLevel::Cinema] {
+            let old = after(&build_lfe(&x, LfeSource::Effects, level, RATE, false));
+            let new = after(&make_lfe(&x, LfeSource::Effects, level, RATE));
+            println!("{level:?}: drone LFE old {old} new {new}");
+            // The old absolute gate is fully open on this drone. 25 dB (not
+            // 20) proves more than merely closing the old -20 dB gate.
+            assert!(new <= old - 25.0, "{level:?}: old {old} new {new}");
+        }
+        let classic = after(&make_lfe(&x, LfeSource::MonoSum, LfeLevel::Normal, RATE));
+        println!("classic drone LFE {classic}");
+        assert!(classic < -60.0, "classic {classic}");
+    }
+
+    #[test]
+    fn impact_over_drone_opens() {
+        let n = 10 * 48_000;
+        let starts = [3 * 48_000, 5 * 48_000, 7 * 48_000];
+        let len = 14_400; // 300 ms
+                          // Drone total RMS is -27 dBFS; impacts at -15 dBFS are +12 dB over it.
+        let mut impacts = vec![0.0f32; n];
+        for &s in &starts {
+            impacts[s..s + len].copy_from_slice(&sine(50.0, -15.0, len));
+        }
+        let d = drone(n);
+        let mixed: Vec<f32> = d.iter().zip(&impacts).map(|(a, b)| a + b).collect();
+        let reference = build_lfe(&impacts, LfeSource::Effects, LfeLevel::Normal, RATE, false);
+        let new = make_lfe(&mixed, LfeSource::Effects, LfeLevel::Normal, RATE);
+        let old_drone =
+            rms_db(&build_lfe(&d, LfeSource::Effects, LfeLevel::Normal, RATE, false)[3 * 48_000..]);
+        let peak = |y: &[f32]| 20.0 * y.iter().fold(0.0f32, |m, v| m.max(v.abs())).log10();
+        for &s in &starts {
+            let (r, w) = (&reference[s..s + len], &new[s..s + len]);
+            let (pr, pw) = (peak(r), peak(w));
+            let (rr, rw) = (rms_db(&r[2_400..12_000]), rms_db(&w[2_400..12_000]));
+            println!("impact at {s}: peak ref {pr} new {pw}, rms ref {rr} new {rw}");
+            assert!((pw - pr).abs() <= 1.5, "peak ref {pr} new {pw}");
+            assert!((rw - rr).abs() <= 1.5, "rms ref {rr} new {rw}");
+        }
+        // Between impacts: from 700 ms after an impact to the next one.
+        for pair in starts.windows(2) {
+            let gap = rms_db(&new[pair[0] + len + 33_600..pair[1]]);
+            println!("between impacts {gap}, old drone {old_drone}");
+            assert!(gap <= old_drone - 20.0, "gap {gap} old drone {old_drone}");
+        }
     }
 
     #[test]

@@ -158,7 +158,11 @@ mod tests {
     #[test]
     fn effects_bass_reaches_lfe() {
         let n = 96_000;
-        let fx = sine(50.0, 0.3, n);
+        // A 1 s bass hit between silences (n/4..3n/4, the measured middle):
+        // the LFE ignores a steady background, so a constant tone would not
+        // reach it.
+        let mut fx = vec![0.0f32; n];
+        fx[n / 4..n * 3 / 4].copy_from_slice(&sine(50.0, 0.3, n / 2));
         let effects = stereo(fx.clone(), fx);
         let silent = stereo(vec![0.0; n], vec![0.0; n]);
         let out = place(&effects, &silent, &silent, &effects, LfeLevel::Normal);
