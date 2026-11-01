@@ -1,25 +1,24 @@
 //! Small offline DSP primitives on mono `f32` slices. Everything is linear in
 //! the length of the input, so whole sections of several minutes are fine.
 
-use std::f32::consts::PI;
-
 const BUTTERWORTH_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const FLOOR_DB: f32 = -120.0;
 
-/// Second-order section (RBJ cookbook), Direct Form II transposed.
+/// Second-order section (RBJ cookbook), Direct Form II transposed. Coefficients
+/// and state are f64 so a 20 Hz filter at 48 kHz keeps its precision.
 #[derive(Debug, Clone)]
 pub struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    z1: f32,
-    z2: f32,
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
 }
 
 impl Biquad {
-    fn from_coeffs(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
+    fn from_coeffs(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Self {
         Self {
             b0: b0 / a0,
             b1: b1 / a0,
@@ -32,9 +31,9 @@ impl Biquad {
     }
 
     pub fn lowpass(f: f32, q: f32, rate: f32) -> Self {
-        let w = 2.0 * PI * f / rate;
+        let w = 2.0 * std::f64::consts::PI * f as f64 / rate as f64;
         let (s, c) = w.sin_cos();
-        let alpha = s / (2.0 * q);
+        let alpha = s / (2.0 * q as f64);
         Self::from_coeffs(
             (1.0 - c) / 2.0,
             1.0 - c,
@@ -46,9 +45,9 @@ impl Biquad {
     }
 
     pub fn highpass(f: f32, q: f32, rate: f32) -> Self {
-        let w = 2.0 * PI * f / rate;
+        let w = 2.0 * std::f64::consts::PI * f as f64 / rate as f64;
         let (s, c) = w.sin_cos();
-        let alpha = s / (2.0 * q);
+        let alpha = s / (2.0 * q as f64);
         Self::from_coeffs(
             (1.0 + c) / 2.0,
             -(1.0 + c),
@@ -60,17 +59,17 @@ impl Biquad {
     }
 
     pub fn process(&mut self, x: f32) -> f32 {
+        let x = x as f64;
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
-        y
+        y as f32
     }
 
     fn run(mut self, x: &[f32]) -> Vec<f32> {
         x.iter().map(|&v| self.process(v)).collect()
     }
 }
-
 /// Linkwitz-Riley 4th order low-pass (two cascaded Butterworth sections).
 pub fn lr4_lowpass(x: &[f32], f: f32, rate: f32) -> Vec<f32> {
     let once = Biquad::lowpass(f, BUTTERWORTH_Q, rate).run(x);
@@ -122,22 +121,46 @@ pub fn delay(x: &[f32], samples: usize) -> Vec<f32> {
     y
 }
 
-/// Four first-order all-passes; the seed picks coefficients in 0.3..0.7.
-/// Same magnitude response, scrambled phase.
+/// Prime delay lengths (about 2-6 ms at 48 kHz) for the Schroeder sections.
+const ALLPASS_DELAYS: [usize; 8] = [97, 131, 163, 197, 233, 263, 293, 317];
+
+/// Energy-preserving decorrelation: four first-order all-passes followed by
+/// two Schroeder all-passes (`y[n] = -g x[n] + x[n-D] + g y[n-D]`) with
+/// seed-dependent coefficients in 0.3..0.7 and seed-dependent prime delays.
+/// The long delay lines are what make two different seeds actually
+/// uncorrelated at low/mid frequencies; first-order sections alone do not.
 pub fn decorrelate(x: &[f32], seed: u32) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(2654435761).wrapping_add(0x9E37_79B9);
-    let mut y = x.to_vec();
-    for _ in 0..4 {
+    let mut state = (seed.wrapping_mul(2654435761).wrapping_add(0x9E37_79B9)) | 1;
+    let mut next = || {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
-        let a = 0.3 + 0.4 * (state >> 8) as f32 / (1u32 << 24) as f32;
-        let (mut x1, mut y1) = (0.0f32, 0.0f32);
+        state
+    };
+    let coef = |s: u32| 0.3 + 0.4 * (s >> 8) as f64 / (1u32 << 24) as f64;
+    let mut y = x.to_vec();
+    for _ in 0..4 {
+        let a = coef(next());
+        let (mut x1, mut y1) = (0.0f64, 0.0f64);
         for v in y.iter_mut() {
-            let out = -a * *v + x1 + a * y1;
-            x1 = *v;
+            let input = *v as f64;
+            let out = -a * input + x1 + a * y1;
+            x1 = input;
             y1 = out;
-            *v = out;
+            *v = out as f32;
+        }
+    }
+    for _ in 0..2 {
+        let g = coef(next());
+        let d = ALLPASS_DELAYS[next() as usize % ALLPASS_DELAYS.len()];
+        let input = y.clone();
+        for n in 0..y.len() {
+            let (xd, yd) = if n >= d {
+                (input[n - d] as f64, y[n - d] as f64)
+            } else {
+                (0.0, 0.0)
+            };
+            y[n] = (-g * input[n] as f64 + xd + g * yd) as f32;
         }
     }
     y
@@ -148,7 +171,7 @@ pub fn db_to_gain(db: f32) -> f32 {
 }
 
 fn gain_to_db(g: f32) -> f32 {
-    if g <= 1e-6 {
+    if g <= db_to_gain(FLOOR_DB) {
         FLOOR_DB
     } else {
         (20.0 * g.log10()).max(FLOOR_DB)
@@ -231,7 +254,14 @@ mod tests {
     fn envelope_follows_burst() {
         let mut x = vec![0.0f32; 24_000];
         x.extend(sine(50.0, db_to_gain(-20.0), 24_000));
-        x.extend(vec![0.0; 24_000]);
+        x.extend(vec![0.0; 48_000]);
+        let slow = envelope_db(&x, RATE, 1.0, 250.0);
+        let end = 48_000;
+        assert!(slow[end - 100] > -22.0);
+        assert!(
+            slow[end + 48_000 - 1] < slow[end - 100] - 20.0,
+            "release too slow"
+        );
         let env = envelope_db(&x, RATE, 1.0, 100.0);
         assert_eq!(env.len(), x.len());
         assert!(env[100] <= -119.0);
@@ -258,6 +288,34 @@ mod tests {
         assert!((rms_db(&x) - rms_db(&y)).abs() < 0.5);
         assert_eq!(y, decorrelate(&x, 3));
         assert_ne!(y, decorrelate(&x, 4));
+    }
+
+    #[test]
+    fn seed_pair_is_decorrelated() {
+        let s = band(&noise(96_000, 11), 100.0, 7000.0, RATE);
+        let a = decorrelate(&s, 1);
+        let b = decorrelate(&s, 2);
+        let (a, b, m) = (mid(&a), mid(&b), mid(&s));
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let ea: f32 = a.iter().map(|x| x * x).sum();
+        let eb: f32 = b.iter().map(|x| x * x).sum();
+        let corr = dot / (ea * eb).sqrt();
+        assert!(corr.abs() < 0.5, "correlation {corr}");
+        assert!((rms_db(a) - rms_db(m)).abs() < 0.5);
+        assert!((rms_db(b) - rms_db(m)).abs() < 0.5);
+    }
+
+    #[test]
+    fn highpass_20_is_accurate() {
+        let n = 96_000;
+        let through = |f: f32| {
+            let x = sine(f, 0.5, n);
+            let y = zero_phase(&x, |s| lr4_highpass(s, 20.0, RATE));
+            rms_db(mid(&x)) - rms_db(mid(&y))
+        };
+        // Theory: zero-phase LR4 at 20 Hz is -1.05 dB at 40 Hz, so 1.2 dB is the tight bound.
+        assert!(through(40.0) < 1.2, "40 Hz lost {}", through(40.0));
+        assert!(through(10.0) > 20.0, "10 Hz lost {}", through(10.0));
     }
 
     #[test]
