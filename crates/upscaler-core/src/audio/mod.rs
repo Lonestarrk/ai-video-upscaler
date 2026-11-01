@@ -5,6 +5,7 @@ pub mod classic;
 pub mod dsp;
 pub mod enhance;
 pub mod io;
+pub mod job;
 pub mod lfe;
 pub mod pack;
 pub mod place;

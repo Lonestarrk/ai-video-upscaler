@@ -21,11 +21,23 @@ pub struct Section {
 /// Plans the sections covering `0..total` frames. Consecutive sections overlap
 /// by exactly `OVERLAP_SECONDS * rate` frames; a short range is one section.
 pub fn plan(total: u64, rate: u32) -> Vec<Section> {
+    plan_with(
+        total,
+        SECTION_SECONDS * rate as u64,
+        OVERLAP_SECONDS * rate as u64,
+    )
+}
+
+/// Like [`plan`] with the section length and overlap given in frames (`len_max > overlap`).
+/// The audio job's tests use short sections through this.
+pub fn plan_with(total: u64, len_max: u64, overlap: u64) -> Vec<Section> {
+    assert!(
+        len_max > overlap,
+        "sections must be longer than their overlap"
+    );
     if total == 0 {
         return Vec::new();
     }
-    let len_max = SECTION_SECONDS * rate as u64;
-    let overlap = OVERLAP_SECONDS * rate as u64;
     let step = len_max - overlap;
     let mut out = Vec::new();
     let mut start = 0u64;
