@@ -401,8 +401,10 @@ fn decoded_front_left(tools: &Tools, path: &Path, index: usize) -> Vec<f32> {
         .unwrap();
     assert!(out.status.success());
     out.stdout
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
@@ -413,11 +415,11 @@ fn best_lag(a: &[f32], b: &[f32], max: i64) -> i64 {
     assert!(a.len() >= from + len, "too short: {}", a.len());
     let score = |l: i64| {
         let (mut dot, mut eb) = (0.0f64, 0.0f64);
-        for n in from..from + len {
+        for (n, x) in a.iter().enumerate().skip(from).take(len) {
             let j = n as i64 + l;
             if j >= 0 && (j as usize) < b.len() {
                 let y = b[j as usize] as f64;
-                dot += a[n] as f64 * y;
+                dot += *x as f64 * y;
                 eb += y * y;
             }
         }

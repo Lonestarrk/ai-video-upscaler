@@ -2,10 +2,11 @@
 
 En skrivbordsapp för Windows (och macOS) som skalar upp och restaurerar video med AI, i första hand med **ChatGPT via din vanliga ChatGPT-prenumeration**, så att du slipper betala per bild via API.
 
-Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade resultatet sida vid sida eller med en svepbar linje. När resultatet ser bra ut exporterar du hela videon eller ett urval. Ljudet kopieras oförändrat från originalet.
+Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade resultatet sida vid sida eller med en svepbar linje. När resultatet ser bra ut exporterar du hela videon eller ett urval. Ljudet kopieras oförändrat från originalet, eller görs om till 5.1 och får bättre kvalitet om du vill.
 
 - [Funktioner](#funktioner)
 - [Kom igång: använda appen](#kom-igång-använda-appen)
+- [Ljud](#ljud)
 - [Kom igång: bygga, testa och utveckla vidare](#kom-igång-bygga-testa-och-utveckla-vidare)
 - [Felsökning](#felsökning)
 - [Hur det fungerar](#hur-det-fungerar)
@@ -28,6 +29,7 @@ Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade r
 - **Sparar kvot:** identiska bildrutor återanvänder resultatet, och du kan välja att bara skicka varannan eller var tredje bildruta till AI:n och skapa resten med rörelseinterpolering.
 - **Återupptagbar export:** färdiga bildrutor sparas. En export som avbryts, får nätverksfel eller når planens gräns fortsätter där den slutade när du startar den igen.
 - **Utdata:** 2×/3×/4× eller 1080p/1440p/4K, H.264 eller H.265, valfri kvalitet (CRF).
+- **Ljud:** originalljudet oförändrat, eller 5.1 gjort av stereoljudet (lokal AI eller klassisk uppmixning) med valbar basnivå, och förbättrad ljudkvalitet. Se [Ljud](#ljud).
 - **Flera AI-tjänster:**
 
   | Tjänst | Kostnad | Hastighet | Föregående bildruta som referens | Kommentar |
@@ -101,6 +103,57 @@ Nycklarna sparas i inställningsfilen på din dator (`%APPDATA%\AI Video Upscale
 3. Jämför i *Sida vid sida* eller *Svep* och zooma in på ansikten.
 4. Justera prompten och förhandsvisa igen. Vill du testa hela flödet utan kostnad först, välj tjänsten *Enkel uppskalning (test)*.
 5. Markera ett kort urval med *Sätt start* och *Sätt slut* och exportera. Exportera sedan allt.
+
+## Ljud
+
+Som standard kopieras ljudet oförändrat. Under *Ljud* i sidopanelen kan du i stället göra 5.1 av ett stereospår och förbättra ljudkvaliteten. Ljudet görs för exakt samma bildrutor som exporteras och ligger i synk med bilden.
+
+### 5.1 av stereo
+
+**Varför:** de flesta äldre serier och filmer på DVD och i AVI har bara stereo (ofta Dolby Surround-matrisat). 5.1 lägger dialogen i mittkanalen, så att den hörs tydligt, och sprider musik och effekter runt om.
+
+| Motor | Vad den gör | Tid |
+|---|---|---|
+| **AI (lokal, grafikkort)** | En AI-modell (BandIt Plus) delar upp ljudet i tal, musik och effekter. Talet hamnar i mitten (FC), musik och effekter i fram- och bakkanalerna, och basen från effekterna i LFE. Inget försvinner: det modellen inte kan placera ligger kvar fram. | ~25 s per minut ljud på grafikkortet, ~4 min per minut på processorn |
+| **Klassisk (utan AI)** | FFmpegs `surround`-filter styr ljudet efter riktning: det som är lika i båda kanalerna går till mitten, resten fram och (fördröjt) bak. Fungerar på alla datorer, men skiljer inte tal från musik som ligger i mitten. | några sekunder per minut |
+
+Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Mono kan inte bli 5.1.
+
+**Bas (LFE):** subwooferkanalen byggs av basen under 90 Hz, bara när det finns riktig bas (explosioner, motorer, musik med djup bas). Dialog öppnar den aldrig. Huvudkanalerna behåller all sin bas, så inget går förlorat om förstärkaren skickar basen till subwoofern ändå.
+
+| Nivå | Vad den gör |
+|---|---|
+| Subtil | 3 dB svagare LFE än Normal, för små rum och grannar. |
+| Normal | Standard. |
+| Kraftig | 3 dB starkare LFE än Normal. |
+| Biokänsla | Kraftig plus en oktav djupare bas (ner mot 35 Hz) som byggs av effektljudet. Bara med AI-motorn, som tar fram effekterna; med Klassisk blir den som Kraftig. |
+
+### Förbättra ljudkvaliteten
+
+**Varför:** AC-3, MP3 och AAC tar bort diskanten över en viss frekvens (ofta 14–16 kHz) och kan låta matta. AI-modellen Apollo återskapar bara det som saknas ovanför den gränsen; allt under gränsen är originalet, orört. Det går att använda med 5.1 (fram, mitt och bak var för sig, aldrig LFE) eller ensamt, då blir resultatet stereo. Tar ungefär 20 s per minut stereoljud på grafikkortet, längre med 5.1. Hur mycket det hörs beror på källan: på en AC-3-källa med lite diskant kvar är skillnaden liten.
+
+### Ljud-AI: installera
+
+AI-motorn och kvalitetsförbättringen behöver *Ljud-AI*: *Inställningar → Ljud-AI → Installera*. Appen hämtar Python, PyTorch och modellerna och lägger dem i `%LOCALAPPDATA%\AI Video Upscaler\tools\audio-ai`.
+
+- **Storlek:** ~2 GB att ladda ner, **~5,7 GB** på disken med PyTorch för AMD-grafikkort (ROCm). Installationen tar runt 10 minuter och fortsätter där den slutade om den avbryts.
+- **Grafikkort:** AMD Radeon med ROCm-stöd i Windows (testat på RX 7900 XTX, drivrutin 26.2.2 eller nyare). Hittas inget sådant kort installeras PyTorch för processorn i stället.
+- **Processorn** fungerar men är långsam: ett 45-minutersavsnitt tar ~15 min på grafikkortet och ~3 timmar på processorn. Appen varnar innan.
+- Ljud-AI finns bara för Windows. Klassisk 5.1 fungerar överallt.
+
+### Den exporterade filen
+
+Med ändrat ljud blir exporten en **MKV** med:
+
+| Spår | Varför |
+|---|---|
+| **5.1 FLAC** (standardspår) | Förlustfritt, exakt det appen räknade fram. |
+| **5.1 AC-3** 640 kbit/s | För förstärkare och TV-apparater som inte kan spela FLAC. Gjort av samma ljud som FLAC-spåret. |
+| **Original** | Källans ljud, oförändrat, för att jämföra eller gå tillbaka. |
+
+Med bara kvalitetsförbättring: FLAC stereo + Original.
+
+**Varför MKV:** MP4 kan inte bära FLAC tillsammans med AC-3 och originalspåret på ett sätt som alla spelare klarar, och MKV hanterar flera ljudspår med namn och ett standardspår. Välj spår i spelaren (VLC, Kodi, Plex, mediaspelare i TV:n). Skulle förstärkaren vara tyst på FLAC-spåret, välj AC-3.
 
 ## Kom igång: bygga, testa och utveckla vidare
 
@@ -185,6 +238,8 @@ cargo build -p upscaler-gui --release
 | "Codex is not signed in" | *Inställningar → ChatGPT → Logga in med ChatGPT*. Kontrollera i en terminal med `codex login status`. |
 | Codex kan inte spara `output.png` | *Inställningar → ChatGPT → Avancerat → Sandlåda: danger-full-access*. Codex arbetar ändå bara i en tillfällig mapp per bildruta. |
 | Planens gräns är nådd | Vänta och starta exporten igen. Den fortsätter där den slutade. |
+| Förstärkaren är tyst eller spelar bara stereo | Välj spåret *5.1 (AC-3)* i spelaren. Alla förstärkare kan inte avkoda FLAC 5.1 som skickas vidare från TV:n eller spelaren. |
+| Ljud-AI är långsamt | Kontrollera *Inställningar → Ljud-AI*: står det processorn, hittades inget grafikkort som stöds. Klassisk motor går snabbt utan AI. |
 | Fönstret blir svart eller appen startar inte (gammalt grafikkort, virtuell maskin, fjärrskrivbord) | Starta med `set UPSCALER_RENDERER=glow` före `AIVideoUpscaler.exe`, så används OpenGL i stället. |
 | Något annat | Loggen finns i `%LOCALAPPDATA%\AI Video Upscaler\upscaler.log` (*Inställningar → Allmänt → Öppna loggfilen*). |
 
@@ -205,7 +260,7 @@ OpenAI:s officiella [Codex CLI](https://github.com/openai/codex) loggar in med d
 
 ### Struktur och data
 
-- `crates/upscaler-core`: allt utom gränssnittet: inställningar, FFmpeg, AI-tjänsterna (`provider/`), bildgeometri, bildformatkontroll, prompter och exportjobbet.
+- `crates/upscaler-core`: allt utom gränssnittet: inställningar, FFmpeg, AI-tjänsterna (`provider/`), bildgeometri, bildformatkontroll, prompter, exportjobbet och ljudet (`audio/`: 5.1, LFE, kvalitetsförbättring och Ljud-AI).
 - `crates/upscaler-gui`: egui-appen: jämförelsevy, tidslinje, sidopanel och inställningar.
 - Inställningar: `%APPDATA%\AI Video Upscaler\settings.json`. Förhandsvisningar, exportjobb, nedladdad FFmpeg och logg: `%LOCALAPPDATA%\AI Video Upscaler\`. Arbetsmappen kan flyttas och tömmas i inställningarna; långa exporter kan ta många GB eftersom varje bildruta sparas som PNG.
 

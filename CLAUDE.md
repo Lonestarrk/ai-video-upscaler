@@ -48,10 +48,25 @@ cargo fmt --all                            # run before committing
   - `job.rs` geometry (`work` square-pixel size, `stored` size, SAR for anamorphic output),
     preview cache, export job (extract → analyse → upscale → encode), resumable by job folder.
   - `settings.rs` all settings (JSON in `%APPDATA%\AI Video Upscaler`), prompts, migration.
+  - `audio/` the 5.1 / enhancement audio job (48 kHz f32, channel order FL FR FC LFE SL SR,
+    `5.1(side)`): `source.rs` channels, codec, AC-3 Dolby Surround flag and dialnorm;
+    `io.rs` exact-range extraction, WAV, streaming FFmpeg encoder; `sections.rs` 300 s
+    sections with 2 s Hann crossfades; `classic.rs` FFmpeg `surround` upmix + delayed,
+    decorrelated surrounds; `ai.rs` + `pack.rs` the local AI pack (embeddable Python 3.12,
+    ROCm or CPU PyTorch, MSST with BandIt Plus separation and Apollo repair; worker
+    `assets/audio_ai.py`) in `tools\audio-ai`; `place.rs` stems → 5.1 (speech in FC, FL + FC
+    rebuilds the source); `lfe.rs` gated 20–90 Hz zero-phase LFE, 16/13/10 dB below the heard level,
+    octave-down synthesis for Biokänsla; `enhance.rs` band-splice of Apollo above the codec
+    cutoff; `dsp.rs` filters; `job.rs` plan, resumable sections, FLAC + AC-3 encode, loudness
+    (±1 LU), true peak (≤ -1 dBTP) and sync checks, cache in `<work>\audio\<key>`.
+    `job.rs` (export) encodes the video to `video.mkv` in the job folder and
+    `ffmpeg::mux` writes the MKV: FLAC 5.1 (default), AC-3 5.1, Original.
 - `crates/upscaler-gui` (egui 0.37 / eframe)
   - `app.rs` state, events, background workers' results; `worker.rs` threads + `Bus`.
   - `ui/viewer.rs` comparison (side by side / swipe, shared zoom-pan in the original's
-    coordinates via `Layout`), `ui/timeline.rs`, `ui/side_panel.rs`, `ui/settings_window.rs`.
+    coordinates via `Layout`), `ui/timeline.rs`, `ui/side_panel.rs`, `ui/settings_window.rs`;
+    `ui/audio.rs` the Ljud section, the Ljud-AI settings tab (install / remove / test) and
+    audio export progress.
   - `i18n.rs` `tr("sv", "en")`; every visible text goes through it.
 
 Data: settings `%APPDATA%\AI Video Upscaler\settings.json`; log, previews, export jobs and
@@ -87,6 +102,26 @@ Verified here (Linux container, real ffmpeg, Xvfb screenshots): loading, timelin
 stepping, previews with the basic provider, both comparison modes, export with audio and
 resume, DVD handling (SAR, interlacing, letterbox, wrong-flag detection), aspect-ratio
 extension layout, all HTTP services against a mock server, and a stand-in `codex` script.
+
+5.1 audio, verified 2026-11-01 on the owner's PC (RX 7900 XTX, ROCm pack) with the Voyager
+pilot (AVI, AC-3 2.0 Dolby Surround, dialnorm -27, 23.976 fps) through
+`examples/export_audio_test.rs` (Basic image provider, never the saved settings): teaser
+0:00–2:00, bass event 1:00:25–1:00:45, bridge dialogue 16:40–18:20, theme 3:11–4:55 with AI and
+Classic (Normal), bass with Biokänsla, bridge with enhancement only. Report and files:
+`.superpowers/sdd/2026-11-01-surround-audio/task-14-report.md`.
+- Time on the GPU: separation ~24 s per audio minute (47 s for 120 s), whole audio job + mux
+  55 s for the 2-min teaser; Classic 4–13 s per range; Apollo stereo enhancement 36 s for 100 s.
+- No job warnings. Loudness within 0.8 LU of the source (Classic exact), true peak ≤ -7.7 dBTP.
+  Sync: 0 samples against the app's extraction, 0–1 against a decode-from-start reference, for
+  FLAC and AC-3. FLAC has exactly the video's samples; AC-3 is 0.1–0.6 frame longer.
+- MKV: FLAC 5.1 (default), AC-3 5.1, Original (copied, offset by its start time, 0.5 ms off).
+- Levels (AI): dialogue scene FC -32.4 dBFS vs FL -34.2, surrounds -47, LFE -81 (closed);
+  theme FC silent (no speech), surrounds -37; bass event LFE -52 RMS / -33 peak, Biokänsla
+  -49 / -30; mains keep all their bass (<120 Hz equal to the source). Classic puts FC about
+  1 dB under FL/FR even in dialogue (matrix steering) and its LFE is louder (-45 RMS).
+- Enhancement on this AC-3 source changes only >14 kHz, where the content is ~55 dB under the
+  total: -3 dB at 14–16 kHz, +1.5–4 dB at 16–20 kHz. Practically inaudible here.
+- Not yet judged by ear on the receiver.
 
 NOT verified against the real services (no accounts in the dev container). This is what to
 test first on the owner's Windows PC:

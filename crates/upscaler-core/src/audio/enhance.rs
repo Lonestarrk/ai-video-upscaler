@@ -395,7 +395,9 @@ pub fn to_mid_side(p: &Pcm) -> Pcm {
     assert_eq!(p.channels, 2, "mid/side needs stereo");
     let samples = p
         .samples
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|f| [(f[0] + f[1]) * 0.5, (f[0] - f[1]) * 0.5])
         .collect();
     Pcm {
@@ -410,7 +412,9 @@ pub fn from_mid_side(p: &Pcm) -> Pcm {
     assert_eq!(p.channels, 2, "mid/side needs stereo");
     let samples = p
         .samples
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|f| [f[0] + f[1], f[0] - f[1]])
         .collect();
     Pcm {

@@ -26,11 +26,7 @@ pub struct Pcm {
 
 impl Pcm {
     pub fn frames(&self) -> usize {
-        if self.channels == 0 {
-            0
-        } else {
-            self.samples.len() / self.channels
-        }
+        self.samples.len().checked_div(self.channels).unwrap_or(0)
     }
 
     pub fn channel(&self, i: usize) -> Vec<f32> {
@@ -393,7 +389,7 @@ impl StreamEncoder<'_> {
             self.kill();
             bail!(Cancelled);
         }
-        if samples.len() % self.channels != 0 {
+        if !samples.len().is_multiple_of(self.channels) {
             bail!("audio chunk is not a whole number of frames");
         }
         let mut bytes = Vec::with_capacity(samples.len() * 4);

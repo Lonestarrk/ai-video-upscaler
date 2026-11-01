@@ -266,13 +266,13 @@ mod tests {
         assert_eq!(env.len(), x.len());
         assert!(env[100] <= -119.0);
         let onset = 24_000;
-        for i in onset + 960..onset + 24_000 {
-            assert!(
-                (env[i] + 20.0).abs() < 2.0,
-                "env {} at +{}",
-                env[i],
-                i - onset
-            );
+        for (i, e) in env
+            .iter()
+            .enumerate()
+            .take(onset + 24_000)
+            .skip(onset + 960)
+        {
+            assert!((e + 20.0).abs() < 2.0, "env {e} at +{}", i - onset);
         }
     }
 
