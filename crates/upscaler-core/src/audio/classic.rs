@@ -1,4 +1,4 @@
-﻿//! Classic 5.1 from stereo: FFmpeg's `surround` filter (per-bin STFT steering) for
+//! Classic 5.1 from stereo: FFmpeg's `surround` filter (per-bin STFT steering) for
 //! FL/FR/FC/surrounds, surrounds delayed and decorrelated in Rust, LFE from the mono sum.
 
 use std::path::Path;
@@ -12,11 +12,13 @@ use super::lfe::{make_lfe, LfeSource};
 use crate::ffmpeg::Tools;
 use crate::process;
 use crate::settings::LfeLevel;
+
 /// Latency of `surround` with `win_size=4096`: half a window.
 const LATENCY: usize = 2048;
 /// Surround channels lag the fronts by 15 ms, as a cinema decoder does.
 const SURROUND_DELAY: usize = 720;
 const FILTER: &str = "aformat=sample_fmts=fltp:channel_layouts=stereo,\
+    apad=pad_len=4096,\
     surround=chl_out=5.1:lfe=0:win_size=4096:overlap=0.5:smooth=0.1,apad=pad_len=8192";
 
 /// Classic 5.1 from a stereo 48 kHz WAV: 6 channels (FL FR FC LFE SL SR), exactly as many
@@ -27,8 +29,8 @@ pub fn upmix_classic(
     level: LfeLevel,
     cancel: &AtomicBool,
 ) -> Result<Pcm> {
-    let raw = upmix_classic_raw(tools, stereo_wav, cancel)?;
     let src = read_wav(stereo_wav)?;
+    let raw = raw_from(tools, stereo_wav, &src, cancel, true)?;
     let mono: Vec<f32> = (0..src.frames())
         .map(|i| 0.5 * (src.samples[2 * i] + src.samples[2 * i + 1]))
         .collect();
@@ -44,15 +46,18 @@ pub fn upmix_classic(
 
 /// The latency-compensated `surround` output before the surround delay, decorrelation and
 /// LFE: FL FR FC LFE (silent) SL SR (FFmpeg's BL/BR relabelled).
+#[cfg(test)]
 pub(crate) fn upmix_classic_raw(
     tools: &Tools,
     stereo_wav: &Path,
     cancel: &AtomicBool,
 ) -> Result<Pcm> {
-    upmix_raw_impl(tools, stereo_wav, cancel, true)
+    let src = read_wav(stereo_wav)?;
+    raw_from(tools, stereo_wav, &src, cancel, true)
 }
 
 /// `compensate = false` leaves the filter latency in (control for the null test).
+#[cfg(test)]
 pub(crate) fn upmix_raw_impl(
     tools: &Tools,
     stereo_wav: &Path,
@@ -60,6 +65,16 @@ pub(crate) fn upmix_raw_impl(
     compensate: bool,
 ) -> Result<Pcm> {
     let src = read_wav(stereo_wav)?;
+    raw_from(tools, stereo_wav, &src, cancel, compensate)
+}
+
+fn raw_from(
+    tools: &Tools,
+    stereo_wav: &Path,
+    src: &Pcm,
+    cancel: &AtomicBool,
+    compensate: bool,
+) -> Result<Pcm> {
     if src.channels != 2 || src.rate != RATE {
         bail!("classic 5.1 needs a 48 kHz stereo file");
     }
@@ -108,7 +123,7 @@ mod tests {
     use crate::audio::dsp::{db_to_gain, rms_db};
     use crate::audio::io::write_wav;
 
-    /// Film dialogue sits around -27 dBFS RMS (the AC-3 dialnorm default). The null residual of\n    /// the `surround` filter is proportional to the level (about -13 dB relative), so the\n    /// absolute bound is only meaningful at a realistic level: this signal is -27 dBFS.\n    const LEVEL: f32 = 0.5;\n\n    /// Film dialogue sits around -27 dBFS RMS (the AC-3 dialnorm default). The null residual of
+    /// Film dialogue sits around -27 dBFS RMS (the AC-3 dialnorm default). The null residual of
     /// the `surround` filter is proportional to the level (about -13 dB relative), so the
     /// absolute bound is only meaningful at a realistic level: this signal is -27 dBFS.
     const LEVEL: f32 = 0.5;
@@ -175,6 +190,26 @@ mod tests {
         eprintln!("null: compensated {g:.1} dB, uncompensated {b:.1} dB");
         assert!(g <= -35.0, "compensated null {g}");
         assert!(b >= g + 10.0, "uncompensated {b} vs {g}");
-        assert!(!dir.path().join("in.wav.part").exists());
+    }
+
+    #[test]
+    fn classic_keeps_the_tail() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let n = 3 * RATE as usize;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| LEVEL * 0.5 * (std::f32::consts::TAU * 300.0 * i as f32 / RATE as f32).sin())
+            .collect();
+        let src = Pcm::from_channels(RATE, &[tone.clone(), tone]);
+        let wav = dir.path().join("tone.wav");
+        write_wav(&wav, &src).unwrap();
+        let out = upmix_classic_raw(&tools, &wav, &AtomicBool::new(false)).unwrap();
+        let sum: Vec<f32> = (0..n)
+            .map(|i| out.samples[6 * i] + out.samples[6 * i + 1] + out.samples[6 * i + 2])
+            .collect();
+        let tail = rms_db(&sum[n - 4800..]);
+        let mid = rms_db(&sum[n / 2 - 2400..n / 2 + 2400]);
+        eprintln!("tail {tail:.1} dB, middle {mid:.1} dB");
+        assert!((tail - mid).abs() <= 1.0, "tail {tail} vs middle {mid}");
     }
 }

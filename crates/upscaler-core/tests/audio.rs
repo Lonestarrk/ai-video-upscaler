@@ -1,4 +1,4 @@
-﻿//! Source audio analysis with the real ffmpeg (skipped when it is not installed).
+//! Source audio analysis with the real ffmpeg (skipped when it is not installed).
 
 use std::path::Path;
 
@@ -294,9 +294,9 @@ mod classic_tests {
         let (fl, fr, fc) = (out.channel(0), out.channel(1), out.channel(2));
         let a: Vec<f32> = (0..l.len()).map(|i| l[i] + r[i]).collect();
         let b: Vec<f32> = (0..l.len()).map(|i| fl[i] + fr[i] + fc[i]).collect();
-        let (lo, hi) = (48000usize, 48000 * 3);
+        let (lo, hi) = (96_000usize, 96_000 + 24_000);
         let mut best = (0i32, f64::MIN);
-        for lag in -100i32..=100 {
+        for lag in -3000i32..=3000 {
             let c: f64 = (lo..hi)
                 .map(|i| a[i] as f64 * b[(i as i32 + lag) as usize] as f64)
                 .sum();
