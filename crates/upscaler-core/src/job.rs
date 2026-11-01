@@ -533,8 +533,10 @@ fn export(
     upscale_all(&plan, s, provider.as_ref(), cancel, emit)?;
     check(cancel)?;
 
-    // 3b. SDR to HDR (cached in `hdr/` by mode and peak, never touches `out/`). The encoder
-    // still reads `out/` until it is switched to the HDR frames.
+    // 3b. SDR to HDR (cached in `hdr/` by mode and peak, never touches `out/`), then the light
+    // levels the encoder writes into the stream, measured from the HDR frames.
+    let hdr_frames = crate::hdr::convert::hdr_dir(&dir);
+    let mut hdr: Option<crate::hdr::HdrEncode> = None;
     if s.hdr_mode != crate::settings::HdrMode::Off {
         emit(ExportEvent::Progress {
             stage: Stage::Hdr,
@@ -561,7 +563,40 @@ fn export(
             return Err(e);
         }
         check(cancel)?;
+        // HLG carries no static light levels.
+        let (max_cll, max_fall) = if s.hdr_mode.is_pq() {
+            let m = crate::hdr::measure::measure_dir(&hdr_frames, total, cancel, |f| {
+                emit(ExportEvent::Progress {
+                    stage: Stage::Hdr,
+                    done: f,
+                    total,
+                })
+            });
+            check(cancel)?;
+            let m = m?;
+            (m.max_cll, m.max_fall)
+        } else {
+            (0, 0)
+        };
+        hdr = Some(crate::hdr::HdrEncode {
+            mode: s.hdr_mode,
+            peak_nits: s.hdr_peak_nits,
+            max_cll,
+            max_fall,
+            // Per-scene HDR10+ metadata comes later; Hdr10Plus encodes as HDR10 until then.
+            hdr10plus_json: None,
+        });
     }
+    let encode_dir = if hdr.is_some() { &hdr_frames } else { &out_dir };
+    // The HDR frames are only an intermediate: gone once the output exists.
+    let finish = |output: PathBuf| -> PathBuf {
+        if hdr.is_some() && s.hdr_delete_frames_after {
+            if let Err(e) = std::fs::remove_dir_all(&hdr_frames) {
+                log::warn!("could not delete {}: {e}", hdr_frames.display());
+            }
+        }
+        output
+    };
 
     // 4. Encode
     let info = &spec.info;
@@ -576,7 +611,7 @@ fn export(
         in_fps_den: info.fps_den as u64 * divisor as u64,
         interpolate_to: (divisor > 1).then_some((info.fps_num, info.fps_den)),
         anamorphic: geo.sar.map(|sar| (geo.stored, sar)),
-        codec: s.video_codec,
+        codec: s.effective_codec(),
         crf: s.crf,
         audio_from: info.has_audio.then(|| {
             (
@@ -585,6 +620,7 @@ fn export(
                 (spec.end - spec.start) as f64 / info.fps(),
             )
         }),
+        hdr: hdr.clone(),
     };
     let progress = |f: u64| {
         emit(ExportEvent::Progress {
@@ -599,14 +635,14 @@ fn export(
         }
         ffmpeg::encode(
             tools,
-            &out_dir,
+            encode_dir,
             total,
             &opts,
             &spec.output,
             cancel,
             progress,
         )?;
-        return Ok(spec.output.clone());
+        return Ok(finish(spec.output.clone()));
     };
 
     // 4b. With new audio: the video without audio to an intermediate MKV (kept, so changing
@@ -631,7 +667,7 @@ fn export(
     } else {
         let _ = std::fs::remove_file(&done);
         let part = dir.join("video.part.mkv");
-        ffmpeg::encode(tools, &out_dir, total, &opts, &part, cancel, progress)?;
+        ffmpeg::encode(tools, encode_dir, total, &opts, &part, cancel, progress)?;
         std::fs::rename(&part, &video).context("could not keep the encoded video")?;
         std::fs::write(&done, &key)?;
     }
@@ -692,7 +728,7 @@ fn export(
     for d in audio_job::prune_after(&audio_spec) {
         log::info!("removed old audio job {}", d.display());
     }
-    Ok(output)
+    Ok(finish(output))
 }
 
 const REVIEW_FILE: &str = "review.json";

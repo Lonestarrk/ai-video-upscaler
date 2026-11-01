@@ -1173,3 +1173,294 @@ fn wrongly_flagged_dvd_is_detected_and_fixed() {
         out.height
     );
 }
+
+// ---- HDR output -------------------------------------------------------------------------
+
+use upscaler_core::settings::HdrMode;
+
+fn hdr_settings(work: &Path, mode: HdrMode) -> Settings {
+    let mut s = Settings {
+        provider: ProviderKind::Basic,
+        output_size: OutputSize::Scale2,
+        hdr_mode: mode,
+        hdr_peak_nits: 1000,
+        hdr_delete_frames_after: false,
+        ..Settings::default()
+    };
+    s.work_dir = work.display().to_string();
+    s
+}
+
+fn hdr_spec(tools: &Tools, dir: &Path, mode: HdrMode, out: &str) -> ExportSpec {
+    let src = dir.join("in.mp4");
+    if !src.is_file() {
+        make_video(tools, &src);
+    }
+    let info = ffmpeg::probe(tools, &src).unwrap();
+    ExportSpec {
+        info,
+        start: 2,
+        end: 14,
+        output: dir.join(out),
+        settings: hdr_settings(&dir.join("work"), mode),
+    }
+}
+
+/// ffprobe JSON of the first video frame (with side data) and the stream.
+fn first_frame_json(tools: &Tools, path: &Path) -> serde_json::Value {
+    let out = std::process::Command::new(&tools.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            "%+#1",
+        ])
+        .args(["-show_frames", "-show_streams", "-of", "json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn ratio(v: &serde_json::Value) -> f64 {
+    let s = v.as_str().unwrap();
+    match s.split_once('/') {
+        Some((n, d)) => n.parse::<f64>().unwrap() / d.parse::<f64>().unwrap(),
+        None => s.parse().unwrap(),
+    }
+}
+
+#[test]
+fn hdr10_export_is_pq_bt2020_10bit() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "hdr.mp4");
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+
+    let j = first_frame_json(&tools, &spec.output);
+    let s = &j["streams"][0];
+    assert_eq!(s["codec_name"], "hevc");
+    assert_eq!(s["pix_fmt"], "yuv420p10le");
+    assert_eq!(s["color_transfer"], "smpte2084");
+    assert_eq!(s["color_primaries"], "bt2020");
+    assert_eq!(s["color_space"], "bt2020nc");
+    let side = j["frames"][0]["side_data_list"].as_array().unwrap();
+    let find = |name: &str| {
+        side.iter()
+            .find(|d| d["side_data_type"].as_str().unwrap().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} in {side:?}"))
+    };
+    let mastering = find("Mastering display");
+    assert!((ratio(&mastering["max_luminance"]) - 1000.0).abs() < 0.5);
+    let cll = find("Content light level");
+    let max_cll = cll["max_content"].as_u64().unwrap();
+    let max_fall = cll["max_average"].as_u64().unwrap();
+    assert!(max_cll > 0 && max_fall > 0 && max_fall <= max_cll, "{cll}");
+    // The values are measured from the HDR frames, not fixed ones.
+    let m = upscaler_core::hdr::measure::measure_dir(
+        &upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()),
+        spec.job_frames(),
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!((max_cll, max_fall), (m.max_cll as u64, m.max_fall as u64));
+}
+
+#[test]
+fn hlg_export_has_hlg_transfer() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hlg, "hlg.mp4");
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    let j = first_frame_json(&tools, &spec.output);
+    let s = &j["streams"][0];
+    assert_eq!(s["codec_name"], "hevc");
+    assert_eq!(s["pix_fmt"], "yuv420p10le");
+    assert_eq!(s["color_transfer"], "arib-std-b67");
+    assert_eq!(s["color_primaries"], "bt2020");
+    let side = j["frames"][0]["side_data_list"].as_array();
+    assert!(
+        side.is_none_or(|l| l.iter().all(|d| {
+            let t = d["side_data_type"].as_str().unwrap();
+            !t.starts_with("Mastering") && !t.starts_with("Content light")
+        })),
+        "{side:?}"
+    );
+}
+
+#[test]
+fn hdr_with_interpolation_and_anamorphic() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("dvdlike.mkv");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=360x240:rate=30000/1001:duration=3,setsar=32/27")
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    assert_eq!((info.fps_num, info.fps_den), (30000, 1001));
+    let mut settings = hdr_settings(&dir.path().join("work"), HdrMode::Hdr10);
+    settings.ai_rate = AiRate::Half;
+    let spec = ExportSpec {
+        info,
+        start: 4,
+        end: 28,
+        output: dir.path().join("dvd.mkv"),
+        settings,
+    };
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    let v = stream_entries(
+        &tools,
+        &spec.output,
+        "v:0",
+        "stream=r_frame_rate,sample_aspect_ratio,color_transfer,color_primaries,pix_fmt",
+    );
+    assert_eq!(
+        entry(&v, "r_frame_rate").as_deref(),
+        Some("30000/1001"),
+        "{v}"
+    );
+    assert_eq!(
+        entry(&v, "sample_aspect_ratio").as_deref(),
+        Some("32:27"),
+        "{v}"
+    );
+    assert_eq!(entry(&v, "color_transfer").as_deref(), Some("smpte2084"));
+    assert_eq!(entry(&v, "color_primaries").as_deref(), Some("bt2020"));
+    assert_eq!(entry(&v, "pix_fmt").as_deref(), Some("yuv420p10le"));
+}
+
+#[test]
+fn hdr_frames_deleted_after_export_when_set() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "del.mp4");
+    spec.settings.hdr_delete_frames_after = true;
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    assert!(!upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()).exists());
+    assert!(spec.job_dir().join("out").is_dir(), "out/ is never deleted");
+
+    let mut keep = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "keep.mp4");
+    keep.settings.hdr_delete_frames_after = false;
+    let log = run(&tools, &keep);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    assert!(upscaler_core::hdr::convert::hdr_dir(&keep.job_dir()).is_dir());
+}
+
+/// The encoder must apply nothing but RGB to YUV with the BT.2020 matrix, full to limited
+/// range: grey 16-bit PQ (100 nits) comes back as limited-range grey with the same code
+/// value, and a colour follows the BT.2020 non-constant-luminance matrix.
+#[test]
+fn hdr_encode_keeps_pq_code_values() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let frames = dir.path().join("hdr");
+    std::fs::create_dir_all(&frames).unwrap();
+    let v = upscaler_core::hdr::measure::nits_to_pq(100.0);
+    let code = (v * 65535.0).round() as u16;
+    let img = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_fn(64, 64, |x, _| {
+        if x < 32 {
+            image::Rgb([code, code, code])
+        } else {
+            image::Rgb([code, code / 4, code / 4])
+        }
+    });
+    for n in 1..=3 {
+        img.save(ffmpeg::frame_file(&frames, n)).unwrap();
+    }
+    let opts = ffmpeg::EncodeOptions {
+        in_fps_num: 24,
+        in_fps_den: 1,
+        interpolate_to: None,
+        anamorphic: None,
+        codec: upscaler_core::settings::VideoCodec::H265,
+        crf: 4,
+        audio_from: None,
+        hdr: Some(upscaler_core::hdr::HdrEncode {
+            mode: HdrMode::Hdr10,
+            peak_nits: 1000,
+            max_cll: 100,
+            max_fall: 100,
+            hdr10plus_json: None,
+        }),
+    };
+    let out = dir.path().join("grey.mkv");
+    ffmpeg::encode(
+        &tools,
+        &frames,
+        3,
+        &opts,
+        &out,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    let raw = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&out)
+        .args([
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv444p10le",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let plane = 64 * 64;
+    assert_eq!(raw.len(), plane * 3 * 2);
+    let at = |p: usize, x: usize, y: usize| {
+        let i = (p * plane + y * 64 + x) * 2;
+        u16::from_le_bytes([raw[i], raw[i + 1]]) as f64
+    };
+    let expect_y = 64.0 + 876.0 * v as f64;
+    let (y, cb, cr) = (at(0, 8, 32), at(1, 8, 32), at(2, 8, 32));
+    assert!((y - expect_y).abs() <= 4.0, "Y {y} expected {expect_y}");
+    assert!(
+        (cb - 512.0).abs() <= 4.0 && (cr - 512.0).abs() <= 4.0,
+        "{cb} {cr}"
+    );
+    let (r, g) = (code as f64 / 65535.0, code as f64 / 4.0 / 65535.0);
+    let b = g;
+    let ey = 0.2627 * r + 0.6780 * g + 0.0593 * b;
+    let (wy, wcb, wcr) = (
+        64.0 + 876.0 * ey,
+        512.0 + 896.0 * (b - ey) / 1.8814,
+        512.0 + 896.0 * (r - ey) / 1.4746,
+    );
+    let (y, cb, cr) = (at(0, 48, 32), at(1, 48, 32), at(2, 48, 32));
+    assert!((y - wy).abs() <= 6.0, "Y {y} vs {wy}");
+    assert!(
+        (cb - wcb).abs() <= 6.0 && (cr - wcr).abs() <= 6.0,
+        "chroma {cb} {cr} vs {wcb} {wcr}"
+    );
+}

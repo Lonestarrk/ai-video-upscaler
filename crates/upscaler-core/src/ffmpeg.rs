@@ -644,6 +644,8 @@ pub struct EncodeOptions {
     pub crf: u8,
     /// Audio: the source file and the range to cut from it.
     pub audio_from: Option<(PathBuf, f64, f64)>,
+    /// HDR output: the input is then 16-bit RGB PNG already in BT.2020 PQ/HLG code values.
+    pub hdr: Option<crate::hdr::HdrEncode>,
 }
 
 /// Encodes `frames_dir/%06d.png` to `out`, with audio copied from the source when it fits the
@@ -676,6 +678,18 @@ pub fn encode(
             cmd.args(["-map", "0:v:0"]);
         }
         let mut filters: Vec<String> = Vec::new();
+        if opts.hdr.is_some() {
+            // The frames already hold BT.2020 PQ/HLG code values: the only conversion is RGB
+            // to YUV with the BT.2020 non-constant-luminance matrix, full to limited range.
+            // Done first and explicitly, so no later automatic conversion assumes BT.601.
+            let mut f = String::from(
+                "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int",
+            );
+            if opts.interpolate_to.is_some() {
+                f.push_str(",format=yuv444p16le");
+            }
+            filters.push(f);
+        }
         if let Some((n, d)) = opts.interpolate_to {
             filters.push(format!(
                 "minterpolate=fps={n}/{d}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
@@ -684,18 +698,38 @@ pub fn encode(
         if let Some(((w, h), (n, d))) = opts.anamorphic {
             filters.push(format!("scale={w}:{h}:flags=lanczos,setsar={n}/{d}"));
         }
-        if !filters.is_empty() {
+        if let Some(h) = &opts.hdr {
+            filters.push("format=yuv420p10le".to_string());
             cmd.arg("-vf").arg(filters.join(","));
-        }
-        match opts.codec {
-            crate::settings::VideoCodec::H264 => {
-                cmd.args(["-c:v", "libx264", "-preset", "slow", "-profile:v", "high"]);
+            // HDR is always H.265 (H.264 has no usable HDR path here).
+            cmd.args(["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"]);
+            cmd.args(["-pix_fmt", "yuv420p10le"]);
+            cmd.args([
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                crate::hdr::transfer_name(h.mode),
+                "-colorspace",
+                "bt2020nc",
+                "-color_range",
+                "tv",
+            ]);
+            cmd.arg("-x265-params")
+                .arg(crate::hdr::x265_params(h, opts.crf));
+        } else {
+            if !filters.is_empty() {
+                cmd.arg("-vf").arg(filters.join(","));
             }
-            crate::settings::VideoCodec::H265 => {
-                cmd.args(["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"]);
+            match opts.codec {
+                crate::settings::VideoCodec::H264 => {
+                    cmd.args(["-c:v", "libx264", "-preset", "slow", "-profile:v", "high"]);
+                }
+                crate::settings::VideoCodec::H265 => {
+                    cmd.args(["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"]);
+                }
             }
+            cmd.args(["-crf", &opts.crf.to_string(), "-pix_fmt", "yuv420p"]);
         }
-        cmd.args(["-crf", &opts.crf.to_string(), "-pix_fmt", "yuv420p"]);
         if opts.audio_from.is_some() {
             cmd.args(["-c:a", audio_codec]);
             if audio_codec == "aac" {
