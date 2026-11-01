@@ -1,0 +1,255 @@
+//! The HDR conversion stage: `out/%06d.png` (SDR) to `hdr/%06d.png` (16-bit PQ or HLG),
+//! parallel over frames, cached by `hdr/settings.txt`.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+
+use anyhow::{bail, Context, Result};
+use image::{ImageBuffer, Rgb};
+
+use super::itm::Itm;
+use crate::settings::HdrMode;
+
+/// Bump when the curve or the encoding changes, so old conversions are redone.
+pub const HDR_VERSION: u32 = 1;
+pub const HDR_DIR: &str = "hdr";
+const SETTINGS_FILE: &str = "settings.txt";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrStatus {
+    Missing,
+    Converting,
+    Ready,
+}
+
+pub fn hdr_dir(job_dir: &Path) -> PathBuf {
+    job_dir.join(HDR_DIR)
+}
+
+fn settings_text(mode: HdrMode, peak_nits: u32) -> String {
+    format!(
+        "mode: {}\npeak: {peak_nits}\nversion: {HDR_VERSION}\n",
+        mode.name()
+    )
+}
+
+fn frame_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n:06}.png"))
+}
+
+fn all_present(dir: &Path, total: u64) -> bool {
+    (1..=total).all(|n| frame_path(dir, n).is_file())
+}
+
+/// Whether the job folder has converted frames: `Ready` when `settings.txt` exists and all
+/// `n` frames are there, `Converting` when only some are, otherwise `Missing`.
+pub fn hdr_status(job_dir: &Path, n: u64) -> HdrStatus {
+    let dir = hdr_dir(job_dir);
+    if !dir.join(SETTINGS_FILE).is_file() {
+        return HdrStatus::Missing;
+    }
+    if n > 0 && all_present(&dir, n) {
+        HdrStatus::Ready
+    } else {
+        HdrStatus::Converting
+    }
+}
+
+/// Converts frames `1..=total` of `out_dir` into `hdr_dir`. Does nothing when the folder was
+/// made with the same mode, peak and version and is complete; otherwise clears and redoes it.
+/// `progress` gets the number of frames done; stops with an error when `cancel` is set.
+pub fn convert(
+    out_dir: &Path,
+    hdr_dir: &Path,
+    total: u64,
+    mode: HdrMode,
+    peak_nits: u32,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<()> {
+    let want = settings_text(mode, peak_nits);
+    let have = std::fs::read_to_string(hdr_dir.join(SETTINGS_FILE)).ok();
+    if have.as_deref() == Some(want.as_str()) && all_present(hdr_dir, total) {
+        progress(total);
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(hdr_dir);
+    std::fs::create_dir_all(hdr_dir)?;
+    std::fs::write(hdr_dir.join(SETTINGS_FILE), &want)?;
+
+    let itm = Itm::new(mode, peak_nits);
+    let next = AtomicU64::new(1);
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .min(total.max(1) as usize);
+    let (tx, rx) = mpsc::channel::<Result<()>>();
+    let mut result = Ok(());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (itm, next) = (&itm, &next);
+            scope.spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let n = next.fetch_add(1, Ordering::Relaxed);
+                if n > total {
+                    return;
+                }
+                let r = convert_frame(itm, &frame_path(out_dir, n), &frame_path(hdr_dir, n));
+                let failed = r.is_err();
+                let _ = tx.send(r);
+                if failed {
+                    next.store(total + 1, Ordering::Relaxed);
+                    return;
+                }
+            });
+        }
+        drop(tx);
+        let mut done = 0;
+        for r in rx {
+            match r {
+                Ok(()) => {
+                    done += 1;
+                    progress(done);
+                }
+                Err(e) if result.is_ok() => result = Err(e),
+                Err(_) => {}
+            }
+        }
+    });
+    result?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+fn convert_frame(itm: &Itm, src: &Path, dst: &Path) -> Result<()> {
+    let img = image::open(src)
+        .with_context(|| format!("could not read frame {}", src.display()))?
+        .into_rgb16();
+    let (w, h) = img.dimensions();
+    let mut raw = Vec::with_capacity(img.as_raw().len());
+    for px in img.as_raw().chunks_exact(3) {
+        raw.extend_from_slice(&itm.pixel([px[0], px[1], px[2]]));
+    }
+    let out: ImageBuffer<Rgb<u16>, Vec<u16>> =
+        ImageBuffer::from_raw(w, h, raw).context("bad frame buffer")?;
+    // Written under a temporary name so a half-written frame never counts as done.
+    let tmp = dst.with_extension("tmp");
+    out.save_with_format(&tmp, image::ImageFormat::Png)
+        .with_context(|| format!("could not write {}", tmp.display()))?;
+    std::fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hdr::measure::{measure_frame, pq_to_nits};
+    use image::RgbImage;
+
+    fn write_sdr(dir: &Path, n: u64) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut img = RgbImage::new(4, 2);
+        for (i, p) in img.pixels_mut().enumerate() {
+            // pixel 0 white, pixel 1 mid grey (linear ~0.18), the rest dark
+            *p = match i {
+                0 => Rgb([255, 255, 255]),
+                1 => Rgb([118, 118, 118]),
+                _ => Rgb([60, 60, 60]),
+            };
+        }
+        img.save(frame_path(dir, n)).unwrap();
+    }
+
+    fn setup(total: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let (o, h) = (t.path().join("out"), t.path().join("hdr"));
+        for n in 1..=total {
+            write_sdr(&o, n);
+        }
+        (t, o, h)
+    }
+
+    fn run(o: &Path, h: &Path, total: u64, peak: u32) -> Result<()> {
+        convert(
+            o,
+            h,
+            total,
+            HdrMode::Hdr10,
+            peak,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+    }
+
+    #[test]
+    fn converts_to_16bit_pq() {
+        let (_t, o, h) = setup(3);
+        let mut last = 0;
+        convert(
+            &o,
+            &h,
+            3,
+            HdrMode::Hdr10,
+            1000,
+            &AtomicBool::new(false),
+            |d| last = d,
+        )
+        .unwrap();
+        assert_eq!(last, 3);
+        for n in 1..=3 {
+            let img = image::open(frame_path(&h, n)).unwrap();
+            assert!(matches!(img, image::DynamicImage::ImageRgb16(_)), "16-bit");
+            let img = img.into_rgb16();
+            let light = measure_frame(&img);
+            assert!(light.max_scl[1] >= 203.0, "white {:?}", light.max_scl);
+            let g = pq_to_nits(img.get_pixel(1, 0).0[1] as f32 / 65535.0);
+            let sdr = (118.0f32 / 255.0).powf(2.4) * 203.0;
+            assert!((g - sdr).abs() / sdr < 0.25, "{g} vs {sdr}");
+        }
+    }
+
+    fn mtimes(h: &Path, total: u64) -> Vec<std::time::SystemTime> {
+        (1..=total)
+            .map(|n| {
+                std::fs::metadata(frame_path(h, n))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_when_settings_match() {
+        let (t, o, h) = setup(3);
+        assert_eq!(hdr_status(t.path(), 3), HdrStatus::Missing);
+        run(&o, &h, 3, 1000).unwrap();
+        assert_eq!(hdr_status(t.path(), 3), HdrStatus::Ready);
+        let before = mtimes(&h, 3);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        run(&o, &h, 3, 1000).unwrap();
+        assert_eq!(before, mtimes(&h, 3));
+    }
+
+    #[test]
+    fn changed_peak_reconverts() {
+        let (_t, o, h) = setup(2);
+        run(&o, &h, 2, 1000).unwrap();
+        let a = measure_frame(&image::open(frame_path(&h, 1)).unwrap().into_rgb16());
+        run(&o, &h, 2, 4000).unwrap();
+        let b = measure_frame(&image::open(frame_path(&h, 1)).unwrap().into_rgb16());
+        assert!(b.max_scl[1] > a.max_scl[1] * 2.0, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn cancel_stops() {
+        let (_t, o, h) = setup(3);
+        let cancel = AtomicBool::new(true);
+        assert!(convert(&o, &h, 3, HdrMode::Hdr10, 1000, &cancel, |_| {}).is_err());
+    }
+}

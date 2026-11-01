@@ -595,6 +595,7 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 "Finding scene cuts and duplicates…",
             ),
             Stage::Upscaling => tr("Skalar upp bildrutor…", "Upscaling frames…"),
+            Stage::Hdr => tr("Konverterar till HDR…", "Converting to HDR…"),
             Stage::Encoding if x.audio_path => tr(
                 "Kodar videon (utan ljud, det görs sedan)…",
                 "Encoding the video (without audio, that comes next)…",

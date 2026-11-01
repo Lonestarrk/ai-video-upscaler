@@ -214,6 +214,8 @@ pub enum Stage {
     Extracting,
     Analysing,
     Upscaling,
+    /// SDR to HDR conversion of the finished frames (only when HDR output is on).
+    Hdr,
     Encoding,
     /// The audio job (5.1 / better quality); `done`/`total` count its sections.
     Audio,
@@ -530,6 +532,36 @@ fn export(
     };
     upscale_all(&plan, s, provider.as_ref(), cancel, emit)?;
     check(cancel)?;
+
+    // 3b. SDR to HDR (cached in `hdr/` by mode and peak, never touches `out/`). The encoder
+    // still reads `out/` until it is switched to the HDR frames.
+    if s.hdr_mode != crate::settings::HdrMode::Off {
+        emit(ExportEvent::Progress {
+            stage: Stage::Hdr,
+            done: 0,
+            total,
+        });
+        let r = crate::hdr::convert::convert(
+            &out_dir,
+            &crate::hdr::convert::hdr_dir(&dir),
+            total,
+            s.hdr_mode,
+            s.hdr_peak_nits,
+            cancel,
+            |f| {
+                emit(ExportEvent::Progress {
+                    stage: Stage::Hdr,
+                    done: f,
+                    total,
+                })
+            },
+        );
+        if let Err(e) = r {
+            check(cancel)?;
+            return Err(e);
+        }
+        check(cancel)?;
+    }
 
     // 4. Encode
     let info = &spec.info;
