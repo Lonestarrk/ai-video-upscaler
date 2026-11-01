@@ -117,7 +117,9 @@ Som standard kopieras ljudet oförändrat. Under *Ljud* i sidopanelen kan du i s
 | **AI (lokal, grafikkort)** | En AI-modell (BandIt Plus) delar upp ljudet i tal, musik och effekter. Talet hamnar i mitten (FC), musik och effekter i fram- och bakkanalerna, och basen från effekterna i LFE. Inget försvinner: det modellen inte kan placera ligger kvar fram. | ~25 s per minut ljud på grafikkortet, ~4 min per minut på processorn |
 | **Klassisk (utan AI)** | Appen delar upp ljudet i många små frekvensband och flyttar det som ligger mitt i stereobilden (oftast dialogen) till mitten och tar bort det från fram-höger/vänster; skillnaden mellan kanalerna går fördröjt bak. Fungerar på alla datorer, men skiljer inte tal från musik som ligger i mitten. | några sekunder per minut |
 
-Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Mono kan inte bli 5.1.
+Källan är redan 5.1: dess egna kanaler (och LFE) behålls, ingen uppmixning. Utan *Förbättra
+ljudkvaliteten* finns då inget att göra, så originalljudet kopieras som det är (MP4), precis som
+med *Oförändrat*. Mono kan inte bli 5.1.
 
 **Bas (LFE):** subwooferkanalen byggs av basen under 90 Hz och öppnar bara för bas som stiger över scenens jämna bakgrund (explosioner, nedslag, toppar i musiken). Ett jämnt motorbrus, som skeppets brum på bryggan, ger ingen LFE. Dialog öppnar den aldrig. Huvudkanalerna behåller all sin bas, så inget går förlorat om förstärkaren skickar basen till subwoofern ändå.
 

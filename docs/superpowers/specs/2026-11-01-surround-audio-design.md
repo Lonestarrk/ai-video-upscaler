@@ -3,6 +3,23 @@
 Datum: 2026-11-01. Underlag: ljudforskningsrapporten (`scratchpad/audio-research/report.md`,
 sammanfattad här där det behövs) och webbresearch om ljudtjänster samma dag.
 
+> **Ändrat efter bygget (2026-11-01), gäller före texten nedan där de skiljer sig:**
+> - *Klassisk* använder inte längre FFmpegs `surround`: appen gör en egen STFT-baserad
+>   mittextraktion (koherens, panorering och en Wiener-vikt per frekvensband) som lägger det
+>   som ligger mitt i stereobilden i C och tar bort det från L/R; Ls/Rs kommer från
+>   sidosignalen som i AI-vägen. Ingen latens att kompensera.
+> - **C skrivs +3 dB** (×√2) i båda vägarna, och invarianten är standardnedmixningen enligt ITU:
+>   `L = FL + 0,7071·C` (likaså R), som återskapar källan exakt.
+> - **LFE-grinden följer bakgrunden**: den öppnar för bas som stiger över scenens jämna
+>   bakgrund (rörligt fönster på 8 s, ingen fast tröskel), så jämnt brum och motorljud ger
+>   ingen LFE.
+> - **Kontrollen vid körning** är för alla vägar (AI, klassisk, 5.1-källa, stereo) en
+>   korskorrelation av nedmixningen mot källan (synk, ±1 sampel), plus ljudstyrka och true
+>   peak; nedmixningstestet med −35 dBFS-gränsen i *Kvalitetskontroll* gäller inte längre.
+> - Separerade stammar sparas per tidsintervall (nyckel utan LFE-nivå och motor), så en annan
+>   LFE-nivå separerar inte om. En 5.1-källa med 5.1 valt och utan förbättring behåller
+>   originalljudet (MP4), som *Oförändrat*.
+
 ## Varför
 
 Ägaren skalar upp gamla TV-serier (testfall: Star Trek Voyager S01E01, 1995) och tittar på

@@ -72,7 +72,8 @@ cargo fmt --all                            # run before committing
 
 Data: settings `%APPDATA%\AI Video Upscaler\settings.json`; log, previews, export jobs and
 downloaded FFmpeg in `%LOCALAPPDATA%\AI Video Upscaler\` (`upscaler.log`, `work\previews`,
-`work\jobs\<key>\{src,out}`, `work\tmp\<id>` per request, `tools\bin`).
+`work\jobs\<key>\{src,out}`, `work\audio\<key>` audio jobs and `work\audio\stems` the stem
+cache, `work\tmp\<id>` per request, `tools\bin`).
 
 ## How the pieces fit
 
@@ -116,13 +117,20 @@ Classic (Normal), bass with Biokänsla, bridge with enhancement only. Report and
   Sync: 0 samples against the app's extraction, 0–1 against a decode-from-start reference, for
   FLAC and AC-3. FLAC has exactly the video's samples; AC-3 is 0.1–0.6 frame longer.
 - MKV: FLAC 5.1 (default), AC-3 5.1, Original (copied, offset by its start time, 0.5 ms off).
-- Levels (AI): dialogue scene FC -32.4 dBFS vs FL -34.2, surrounds -47, LFE -81 (closed);
-  theme FC silent (no speech), surrounds -37; bass event LFE -52 RMS / -33 peak, Biokänsla
-  -49 / -30; mains keep all their bass (<120 Hz equal to the source). Classic puts FC about
-  1 dB under FL/FR even in dialogue (matrix steering) and its LFE is louder (-45 RMS).
+- Levels, measured after the Classic STFT centre extraction, FC at +3 dB (ITU downmix
+  `FL + 0.7071 FC = L`) and the background-relative LFE gate (AUDIO_VERSION 6; the Task 14
+  numbers before these changes are superseded): bridge scene speech band FC +6.9 dB over FL
+  with AI, +10.7 dB with Classic; bridge low/mid power sum original -10.22, AI -10.47,
+  Classic -11.17; bass event LFE peak -33.0 / RMS -51.9 (Normal), -29.5 / -48.8 (Biokänsla);
+  theme FC silent with AI (no speech); mains keep all their bass. Classic moves anything
+  centred (also centred music or effects) to FC.
 - Enhancement on this AC-3 source changes only >14 kHz, where the content is ~55 dB under the
   total: -3 dB at 14–16 kHz, +1.5–4 dB at 16–20 kHz. Practically inaudible here.
-- Not yet judged by ear on the receiver.
+- Owner's listening so far (AI files): dialogue sits in the centre, LFE Normal is the right
+  default, stereo enhancement "a little better". Classic after the centre rewrite not yet
+  judged on the receiver.
+- Separated stems are cached per range (`work\audio\stems\<key>\NNN\`, key without LFE level
+  or engine), so an LFE A/B re-places the stems instead of separating again.
 
 NOT verified against the real services (no accounts in the dev container). This is what to
 test first on the owner's Windows PC:
