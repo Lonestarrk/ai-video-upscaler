@@ -38,6 +38,16 @@ fn frame_path(dir: &Path, n: u64) -> PathBuf {
     dir.join(format!("{n:06}.png"))
 }
 
+/// True when `hdr` is missing or older than its SDR source `out`.
+fn is_stale(out: &Path, hdr: &Path) -> bool {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (modified(hdr), modified(out)) {
+        (Some(h), Some(o)) => o > h,
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
+}
+
 fn all_present(dir: &Path, total: u64) -> bool {
     (1..=total).all(|n| frame_path(dir, n).is_file())
 }
@@ -70,38 +80,50 @@ pub fn convert(
 ) -> Result<()> {
     let want = settings_text(mode, peak_nits);
     let have = std::fs::read_to_string(hdr_dir.join(SETTINGS_FILE)).ok();
-    if have.as_deref() == Some(want.as_str()) && all_present(hdr_dir, total) {
+    let todo: Vec<u64> = if have.as_deref() == Some(want.as_str()) {
+        // Same settings: only frames that are missing or whose SDR frame was made again
+        // (a rejected frame replaced in out/) since they were converted.
+        (1..=total)
+            .filter(|&n| is_stale(&frame_path(out_dir, n), &frame_path(hdr_dir, n)))
+            .collect()
+    } else {
+        let _ = std::fs::remove_dir_all(hdr_dir);
+        std::fs::create_dir_all(hdr_dir)?;
+        std::fs::write(hdr_dir.join(SETTINGS_FILE), &want)?;
+        (1..=total).collect()
+    };
+    let already = total - todo.len() as u64;
+    if todo.is_empty() {
         progress(total);
         return Ok(());
     }
-    let _ = std::fs::remove_dir_all(hdr_dir);
-    std::fs::create_dir_all(hdr_dir)?;
-    std::fs::write(hdr_dir.join(SETTINGS_FILE), &want)?;
 
     let itm = Itm::new(mode, peak_nits);
-    let next = AtomicU64::new(1);
+    let next = AtomicU64::new(0);
+    let count = todo.len() as u64;
     let workers = std::thread::available_parallelism()
         .map_or(2, |n| n.get())
-        .min(total.max(1) as usize);
+        .min(todo.len());
     let (tx, rx) = mpsc::channel::<Result<()>>();
     let mut result = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
-            let (itm, next) = (&itm, &next);
+            let (itm, next, todo) = (&itm, &next, &todo);
             scope.spawn(move || loop {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let n = next.fetch_add(1, Ordering::Relaxed);
-                if n > total {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
                     return;
                 }
+                let n = todo[i as usize];
                 let r = convert_frame(itm, &frame_path(out_dir, n), &frame_path(hdr_dir, n));
                 let failed = r.is_err();
                 let _ = tx.send(r);
                 if failed {
-                    next.store(total + 1, Ordering::Relaxed);
+                    next.store(count, Ordering::Relaxed);
                     return;
                 }
             });
@@ -112,7 +134,7 @@ pub fn convert(
             match r {
                 Ok(()) => {
                     done += 1;
-                    progress(done);
+                    progress(already + done);
                 }
                 Err(e) if result.is_ok() => result = Err(e),
                 Err(_) => {}
@@ -234,6 +256,25 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         run(&o, &h, 3, 1000).unwrap();
         assert_eq!(before, mtimes(&h, 3));
+    }
+
+    #[test]
+    fn replaced_sdr_frame_is_reconverted() {
+        let (_t, o, h) = setup(3);
+        run(&o, &h, 3, 1000).unwrap();
+        let before = mtimes(&h, 3);
+        let old2 = std::fs::read(frame_path(&h, 2)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // A different picture in out/2 (as when a rejected frame is made again).
+        RgbImage::from_pixel(4, 2, Rgb([20, 20, 20]))
+            .save(frame_path(&o, 2))
+            .unwrap();
+        run(&o, &h, 3, 1000).unwrap();
+        let after = mtimes(&h, 3);
+        assert_eq!(before[0], after[0]);
+        assert_eq!(before[2], after[2]);
+        assert_ne!(before[1], after[1]);
+        assert_ne!(old2, std::fs::read(frame_path(&h, 2)).unwrap());
     }
 
     #[test]
