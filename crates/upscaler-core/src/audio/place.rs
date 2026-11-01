@@ -151,7 +151,7 @@ mod tests {
             let down: Vec<f32> = zip2(&out.channel(front), &out.channel(2), |a, b| a + b);
             let diff = zip2(&down, &src.channel(other), |a, b| a - b);
             let res = rms_db(&diff);
-            assert!(res <= -30.0, "channel {front} residual {res} dBFS");
+            assert!(res <= -60.0, "channel {front} residual {res} dBFS");
         }
     }
 
@@ -163,7 +163,9 @@ mod tests {
         let silent = stereo(vec![0.0; n], vec![0.0; n]);
         let out = place(&effects, &silent, &silent, &effects, LfeLevel::Normal);
         let lfe = rms_db(mid(&out.channel(3)));
-        assert!(lfe > -40.0, "LFE at {lfe}");
+        assert!((-30.0..=-18.0).contains(&lfe), "LFE at {lfe}");
+        let expected = make_lfe(&effects.channel(0), LfeSource::Effects, LfeLevel::Normal, R);
+        assert_eq!(out.channel(3), expected);
     }
 
     #[test]
@@ -177,25 +179,88 @@ mod tests {
         assert_eq!(out.rate, RATE);
         assert_eq!(out.frames(), n);
         // Identical L/R music: no side signal, so no surround; FL = FR = src.
-        assert_eq!(out.channel(0), src.channel(0));
-        assert_eq!(out.channel(1), src.channel(1));
+        for c in 0..2 {
+            let worst = zip2(&out.channel(c), &src.channel(c), |a, b| (a - b).abs())
+                .into_iter()
+                .fold(0.0f32, f32::max);
+            assert!(worst <= 1e-6, "channel {c} differs by {worst}");
+        }
         assert!(rms_db(&out.channel(2)) <= -119.0);
         assert!(rms_db(&out.channel(4)) <= -100.0);
         assert!(rms_db(&out.channel(5)) <= -100.0);
     }
 
+    /// Music with R = -L: the mid is zero and the side signal is exactly `x`.
+    fn side_only(x: &[f32]) -> Pcm {
+        stereo(x.to_vec(), x.iter().map(|v| -v).collect())
+    }
+
+    fn silent(n: usize) -> Pcm {
+        stereo(vec![0.0; n], vec![0.0; n])
+    }
+
+    fn correlation(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let ea: f32 = a.iter().map(|x| x * x).sum();
+        let eb: f32 = b.iter().map(|x| x * x).sum();
+        dot / (ea * eb).sqrt()
+    }
+
     #[test]
-    fn surrounds_get_delayed_side_signal() {
+    fn surround_level_is_minus_3_db_of_banded_side() {
         let n = 96_000;
-        let l = noise(n, 21, 0.2);
-        let r = noise(n, 22, 0.2);
-        let src = stereo(l, r);
-        let silent = stereo(vec![0.0; n], vec![0.0; n]);
-        let out = place(&src, &silent, &src, &silent, LfeLevel::Normal);
-        let sl = out.channel(4);
+        let x = noise(n, 21, 0.3);
+        let music = side_only(&x);
+        let out = place(&music, &silent(n), &music, &silent(n), LfeLevel::Normal);
+        let reference = rms_db(mid(&band(&x, 100.0, 7000.0, R)));
+        for c in [4, 5] {
+            let diff = rms_db(mid(&out.channel(c))) - reference;
+            assert!((diff + 3.0).abs() <= 0.5, "channel {c}: {diff} dB, want -3");
+        }
+    }
+
+    #[test]
+    fn surrounds_are_delayed_15_ms() {
+        let n = 96_000;
         let delay_samples = (0.015 * R).round() as usize;
-        assert!(rms_db(&sl[..delay_samples / 2]) <= -100.0);
-        assert!(rms_db(mid(&sl)) > -40.0);
+        assert_eq!(delay_samples, 720);
+        // Noise burst in the middle of silence.
+        let mut x = vec![0.0f32; n];
+        let burst = noise(4_000, 41, 0.4);
+        x[30_000..34_000].copy_from_slice(&burst);
+        let music = side_only(&x);
+        let out = place(&music, &silent(n), &music, &silent(n), LfeLevel::Normal);
+        let banded = band(&x, 100.0, 7000.0, R);
+        for (c, seed) in [(4, 1u32), (5, 2)] {
+            // The all-pass decorrelator is linear and time-invariant, so the
+            // expected output is the same filter applied to the undelayed band.
+            let reference = decorrelate(&banded, seed);
+            let ch = out.channel(c);
+            assert!(rms_db(&ch[..delay_samples]) <= -100.0, "channel {c} early");
+            let window = 30_000..34_000;
+            let peak = (0..2_000usize)
+                .map(|lag| {
+                    let shifted = &ch[window.start + lag..window.end + lag];
+                    (lag, correlation(&reference[window.clone()], shifted).abs())
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0;
+            assert!(
+                (peak as i64 - delay_samples as i64).abs() <= 2,
+                "channel {c} peak at lag {peak}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounds_are_decorrelated_from_each_other() {
+        let n = 96_000;
+        let x = noise(n, 51, 0.3);
+        let music = side_only(&x);
+        let out = place(&music, &silent(n), &music, &silent(n), LfeLevel::Normal);
+        let rho = correlation(mid(&out.channel(4)), mid(&out.channel(5)));
+        assert!(rho.abs() < 0.3, "SL/SR correlation {rho}");
     }
 
     #[test]
@@ -216,5 +281,12 @@ mod tests {
         );
         assert_eq!(out.channels, 6);
         assert_eq!(out.frames(), n);
+        assert!(out.samples.iter().all(|v| v.is_finite()));
+        // Past the end of the stems they are silence: FL + FC is the source again.
+        let (fl, fc) = (out.channel(0), out.channel(2));
+        for i in n - 5..n {
+            let d = (fl[i] + fc[i] - v[i]).abs();
+            assert!(d <= 1e-6, "sample {i} differs by {d}");
+        }
     }
 }
