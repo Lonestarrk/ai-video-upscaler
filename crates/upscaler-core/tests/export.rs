@@ -3,7 +3,7 @@
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use upscaler_core::ffmpeg::{self, Tools};
 use upscaler_core::job::{self, ExportEvent, ExportSpec};
@@ -41,7 +41,21 @@ fn make_video(tools: &Tools, path: &Path) {
     assert!(status.success());
 }
 
+/// Points the AI audio pack at an empty folder for the whole test binary, once, so no test
+/// ever sees the pack installed on this machine. Every export in this file goes through it.
+fn no_audio_pack() -> &'static Path {
+    static EMPTY: OnceLock<tempfile::TempDir> = OnceLock::new();
+    EMPTY
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var(upscaler_core::audio::pack::DIR_ENV, dir.path());
+            dir
+        })
+        .path()
+}
+
 fn run(tools: &Tools, spec: &ExportSpec) -> Vec<String> {
+    no_audio_pack();
     let log = Mutex::new(Vec::new());
     job::run_export(tools, spec, &AtomicBool::new(false), &|e| {
         let line = match &e {
@@ -314,13 +328,18 @@ fn dvd_source_is_frame_accurate_and_widescreen() {
 
 // ---------------------------------------------------------------- surround audio export
 
-/// A 4 s 30000/1001 clip (160x90) with Swedish-tagged stereo AC-3 audio.
+/// A 4 s 30000/1001 clip (160x90) with Swedish-tagged stereo AC-3 audio. The audio is a
+/// different rising tone in each channel: never periodic, so tracks can be lined up by
+/// cross-correlation.
 fn make_ntsc_clip(tools: &Tools, path: &Path) {
     let status = std::process::Command::new(&tools.ffmpeg)
         .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
         .arg("testsrc2=size=160x90:rate=30000/1001:duration=4")
         .args(["-f", "lavfi", "-i"])
-        .arg("sine=frequency=440:sample_rate=48000:duration=4,aformat=channel_layouts=stereo")
+        .arg(
+            "aevalsrc=0.4*sin(2*PI*(150*t+400*t*t))|0.4*sin(2*PI*(230*t+300*t*t))\
+             :s=48000:d=4,aformat=channel_layouts=stereo",
+        )
         .args([
             "-c:v",
             "libx264",
@@ -371,6 +390,50 @@ fn decoded_samples(tools: &Tools, path: &Path, index: usize) -> u64 {
     out.stdout.len() as u64 / 2
 }
 
+/// The front-left channel of audio stream `index`, decoded at 48 kHz.
+fn decoded_front_left(tools: &Tools, path: &Path, index: usize) -> Vec<f32> {
+    let out = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", &format!("0:a:{index}"), "-af", "pan=mono|c0=FL"])
+        .args(["-ar", "48000", "-f", "f32le", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    out.stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// The lag `l` (within ±`max`) at which `b[n + l]` matches `a[n]` best, over 0.5 s of `a`
+/// from 0.1 s on.
+fn best_lag(a: &[f32], b: &[f32], max: i64) -> i64 {
+    let (from, len) = (4800usize, 24000usize);
+    assert!(a.len() >= from + len, "too short: {}", a.len());
+    let score = |l: i64| {
+        let (mut dot, mut eb) = (0.0f64, 0.0f64);
+        for n in from..from + len {
+            let j = n as i64 + l;
+            if j >= 0 && (j as usize) < b.len() {
+                let y = b[j as usize] as f64;
+                dot += a[n] as f64 * y;
+                eb += y * y;
+            }
+        }
+        dot / eb.sqrt().max(1e-9)
+    };
+    (-max..=max)
+        .max_by(|x, y| score(*x).total_cmp(&score(*y)))
+        .unwrap()
+}
+
+/// `start_time` of stream `select` in seconds.
+fn start_time(tools: &Tools, path: &Path, select: &str) -> f64 {
+    let s = stream_entries(tools, path, select, "stream=start_time");
+    entry(&s, "start_time").unwrap().parse().unwrap()
+}
+
 /// Video frames in `path`, counted.
 fn video_frames(tools: &Tools, path: &Path) -> u64 {
     let out = std::process::Command::new(&tools.ffprobe)
@@ -402,6 +465,7 @@ fn surround_settings(work: &Path) -> Settings {
 
 /// Runs an export and returns every event in a readable form.
 fn run_events(tools: &Tools, spec: &ExportSpec) -> Vec<String> {
+    no_audio_pack();
     let log = Mutex::new(Vec::new());
     job::run_export(tools, spec, &AtomicBool::new(false), &|e| {
         let line = match &e {
@@ -497,6 +561,20 @@ fn audio_matches_video_length() {
         (n - video).abs() <= frame + 1536,
         "original: {n} samples, video {video}"
     );
+    // The original sits where the FLAC (cut sample-exact from the same range) sits, within
+    // one of its own frames: its content offset plus its start time against the FLAC's.
+    let flac = decoded_front_left(&tools, &spec.output, 0);
+    let orig = decoded_front_left(&tools, &spec.output, 2);
+    let lag = best_lag(&flac, &orig, 4000);
+    let starts = start_time(&tools, &spec.output, "a:2") - start_time(&tools, &spec.output, "a:0");
+    // FLAC sample n plays at its start + n; the matching original sample n + lag at the
+    // original's start + n + lag.
+    let offset = starts * 48000.0 + lag as f64;
+    assert!(
+        offset.abs() <= 1536.0,
+        "original placed {offset} samples off (lag {lag}, start difference {starts} s)"
+    );
+    assert!(!dir.path().join("out.part.mkv").exists());
 }
 
 #[test]
@@ -544,6 +622,37 @@ fn surround_export_has_three_tracks() {
     assert_eq!(entry(&orig, "TAG:title").as_deref(), Some("Original"));
     assert_eq!(entry(&orig, "TAG:language").as_deref(), Some("swe"));
     assert!(stream_entries(&tools, &spec.output, "4", "stream=index").is_empty());
+    // The AC-3 lines up with the FLAC sample for sample (the encoder's priming is removed).
+    let flac = decoded_front_left(&tools, &spec.output, 0);
+    let ac3 = decoded_front_left(&tools, &spec.output, 1);
+    let lag = best_lag(&flac, &ac3, 600);
+    assert!(lag.abs() <= 2, "AC-3 is {lag} samples off the FLAC");
+}
+
+/// `film.mkv` exported as `film.mp4` with new audio would be written over the source.
+#[test]
+fn new_audio_never_overwrites_the_source() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("film.mkv");
+    make_ntsc_clip(&tools, &src);
+    let before = std::fs::read(&src).unwrap();
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let spec = ExportSpec {
+        info,
+        start: 0,
+        end: 10,
+        output: dir.path().join("film.mp4"),
+        settings: surround_settings(&dir.path().join("work")),
+    };
+    let log = run_events(&tools, &spec);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].contains("source video"), "{log:?}");
+    assert!(!spec.job_dir().join(job::INPUT_DIR).exists());
+    assert_eq!(std::fs::read(&src).unwrap(), before);
 }
 
 #[test]
@@ -672,6 +781,7 @@ fn mux_stereo_flac_first_and_no_pcm() {
     assert_eq!(decoded_samples(&tools, &out, 1), 96000);
     assert!(stream_entries(&tools, &out, "a:2", "stream=index").is_empty());
     assert!(!out.with_extension("original.part.mka").exists());
+    assert!(!out.with_extension("part.mkv").exists());
 }
 
 #[test]
@@ -681,10 +791,7 @@ fn missing_pack_fails_before_frames() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let empty_pack = dir.path().join("no-pack");
-    std::fs::create_dir_all(&empty_pack).unwrap();
-    // Never the real pack of this machine.
-    std::env::set_var(upscaler_core::audio::pack::DIR_ENV, &empty_pack);
+    // run_events points the pack at an empty folder: never the real pack of this machine.
     let src = dir.path().join("ntsc.mkv");
     make_ntsc_clip(&tools, &src);
     let info = ffmpeg::probe(&tools, &src).unwrap();

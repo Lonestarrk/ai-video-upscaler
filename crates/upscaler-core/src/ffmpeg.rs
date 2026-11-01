@@ -772,13 +772,17 @@ fn cut_original(
     cancel: &AtomicBool,
 ) -> Result<()> {
     let mut cmd = tools.ffmpeg_cmd();
-    // Output-side seeking: with stream copy it only reads packets, and it keeps the
-    // sub-frame position of the first kept packet in its timestamp.
+    // Two-stage seek: a fast input seek to 30 s before the range, then output-side seeking
+    // for the rest, which with stream copy drops whole packets and keeps the sub-frame
+    // position of the first kept one in its timestamp (and when encoding cuts sample-exact).
+    let coarse = (start - 30.0).max(0.0);
     cmd.arg("-y")
+        .arg("-ss")
+        .arg(format!("{coarse:.6}"))
         .arg("-i")
         .arg(src)
         .arg("-ss")
-        .arg(format!("{start:.6}"))
+        .arg(format!("{:.6}", start - coarse))
         .arg("-t")
         .arg(format!("{dur:.6}"))
         .args(["-map", "0:a:0", "-vn", "-sn", "-dn"])
@@ -799,7 +803,13 @@ fn cut_original(
 /// `original` is `(source file, start s, duration s)`. Every stream is cut to the video's
 /// length (`duration`, or the probed length of `video` without an original): stream copy
 /// cuts on packets, so a copied track may differ from the video's length by up to one of
-/// its own frames (AC-3: 1536 samples, 32 ms; the original by one at each end).
+/// its own frames (AC-3: 1536 samples, 32 ms; the original by one at each end). The AC-3
+/// track can therefore end up to 32 ms after the video, which is less than a frame at 30 fps
+/// but up to two frames at 50/60 fps.
+///
+/// The MKV is written as `<out minus extension>.part.mkv` and renamed to `out` only when
+/// complete, so a cancel or failure never leaves a partial file at `out` nor replaces a file
+/// that was there.
 pub fn mux(
     tools: &Tools,
     video: &Path,
@@ -830,6 +840,7 @@ pub fn mux(
         })
         .collect();
 
+    let part = out.with_extension("part.mkv");
     let orig_file = out.with_extension("original.part.mka");
     let mut language = None;
     if let Some((src, start, dur)) = &original {
@@ -877,9 +888,14 @@ pub fn mux(
         }
     }
     cmd.args(["-f", "matroska", "-progress", "pipe:1", "-nostats"])
-        .arg(out);
-    let result = run_with_progress(cmd, cancel, |_| {});
+        .arg(&part);
+    let result = run_with_progress(cmd, cancel, |_| {}).and_then(|()| {
+        std::fs::rename(&part, out).with_context(|| format!("could not write {}", out.display()))
+    });
     let _ = std::fs::remove_file(&orig_file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
     result
 }
 

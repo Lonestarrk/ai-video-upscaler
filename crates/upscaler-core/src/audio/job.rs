@@ -44,7 +44,9 @@ use crate::process::{self, is_cancelled, Cancelled};
 use crate::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
 /// Bumped whenever the job's output for the same inputs changes; part of the cache key.
-pub const AUDIO_VERSION: u32 = 1;
+pub const AUDIO_VERSION: u32 = 2;
+/// Frames of silence the AC-3 encoder puts in front of the signal (one block).
+const AC3_PRIMING: usize = 256;
 /// Channel layout of every 5.1 track: FL FR FC LFE SL SR.
 pub const LAYOUT_51: &str = "5.1(side)";
 /// AC-3 dialogue normalisation when the source has none (the AC-3 default).
@@ -792,11 +794,18 @@ impl Job<'_> {
                 AudioCodec::Flac24,
             ));
         }
+        // The AC-3 encoder puts AC3_PRIMING frames of silence in front of the signal and
+        // nothing in the stream says so: it gets the signal without its first frames and
+        // silence at the end instead, so decoded it lines up with the FLAC sample for sample
+        // and keeps its length.
         let mut encoders = Vec::new();
         for (_, part, codec) in &outputs {
-            encoders.push(encode_stream_filtered(
-                self.tools, ch, layout, *codec, filter, part, cancel,
-            )?);
+            let skip = match codec {
+                AudioCodec::Ac3At640 { .. } => AC3_PRIMING,
+                _ => 0,
+            };
+            let enc = encode_stream_filtered(self.tools, ch, layout, *codec, filter, part, cancel)?;
+            encoders.push((enc, skip));
         }
         let gain = 10f32.powf(gain_db as f32 / 20.0);
         let mut scaled = Vec::new();
@@ -809,8 +818,12 @@ impl Job<'_> {
                     scaled.extend(chunk.iter().map(|v| v * gain));
                     &scaled[..]
                 };
-                for e in encoders.iter_mut() {
-                    e.write(data)?;
+                for (e, skip) in encoders.iter_mut() {
+                    let drop = (*skip).min(data.len() / ch);
+                    *skip -= drop;
+                    if drop * ch < data.len() {
+                        e.write(&data[drop * ch..])?;
+                    }
                 }
             }
             Ok(())
@@ -818,7 +831,15 @@ impl Job<'_> {
         if ch == 6 {
             emit(AudioEvent::Stage(AudioStage::Encoding));
         }
-        for e in encoders {
+        for ((mut e, skip), (_, _, codec)) in encoders.into_iter().zip(&outputs) {
+            // As much silence as was dropped (less when the whole signal was shorter).
+            let padding = match codec {
+                AudioCodec::Ac3At640 { .. } => AC3_PRIMING - skip,
+                _ => 0,
+            };
+            if padding > 0 {
+                e.write(&vec![0.0; padding * ch])?;
+            }
             e.finish()?;
         }
         let mut tracks = Vec::new();

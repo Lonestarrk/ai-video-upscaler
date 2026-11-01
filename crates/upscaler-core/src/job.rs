@@ -394,6 +394,26 @@ fn video_key(opts: &EncodeOptions, total: u64, frames: impl Iterator<Item = Path
 pub const VIDEO_FILE: &str = "video.mkv";
 const VIDEO_DONE: &str = "video.done";
 
+/// The new-audio path writes `spec.output` with the extension `.mkv`, a file the user may not
+/// have chosen: refuses when that is the source video itself (`film.mkv` exported as
+/// `film.mp4`).
+fn check_mkv_output(spec: &ExportSpec) -> Result<()> {
+    let output = spec.output.with_extension("mkv");
+    if let (Ok(out), Ok(src)) = (
+        std::fs::canonicalize(&output),
+        std::fs::canonicalize(&spec.info.path),
+    ) {
+        if out == src {
+            bail!(
+                "The export with new audio is saved as {}, which is the source video. \
+                 Choose another name or folder.",
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn export(
     tools: &Tools,
     spec: &ExportSpec,
@@ -401,6 +421,9 @@ fn export(
     emit: &(dyn Fn(ExportEvent) + Sync),
 ) -> Result<PathBuf> {
     let audio = prepare_audio(tools, spec, emit)?;
+    if audio.is_some() {
+        check_mkv_output(spec)?;
+    }
     let dir = spec.job_dir();
     let src_dir = dir.join(INPUT_DIR);
     let out_dir = dir.join(OUTPUT_DIR);
