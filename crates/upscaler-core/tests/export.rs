@@ -784,6 +784,65 @@ fn mux_stereo_flac_first_and_no_pcm() {
     assert!(!out.with_extension("part.mkv").exists());
 }
 
+/// A mux that fails after ffmpeg has created its output leaves neither a `.part.mkv` nor a
+/// changed file at `out`. The failure: a track Matroska cannot hold (ADPCM IMA QT has no
+/// codec tag there), which ffmpeg only notices when it writes the header.
+#[test]
+fn failed_mux_leaves_out_untouched() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ff = |args: &[&str], out: &Path| {
+        let ok = std::process::Command::new(&tools.ffmpeg)
+            .args(["-y", "-loglevel", "error"])
+            .args(args)
+            .arg(out)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    };
+    let video = dir.path().join("video.mkv");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=25:duration=1",
+            "-c:v",
+            "libx264",
+        ],
+        &video,
+    );
+    let bad = dir.path().join("bad.mov");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=1",
+            "-c:a",
+            "adpcm_ima_qt",
+        ],
+        &bad,
+    );
+    let out = dir.path().join("out.mkv");
+    let before = b"the user's own file".to_vec();
+    std::fs::write(&out, &before).unwrap();
+    let result = ffmpeg::mux(
+        &tools,
+        &video,
+        &[upscaler_core::audio::job::AudioTrack::FlacStereo(bad)],
+        None,
+        &out,
+        &AtomicBool::new(false),
+    );
+    assert!(result.is_err(), "the mux must fail");
+    assert!(!out.with_extension("part.mkv").exists());
+    assert_eq!(std::fs::read(&out).unwrap(), before);
+}
+
 #[test]
 fn missing_pack_fails_before_frames() {
     let Some(tools) = Tools::locate("") else {
