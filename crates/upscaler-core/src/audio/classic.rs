@@ -37,9 +37,11 @@
 //!   still puts the real bridge scene's dialogue about 8 dB above FL/FR; β = 0 gives 25 dB and
 //!   13 dB on the test and about 10 dB on the bridge.
 //!
-//! `C = m · (L + R) / 2`, and the fronts are `FL = L − C`, `FR = R − C` in the time domain, so
-//! `FL + FC = L` and `FR + FC = R` hold to float rounding whatever the mask does (the same
-//! invariant as [`super::place::place`]): a receiver that folds the centre back loses nothing.
+//! `C = m · (L + R) / 2`, the fronts are `FL = L − C`, `FR = R − C` in the time domain, and
+//! FC is `√2 · C` (+3 dB: one real centre speaker in place of the two-speaker phantom
+//! centre, the ITU convention). So the standard downmix `FL + 0.7071·FC = L` and
+//! `FR + 0.7071·FC = R` holds to float rounding whatever the mask does (the same invariant as
+//! [`super::place::place`]): a receiver that folds the centre back loses nothing.
 //!
 //! The extraction runs over the full band. Dialogue sibilance reaches past 8 kHz and would
 //! otherwise stay in the fronts, split from the voice; centred bass in FC is normal in a film
@@ -61,6 +63,7 @@ use rustfft::FftPlanner;
 use super::dsp::{band, db_to_gain, decorrelate, delay};
 use super::io::{Pcm, RATE};
 use super::lfe::{make_lfe, LfeSource};
+use super::place::CENTRE_GAIN;
 use crate::process::Cancelled;
 use crate::settings::LfeLevel;
 
@@ -92,10 +95,11 @@ pub fn upmix_classic(src: &Pcm, level: LfeLevel, cancel: &AtomicBool) -> Result<
         bail!("classic 5.1 needs a 48 kHz stereo file");
     }
     let (l, r) = (src.channel(0), src.channel(1));
-    let fc = centre(&l, &r, &[], cancel)?.remove(0);
+    let c = centre(&l, &r, &[], cancel)?.remove(0);
     let n = l.len();
-    let fl: Vec<f32> = (0..n).map(|i| l[i] - fc[i]).collect();
-    let fr: Vec<f32> = (0..n).map(|i| r[i] - fc[i]).collect();
+    let fl: Vec<f32> = (0..n).map(|i| l[i] - c[i]).collect();
+    let fr: Vec<f32> = (0..n).map(|i| r[i] - c[i]).collect();
+    let fc: Vec<f32> = c.iter().map(|v| v * CENTRE_GAIN).collect();
     let rate = RATE as f32;
     let mono: Vec<f32> = (0..n).map(|i| 0.5 * (l[i] + r[i])).collect();
     let lfe = make_lfe(&mono, LfeSource::MonoSum, level, rate);
@@ -300,6 +304,7 @@ pub(crate) fn centre(
 mod tests {
     use super::*;
     use crate::audio::dsp::rms_db;
+    use crate::audio::place::DOWNMIX_FC;
 
     /// Film dialogue sits around -27 dBFS RMS (the AC-3 dialnorm default).
     const LEVEL: f32 = 0.5;
@@ -367,9 +372,14 @@ mod tests {
         assert!(rms_db(&fc) > rms_db(&src.channel(0)) - 10.0, "centre empty");
         for c in 0..2 {
             let s = src.channel(c);
-            let down: Vec<f32> = out.channel(c).iter().zip(&fc).map(|(a, b)| a + b).collect();
+            let down: Vec<f32> = out
+                .channel(c)
+                .iter()
+                .zip(&fc)
+                .map(|(a, b)| a + DOWNMIX_FC * b)
+                .collect();
             let res = rms_db(&sub(&down, &s)) - rms_db(&s);
-            eprintln!("channel {c}: FL/FR + FC vs source residual {res:.1} dB");
+            eprintln!("channel {c}: FL/FR + 0.7071 FC vs source residual {res:.1} dB");
             assert!(res <= -40.0, "channel {c} residual {res} dB");
         }
     }

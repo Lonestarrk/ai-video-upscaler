@@ -45,7 +45,7 @@ use crate::process::{self, is_cancelled, Cancelled};
 use crate::settings::{AudioMode, LfeLevel, Settings, SurroundEngine};
 
 /// Bumped whenever the job's output for the same inputs changes; part of the cache key.
-pub const AUDIO_VERSION: u32 = 4;
+pub const AUDIO_VERSION: u32 = 5;
 /// Frames of silence the AC-3 encoder puts in front of the signal (one block).
 const AC3_PRIMING: usize = 256;
 /// Channel layout of every 5.1 track: FL FR FC LFE SL SR.
@@ -1475,11 +1475,16 @@ mod tests {
         let out = stitched(&job);
         assert_eq!(out.len() as u64, total * 6);
         assert!(out.iter().all(|v| v.is_finite()));
-        // FL + FC is the source's left channel (placement loses nothing), across the joins.
+        // The ITU downmix FL + 0.7071 FC is the source's left channel (placement loses
+        // nothing), across the joins.
+        let fc = crate::audio::place::DOWNMIX_FC;
         let worst = (0..total as usize)
-            .map(|i| (out[6 * i] + out[6 * i + 2] - src.samples[2 * i]).abs())
+            .map(|i| (out[6 * i] + fc * out[6 * i + 2] - src.samples[2 * i]).abs())
             .fold(0.0f32, f32::max);
-        assert!(worst < 1e-3, "FL + FC differs from the source by {worst}");
+        assert!(
+            worst < 1e-3,
+            "FL + 0.7071 FC differs from the source by {worst}"
+        );
     }
 
     #[test]

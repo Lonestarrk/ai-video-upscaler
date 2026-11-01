@@ -7,6 +7,15 @@ use super::lfe::{make_lfe, LfeSource};
 use crate::settings::LfeLevel;
 
 const CENTRE_HIGHPASS_HZ: f32 = 70.0;
+/// FC is written +3 dB (x sqrt 2) over the centre share taken from the fronts,
+/// the ITU convention: a stereo phantom centre plays from two speakers, so one
+/// real centre speaker needs +3 dB to sound as loud. The standard downmix
+/// `L = FL + 0.7071 * FC` then rebuilds the source exactly. Shared with the
+/// classic path.
+pub(crate) const CENTRE_GAIN: f32 = std::f32::consts::SQRT_2;
+/// The ITU downmix coefficient for FC (-3 dB), `1 / CENTRE_GAIN`.
+#[cfg(test)]
+pub(crate) const DOWNMIX_FC: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const SURROUND_GAIN_DB: f32 = -3.0;
 const SURROUND_DELAY_S: f32 = 0.015;
 const SURROUND_BAND: (f32, f32) = (100.0, 7000.0);
@@ -29,10 +38,11 @@ fn zip2(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> Vec<f32> {
 /// this is asserted. Stems shorter than `src` are padded with silence, longer
 /// ones are trimmed.
 ///
-/// Speech goes to FC (high-passed at 70 Hz, amplitude 1); the sub-70 Hz part
-/// of the speech mono and the side part of the speech stay in FL/FR, so
-/// FL + FC reconstructs the source's left channel exactly (before the
-/// surrounds), including anything the separation left in the residual.
+/// Speech goes to FC (high-passed at 70 Hz, written at +3 dB, see
+/// [`CENTRE_GAIN`]); the sub-70 Hz part of the speech mono and the side part
+/// of the speech stay in FL/FR, so the ITU downmix FL + 0.7071 FC
+/// reconstructs the source's left channel exactly (before the surrounds),
+/// including anything the separation left in the residual.
 pub fn place(src: &Pcm, speech: &Pcm, music: &Pcm, effects: &Pcm, level: LfeLevel) -> Pcm {
     assert!(
         [src, speech, music, effects]
@@ -54,8 +64,9 @@ pub fn place(src: &Pcm, speech: &Pcm, music: &Pcm, effects: &Pcm, level: LfeLeve
     let (rl, rr) = (res(&sl, &spl, &ml, &el), res(&sr, &spr, &mr, &er));
 
     let mono_speech = zip2(&spl, &spr, |a, b| (a + b) * 0.5);
-    let fc = zero_phase(&mono_speech, |s| lr4_highpass(s, CENTRE_HIGHPASS_HZ, rate));
-    let low: Vec<f32> = zip2(&mono_speech, &fc, |m, c| m - c);
+    let centre = zero_phase(&mono_speech, |s| lr4_highpass(s, CENTRE_HIGHPASS_HZ, rate));
+    let low: Vec<f32> = zip2(&mono_speech, &centre, |m, c| m - c);
+    let fc: Vec<f32> = centre.iter().map(|c| c * CENTRE_GAIN).collect();
 
     let front = |m: &[f32], e: &[f32], r: &[f32], sp: &[f32]| -> Vec<f32> {
         (0..n)
@@ -148,7 +159,9 @@ mod tests {
             LfeLevel::Normal,
         );
         for (front, other) in [(0, 0), (1, 1)] {
-            let down: Vec<f32> = zip2(&out.channel(front), &out.channel(2), |a, b| a + b);
+            let down: Vec<f32> = zip2(&out.channel(front), &out.channel(2), |a, b| {
+                a + DOWNMIX_FC * b
+            });
             let diff = zip2(&down, &src.channel(other), |a, b| a - b);
             let res = rms_db(&diff);
             assert!(res <= -60.0, "channel {front} residual {res} dBFS");
@@ -286,10 +299,10 @@ mod tests {
         assert_eq!(out.channels, 6);
         assert_eq!(out.frames(), n);
         assert!(out.samples.iter().all(|v| v.is_finite()));
-        // Past the end of the stems they are silence: FL + FC is the source again.
+        // Past the end of the stems they are silence: FL + 0.7071 FC is the source again.
         let (fl, fc) = (out.channel(0), out.channel(2));
         for i in n - 5..n {
-            let d = (fl[i] + fc[i] - v[i]).abs();
+            let d = (fl[i] + DOWNMIX_FC * fc[i] - v[i]).abs();
             assert!(d <= 1e-6, "sample {i} differs by {d}");
         }
     }
