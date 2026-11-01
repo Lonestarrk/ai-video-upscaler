@@ -276,4 +276,62 @@
 
 ## Spike findings
 
-(Filled in by Task 8 Step 1.)
+Task 8 Step 1, measured 2026-11-01 on the owner's PC (Windows 11 Pro 26200, RX 7900 XTX 24 GB,
+Adrenalin driver 32.0.31041.1004 of 2026-08-17, 20 logical CPU cores).
+
+- **ROCm PyTorch on Windows works on the 7900 XTX:** `torch 2.9.1+rocm7.2.1`,
+  `torch.cuda.is_available() == True`, `get_device_name(0) == "AMD Radeon RX 7900 XTX"`. No
+  WSL2, no DirectML.
+- **Python must be 3.12, not 3.11:** AMD's wheels are `cp312` only. Embeddable
+  `https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip` (3.12.10 is the last
+  3.12 release with Windows binaries); `python312._pth` gets `import site`; pip from
+  `https://bootstrap.pypa.io/get-pip.py`.
+- **AMD wheels** (newest release on `https://repo.radeon.com/rocm/windows/`, docs
+  `https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/windows/install-pytorch.html`,
+  needs driver 26.2.2 or newer), base `https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/`:
+  1. SDK: `rocm_sdk_core-7.2.1-py3-none-win_amd64.whl` (645 MB),
+     `rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl`, `rocm-7.2.1.tar.gz` (an sdist: needs
+     `setuptools` first, which the embeddable Python lacks). AMD's guide also lists
+     `rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl` (233 MB, 1.2 GB unpacked); torch runs without it
+     (GPU separation verified after uninstalling it), so the pack skips it.
+  2. Then `torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl` (821 MB) and
+     `torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl` (torchvision not needed).
+  Download ~2 GB at ~20 MB/s here; pip install of SDK + torch ~3.5 min.
+- **CPU fallback:** `torch==2.9.1 torchaudio==2.9.1` from `https://download.pytorch.org/whl/cpu`
+  (`torch-2.9.1+cpu-cp312-cp312-win_amd64.whl` exists there).
+- **MSST** pinned to commit `9cc76c03ccd4da5ddf3477e93d386a1648a77732` (main, 2026-10-30; latest tag
+  v1.0.22): `https://github.com/ZFTurbo/Music-Source-Separation-Training/archive/9cc76c03ccd4da5ddf3477e93d386a1648a77732.zip`.
+  Its `requirements.txt` is mostly training tools and does not install on Windows without a C
+  compiler (`asteroid` → `pb-bss-eval` → `pesq`). What BandIt + Apollo inference imports, with
+  `torch==2.9.1`/`torchaudio==2.9.1` as pip constraints so the ROCm build is kept: numpy, scipy,
+  soundfile, soxr, librosa, PyYAML, omegaconf 2.2.3, ml_collections, tqdm, einops 0.8.1, beartype
+  0.14.1, rotary_embedding_torch 0.3.5, pytorch_lightning, torchmetrics 0.11.4, spafe 0.3.2,
+  pyloudnorm, pedalboard, torch_audiomentations, pandas, fire, asteroid-filterbanks,
+  huggingface_hub, torch-optimizer, torch-stoi, **setuptools<81** (torchmetrics 0.11 imports
+  `pkg_resources`), then `asteroid==0.7.0 --no-deps`. Exact versions are constants in `audio/pack.rs`.
+- **MSST on Windows torch:** `torch.distributed` has no `is_initialized` in the Windows builds and
+  MSST's `demix()` calls it; the worker stubs it.
+- **Models** (URLs from MSST `docs/pretrained_models.md`):
+  `https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v.1.0.3/config_dnr_bandit_bsrnn_multi_mus64.yaml`,
+  `https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v.1.0.3/model_bandit_plus_dnr_sdr_11.47.chpt`
+  (149 MB), Apollo `https://huggingface.co/JusperLee/Apollo/resolve/main/pytorch_model.bin` (67 MB) with
+  MSST's `configs/config_apollo.yaml`. Both models run at 44.1 kHz; the worker resamples 48k → 44.1k
+  → 48k (soxr_hq) and returns exactly the input's length.
+- **Speed, BandIt Plus on the 120 s teaser** (`sample_teaser_0-120s.wav`, stereo 48 kHz), whole
+  worker run including Python start and model load (~10 s):
+  - GPU: 46.8 s first run, 42.8 s second (37.7 s through the installed pack and the Rust runner)
+    → **~19–21 s per minute of audio** (~3× realtime), ~16 s/min excluding start-up. A 45-min
+    episode ≈ 15 min.
+  - CPU with the official CPU wheel (`torch 2.9.1+cpu`, the installer's fallback), 30 s excerpt:
+    125 s → **~250 s (4.2 min) per minute of audio** (0.24× realtime); a 45-min episode ≈ 3 h.
+  - CPU with the *ROCm* torch build (`AUDIO_AI_FORCE_CPU=1`): unusable, 657 s for half of the
+    30 s excerpt (~43 min per audio minute); the 120 s run was stopped after 47 min. So a GPU
+    machine must not fall back to the CPU inside the ROCm pack; the CPU path needs the CPU wheel.
+  - Apollo (`enhance`) on GPU: 84 s for the 120 s teaser (~42 s per audio minute). On this AC-3
+    source it does not add content above 14 kHz (14–20 kHz came out ~3 dB lower than the source);
+    worth checking by ear in Task 10 before relying on it for band-splice.
+- **Pack through the app's installer** (`examples/audio_pack -- install`, from empty): 7.3 min,
+  **5.7 GB** on disk (ROCm SDK libraries ~3.4 GB, torch 1.2 GB), above the 2–5 GB estimate.
+  `remove` of the pack took 4 min (many small files): the GUI should run it in the background.
+- **Separation sanity (GPU):** speech −33.9, music −31.8, effects −32.1 dBFS; speech silent for the
+  music-only first 20 s; source − sum of stems is 31.6 dB below the source (stems add back up).
