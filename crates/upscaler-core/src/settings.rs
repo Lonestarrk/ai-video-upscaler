@@ -180,6 +180,32 @@ pub enum VideoCodec {
     H265,
 }
 
+/// HDR output: how the exported video is coded. `Off` keeps the SDR output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HdrMode {
+    #[default]
+    Off,
+    Hdr10Plus,
+    Hdr10,
+    Hlg,
+}
+
+impl HdrMode {
+    /// PQ (SMPTE ST 2084) transfer, as opposed to HLG.
+    pub fn is_pq(self) -> bool {
+        matches!(self, HdrMode::Hdr10Plus | HdrMode::Hdr10)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HdrMode::Off => "Off",
+            HdrMode::Hdr10Plus => "HDR10+",
+            HdrMode::Hdr10 => "HDR10",
+            HdrMode::Hlg => "HLG",
+        }
+    }
+}
+
 /// How many of the source frames go through the AI. Skipped frames are rebuilt with
 /// motion interpolation, which cuts cost and time at some loss of quality in fast motion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +417,11 @@ pub struct Settings {
     // Output video
     pub video_codec: VideoCodec,
     pub crf: u8,
+    pub hdr_mode: HdrMode,
+    /// Peak brightness (nits) the inverse tone map expands the top range to.
+    pub hdr_peak_nits: u32,
+    /// Remove the 16-bit HDR frames once the video is encoded.
+    pub hdr_delete_frames_after: bool,
 
     // Audio
     pub audio_mode: AudioMode,
@@ -455,6 +486,9 @@ impl Default for Settings {
             review_max_attempts: 3,
             video_codec: VideoCodec::H264,
             crf: 16,
+            hdr_mode: HdrMode::Off,
+            hdr_peak_nits: 1000,
+            hdr_delete_frames_after: true,
             audio_mode: AudioMode::Original,
             surround_engine: SurroundEngine::LocalAi,
             lfe_level: LfeLevel::Normal,
@@ -586,6 +620,15 @@ impl Settings {
         self.recent_projects.truncate(10);
     }
 
+    /// HDR is always coded with H.265.
+    pub fn effective_codec(&self) -> VideoCodec {
+        if self.hdr_mode != HdrMode::Off {
+            VideoCodec::H265
+        } else {
+            self.video_codec
+        }
+    }
+
     /// Whether the current service can take the previous frame as a second image.
     /// FLUX.1 Kontext and Grok edit one image at a time.
     pub fn reference_supported(&self) -> bool {
@@ -602,6 +645,27 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_defaults() {
+        let s = Settings::default();
+        assert_eq!(s.hdr_mode, HdrMode::Off);
+        assert_eq!(s.hdr_peak_nits, 1000);
+        assert!(s.hdr_delete_frames_after);
+        assert!(!HdrMode::Off.is_pq());
+        assert!(HdrMode::Hdr10.is_pq());
+        assert!(HdrMode::Hdr10Plus.is_pq());
+        assert!(!HdrMode::Hlg.is_pq());
+    }
+
+    #[test]
+    fn hdr_forces_h265() {
+        let mut s = Settings::default();
+        s.video_codec = VideoCodec::H264;
+        assert_eq!(s.effective_codec(), VideoCodec::H264);
+        s.hdr_mode = HdrMode::Hlg;
+        assert_eq!(s.effective_codec(), VideoCodec::H265);
+    }
 
     #[test]
     fn audio_defaults() {

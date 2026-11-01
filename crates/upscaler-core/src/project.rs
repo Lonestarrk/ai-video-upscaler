@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{
-    AiRate, AspectChoice, AudioMode, LfeLevel, OutputSize, ProviderKind, Settings, SurroundEngine,
-    VideoCodec,
+    AiRate, AspectChoice, AudioMode, HdrMode, LfeLevel, OutputSize, ProviderKind, Settings,
+    SurroundEngine, VideoCodec,
 };
 
 pub const PROJECT_FILE: &str = "project.json";
@@ -80,6 +80,9 @@ pub struct ProjectSettings {
     pub review_max_attempts: u32,
     pub video_codec: VideoCodec,
     pub crf: u8,
+    pub hdr_mode: HdrMode,
+    pub hdr_peak_nits: u32,
+    pub hdr_delete_frames_after: bool,
     pub audio_mode: AudioMode,
     pub surround_engine: SurroundEngine,
     pub lfe_level: LfeLevel,
@@ -124,6 +127,9 @@ macro_rules! project_fields {
             review_max_attempts,
             video_codec,
             crf,
+            hdr_mode,
+            hdr_peak_nits,
+            hdr_delete_frames_after,
             audio_mode,
             surround_engine,
             lfe_level,
@@ -340,6 +346,26 @@ mod tests {
         assert_eq!(other.openai_api_key, "mine");
 
         assert_eq!(find_for_video(&video, &[], &other), Some(pdir));
+    }
+
+    #[test]
+    fn project_keeps_hdr() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"x").unwrap();
+        let mut s = Settings::default();
+        s.hdr_mode = crate::settings::HdrMode::Hdr10Plus;
+        s.hdr_peak_nits = 600;
+        s.hdr_delete_frames_after = false;
+        let p = Project::new(&video, &s);
+        let pdir = default_dir(&video);
+        p.save(&pdir).unwrap();
+        let loaded = Project::load(&pdir).unwrap();
+        let mut other = Settings::default();
+        loaded.settings.apply(&mut other);
+        assert_eq!(other.hdr_mode, crate::settings::HdrMode::Hdr10Plus);
+        assert_eq!(other.hdr_peak_nits, 600);
+        assert!(!other.hdr_delete_frames_after);
     }
 
     #[test]
