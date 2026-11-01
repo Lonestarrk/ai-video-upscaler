@@ -2,6 +2,7 @@
 //! pipeline (padding, prompts, consistency) and the export job.
 
 pub mod aspect;
+pub mod audio;
 pub mod cache;
 pub mod ffmpeg;
 pub mod ffmpeg_download;

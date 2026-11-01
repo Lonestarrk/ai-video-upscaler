@@ -63,7 +63,7 @@ impl Tools {
         }
     }
 
-    fn ffmpeg_cmd(&self) -> std::process::Command {
+    pub(crate) fn ffmpeg_cmd(&self) -> std::process::Command {
         let mut c = command(&self.ffmpeg);
         c.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
         c
