@@ -631,17 +631,8 @@ mod classic_tests {
     use std::sync::atomic::AtomicBool;
 
     use upscaler_core::audio::classic::upmix_classic;
-    use upscaler_core::audio::io::{write_wav, Pcm};
-    use upscaler_core::ffmpeg::Tools;
+    use upscaler_core::audio::io::Pcm;
     use upscaler_core::settings::LfeLevel;
-
-    fn tools() -> Option<Tools> {
-        let t = Tools::locate("");
-        if t.is_none() {
-            eprintln!("ffmpeg not installed, skipping");
-        }
-        t
-    }
 
     fn stereo(n: usize) -> Pcm {
         let mut s = 777u32;
@@ -662,33 +653,19 @@ mod classic_tests {
 
     #[test]
     fn classic_length_matches() {
-        let Some(tools) = tools() else { return };
-        let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
-        for n in [48000usize, 100_003, 1500] {
-            let wav = dir.path().join(format!("in{n}.wav"));
-            write_wav(&wav, &stereo(n)).unwrap();
-            let out = upmix_classic(&tools, &wav, LfeLevel::Normal, &cancel).unwrap();
+        for n in [48000usize, 100_003, 1500, 0] {
+            let out = upmix_classic(&stereo(n), LfeLevel::Normal, &cancel).unwrap();
             assert_eq!((out.channels, out.frames()), (6, n), "n={n}");
             assert!(out.samples.iter().all(|v| v.is_finite()));
-            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|f| !f.starts_with("in"))
-                .collect();
-            assert!(leftovers.is_empty(), "{leftovers:?}");
         }
     }
 
     #[test]
     fn classic_is_in_sync() {
-        let Some(tools) = tools() else { return };
-        let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
         let src = stereo(5 * 48000);
-        let wav = dir.path().join("in.wav");
-        write_wav(&wav, &src).unwrap();
-        let out = upmix_classic(&tools, &wav, LfeLevel::Normal, &cancel).unwrap();
+        let out = upmix_classic(&src, LfeLevel::Normal, &cancel).unwrap();
         let (l, r) = (src.channel(0), src.channel(1));
         let (fl, fr, fc) = (out.channel(0), out.channel(1), out.channel(2));
         let a: Vec<f32> = (0..l.len()).map(|i| l[i] + r[i]).collect();
