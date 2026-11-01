@@ -7,6 +7,7 @@ pub mod cache;
 pub mod ffmpeg;
 pub mod ffmpeg_download;
 pub mod frame;
+pub mod hdr;
 pub mod job;
 pub mod paths;
 pub mod process;
