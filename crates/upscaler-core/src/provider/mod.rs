@@ -184,14 +184,23 @@ pub fn upscale_frame_with_prompt(
     let result = provider.upscale(&req, cancel)?;
     let finished = frame::finish(&result, &prepared, target);
     if extend.is_some() && frame::canvas_left_grey(&finished, source.dimensions()) {
-        return Err(GreyCanvasLeft.into());
+        return Err(GreyCanvasLeft {
+            image: finished,
+            prompt: text,
+        }
+        .into());
     }
     Ok((finished, text))
 }
 
-/// The AI returned the extended picture with the grey canvas still in it.
+/// The AI returned the extended picture with the grey canvas still in it. Carries the
+/// result and its prompt so a caller that gives up retrying can still keep it (the scene
+/// may genuinely be flat grey at the edges).
 #[derive(Debug)]
-pub struct GreyCanvasLeft;
+pub struct GreyCanvasLeft {
+    pub image: RgbImage,
+    pub prompt: String,
+}
 
 impl std::fmt::Display for GreyCanvasLeft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -204,6 +213,11 @@ impl std::error::Error for GreyCanvasLeft {}
 /// Whether `e` is (or was caused by) [`GreyCanvasLeft`].
 pub fn is_grey_canvas_error(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<GreyCanvasLeft>())
+}
+
+/// The [`GreyCanvasLeft`] inside `e`, if that is what it is.
+pub fn grey_canvas_result(e: &anyhow::Error) -> Option<&GreyCanvasLeft> {
+    e.chain().find_map(|c| c.downcast_ref::<GreyCanvasLeft>())
 }
 
 /// Decodes PNG/JPEG/WebP bytes to RGB.

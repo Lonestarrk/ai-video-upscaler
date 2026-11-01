@@ -1217,6 +1217,21 @@ fn make_frame(
                 return Ok(prompt);
             }
             Err(e) if process::is_cancelled(&e) => return Err(e),
+            Err(e) if attempt >= 2 && provider::grey_canvas_result(&e).is_some() => {
+                // Out of retries and still grey: the scene may really be flat grey at the
+                // edges. Keep the result and let quality control or the owner judge it.
+                let kept = provider::grey_canvas_result(&e).expect("checked above");
+                let _ = std::fs::remove_dir_all(&tmp);
+                save_atomic(&kept.image, &plan.out(n))?;
+                log::warn!("frame {n}: grey canvas may still be unfilled after 3 attempts; kept");
+                emit(ExportEvent::Retry {
+                    n,
+                    error: format!(
+                        "{e:#} (kept after 3 attempts; the grey canvas may still be unfilled)"
+                    ),
+                });
+                return Ok(kept.prompt.clone());
+            }
             Err(e) if attempt < 2 => {
                 attempt += 1;
                 grey = provider::is_grey_canvas_error(&e);
@@ -1339,10 +1354,16 @@ pub fn dir_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Provider, Request, ReviewRequest};
+    use crate::review::Verdict;
+    use image::Rgb;
 
     #[test]
     fn grey_canvas_retry_feedback_is_combined() {
-        let grey = anyhow::Error::new(provider::GreyCanvasLeft);
+        let grey = anyhow::Error::new(provider::GreyCanvasLeft {
+            image: RgbImage::new(1, 1),
+            prompt: String::new(),
+        });
         assert!(provider::is_grey_canvas_error(&grey));
         assert!(!provider::is_grey_canvas_error(&anyhow::anyhow!("other")));
         assert_eq!(
@@ -1358,9 +1379,76 @@ mod tests {
             .unwrap()
             .contains("paint the full new scene"));
     }
-    use crate::provider::{Provider, Request, ReviewRequest};
-    use crate::review::Verdict;
-    use image::Rgb;
+
+    /// Always answers with flat grey, as a scene with a really grey edge would look.
+    struct AlwaysGrey {
+        calls: Mutex<u32>,
+    }
+
+    impl Provider for AlwaysGrey {
+        fn upscale(&self, req: &Request, _: &AtomicBool) -> Result<RgbImage> {
+            *self.calls.lock().unwrap() += 1;
+            let (w, h) = req.image.dimensions();
+            Ok(RgbImage::from_pixel(w, h, frame::EXTEND_FILL))
+        }
+
+        fn canvas_aspects(&self) -> &'static [f64] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn grey_result_is_kept_after_three_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src_dir, out_dir) = (dir.path().join("in"), dir.path().join("out"));
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        RgbImage::from_pixel(160, 120, Rgb([200, 30, 30]))
+            .save(ffmpeg::frame_file(&src_dir, 1))
+            .unwrap();
+        let (review_file, rejects) = (dir.path().join(REVIEW_FILE), dir.path().join(REJECTS_DIR));
+        let rejected = dir.path().join(REJECTED_DIR);
+        let plan = Plan {
+            total: 1,
+            dup_of: &[None, None],
+            cut: &[false, true],
+            src_dir: &src_dir,
+            out_dir: &out_dir,
+            review_file: &review_file,
+            rejects_dir: &rejects,
+            rejected_dir: &rejected,
+            target: (320, 180),
+        };
+        let mut s = Settings::default();
+        s.project_dir = Some(dir.path().to_path_buf());
+        s.change_aspect = true;
+        s.target_aspect = crate::settings::AspectChoice::Wide16x9;
+        let fake = AlwaysGrey {
+            calls: Mutex::new(0),
+        };
+        let retries = Mutex::new(Vec::new());
+        let prompt = make_frame(
+            &plan,
+            &s,
+            &fake,
+            1,
+            None,
+            None,
+            &AtomicBool::new(false),
+            &|e| {
+                if let ExportEvent::Retry { error, .. } = e {
+                    retries.lock().unwrap().push(error);
+                }
+            },
+        )
+        .unwrap();
+        assert!(prompt.contains("EXTENSION TASK"));
+        assert_eq!(*fake.calls.lock().unwrap(), 3);
+        assert!(plan.out(1).is_file());
+        let retries = retries.into_inner().unwrap();
+        assert_eq!(retries.len(), 3);
+        assert!(retries[2].contains("may still be unfilled"));
+    }
 
     /// Paints results grey, or white when the prompt carries quality-control feedback, and
     /// rejects the first (grey) result of the frame whose source is 30.
