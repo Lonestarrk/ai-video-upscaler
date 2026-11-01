@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{AiRate, AspectChoice, OutputSize, ProviderKind, Settings, VideoCodec};
+use crate::settings::{
+    AiRate, AspectChoice, AudioMode, LfeLevel, OutputSize, ProviderKind, Settings, SurroundEngine,
+    VideoCodec,
+};
 
 pub const PROJECT_FILE: &str = "project.json";
 pub const APP_FOLDER: &str = "AI Video Upscaler";
@@ -77,6 +80,10 @@ pub struct ProjectSettings {
     pub review_max_attempts: u32,
     pub video_codec: VideoCodec,
     pub crf: u8,
+    pub audio_mode: AudioMode,
+    pub surround_engine: SurroundEngine,
+    pub lfe_level: LfeLevel,
+    pub audio_enhance: bool,
 }
 
 impl Default for ProjectSettings {
@@ -116,7 +123,11 @@ macro_rules! project_fields {
             review_frames,
             review_max_attempts,
             video_codec,
-            crf
+            crf,
+            audio_mode,
+            surround_engine,
+            lfe_level,
+            audio_enhance
         )
     };
 }
@@ -329,6 +340,28 @@ mod tests {
         assert_eq!(other.openai_api_key, "mine");
 
         assert_eq!(find_for_video(&video, &[], &other), Some(pdir));
+    }
+
+    #[test]
+    fn project_keeps_audio_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"x").unwrap();
+        let mut s = Settings::default();
+        s.audio_mode = AudioMode::Surround;
+        s.surround_engine = SurroundEngine::Classic;
+        s.lfe_level = LfeLevel::Cinema;
+        s.audio_enhance = true;
+        let p = Project::new(&video, &s);
+        let pdir = default_dir(&video);
+        p.save(&pdir).unwrap();
+        let loaded = Project::load(&pdir).unwrap();
+        let mut other = Settings::default();
+        loaded.settings.apply(&mut other);
+        assert_eq!(other.audio_mode, AudioMode::Surround);
+        assert_eq!(other.surround_engine, SurroundEngine::Classic);
+        assert_eq!(other.lfe_level, LfeLevel::Cinema);
+        assert!(other.audio_enhance);
     }
 
     #[test]

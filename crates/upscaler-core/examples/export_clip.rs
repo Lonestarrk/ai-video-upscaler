@@ -46,7 +46,11 @@ fn main() -> Result<()> {
     }
     let tools = Tools::locate(&s.ffmpeg_dir).context("ffmpeg not found")?;
     let info = ffmpeg::probe(&tools, &video)?;
-    let crop = if s.remove_black_bars { info.detected_crop } else { None };
+    let crop = if s.remove_black_bars {
+        info.detected_crop
+    } else {
+        None
+    };
     let info = info.with_crop(crop);
     let start = info.frame_at(start_s);
     let end = start + (secs * info.fps()).round() as u64;

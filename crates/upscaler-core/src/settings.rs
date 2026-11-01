@@ -201,6 +201,60 @@ impl AiRate {
     }
 }
 
+/// What happens to the audio on export.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioMode {
+    /// Keep the source audio as it is.
+    #[default]
+    Original,
+    /// Build 5.1 from the source's stereo.
+    Surround,
+}
+
+/// How 5.1 is built from stereo.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurroundEngine {
+    /// Local AI source separation.
+    #[default]
+    LocalAi,
+    /// Classic signal processing.
+    Classic,
+}
+
+/// How strong the LFE (subwoofer) channel is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LfeLevel {
+    Subtle,
+    #[default]
+    Normal,
+    Strong,
+    /// Strong, with synthesized extra bass.
+    Cinema,
+}
+
+impl LfeLevel {
+    pub const ALL: [LfeLevel; 4] = [
+        LfeLevel::Subtle,
+        LfeLevel::Normal,
+        LfeLevel::Strong,
+        LfeLevel::Cinema,
+    ];
+
+    /// Gain written into the file relative to the heard level, in dB.
+    pub fn file_gain_db(self) -> f32 {
+        match self {
+            LfeLevel::Subtle => -16.0,
+            LfeLevel::Normal => -13.0,
+            LfeLevel::Strong | LfeLevel::Cinema => -10.0,
+        }
+    }
+
+    /// Whether extra bass is synthesized.
+    pub fn synth(self) -> bool {
+        self == LfeLevel::Cinema
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompareMode {
     SideBySide,
@@ -338,6 +392,12 @@ pub struct Settings {
     pub video_codec: VideoCodec,
     pub crf: u8,
 
+    // Audio
+    pub audio_mode: AudioMode,
+    pub surround_engine: SurroundEngine,
+    pub lfe_level: LfeLevel,
+    pub audio_enhance: bool,
+
     // View
     pub compare_mode: CompareMode,
     pub ui_scale: f32,
@@ -395,6 +455,10 @@ impl Default for Settings {
             review_max_attempts: 3,
             video_codec: VideoCodec::H264,
             crf: 16,
+            audio_mode: AudioMode::Original,
+            surround_engine: SurroundEngine::LocalAi,
+            lfe_level: LfeLevel::Normal,
+            audio_enhance: false,
             compare_mode: CompareMode::SideBySide,
             ui_scale: 1.0,
             seconds_per_frame: Vec::new(),
@@ -505,6 +569,11 @@ impl Settings {
         self.use_previous_frame && self.reference_supported()
     }
 
+    /// Whether the export touches the audio at all.
+    pub fn audio_active(&self) -> bool {
+        self.audio_mode == AudioMode::Surround || self.audio_enhance
+    }
+
     /// Whether exported frames are checked by the service's own model.
     pub fn review_active(&self) -> bool {
         self.review_frames && self.provider.can_review()
@@ -533,6 +602,28 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_defaults() {
+        let s = Settings::default();
+        assert_eq!(s.audio_mode, AudioMode::Original);
+        assert_eq!(s.surround_engine, SurroundEngine::LocalAi);
+        assert_eq!(s.lfe_level, LfeLevel::Normal);
+        assert!(!s.audio_enhance);
+        assert!(!s.audio_active());
+        let mut t = s.clone();
+        t.audio_enhance = true;
+        assert!(t.audio_active());
+        t.audio_enhance = false;
+        t.audio_mode = AudioMode::Surround;
+        assert!(t.audio_active());
+        assert_eq!(LfeLevel::Subtle.file_gain_db(), -16.0);
+        assert_eq!(LfeLevel::Normal.file_gain_db(), -13.0);
+        assert_eq!(LfeLevel::Strong.file_gain_db(), -10.0);
+        assert_eq!(LfeLevel::Cinema.file_gain_db(), -10.0);
+        assert!(LfeLevel::Cinema.synth());
+        assert!(!LfeLevel::Strong.synth());
+    }
 
     #[test]
     fn targets_are_even() {
