@@ -34,6 +34,7 @@ use super::io::{
     encode_stream_filtered, extract, extract_raw, frames_for, read_raw_frames, read_wav, write_wav,
     AudioCodec, Pcm, RATE,
 };
+use super::pack;
 use super::place::place;
 use super::sections::{self, Section};
 use super::source::{self, SourceAudio};
@@ -79,11 +80,34 @@ pub struct AudioSpec {
     pub settings: Settings,
 }
 
-/// The cache key: the video, the range, every audio setting and [`AUDIO_VERSION`].
+/// The file's identity for the audio: path, size and modification time. Unlike
+/// [`VideoInfo::identity`] it leaves out the crop and the SAR override, which change only
+/// the pixels, so they never throw away a finished audio job.
+fn audio_identity(info: &VideoInfo) -> String {
+    format!(
+        "{}|{}|{}",
+        info.path.display(),
+        info.file_size,
+        info.modified
+    )
+}
+
+/// Whether these settings may use the AI audio pack (separation or enhancement).
+fn may_use_ai(s: &Settings) -> bool {
+    s.audio_enhance
+        || (s.audio_mode == AudioMode::Surround && s.surround_engine == SurroundEngine::LocalAi)
+}
+
+/// The cache key: the video's audio identity, the range, every audio setting,
+/// [`AUDIO_VERSION`] and, when the AI may be used, the AI pack's identity.
 pub fn key(spec: &AudioSpec) -> String {
+    key_with(spec, &pack::identity())
+}
+
+fn key_with(spec: &AudioSpec, pack_identity: &str) -> String {
     let s = &spec.settings;
-    let parts = [
-        spec.info.identity(),
+    let mut parts = vec![
+        audio_identity(&spec.info),
         spec.start.to_string(),
         spec.end.to_string(),
         format!("{:?}", s.audio_mode),
@@ -92,6 +116,9 @@ pub fn key(spec: &AudioSpec) -> String {
         format!("enhance={}", s.audio_enhance),
         format!("audio-v{AUDIO_VERSION}"),
     ];
+    if may_use_ai(s) {
+        parts.push(pack_identity.to_string());
+    }
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
     cache::key(&refs)
 }
@@ -107,7 +134,9 @@ pub fn job_dir(spec: &AudioSpec) -> PathBuf {
 pub enum AudioTrack {
     /// FLAC 24 bit, 5.1(side).
     Flac51(PathBuf),
-    /// AC-3 640 kbit/s, 5.1(side), made from the same samples as the FLAC.
+    /// AC-3 640 kbit/s, 5.1(side), made from the same samples as the FLAC. AC-3 codes whole
+    /// 1536-sample frames plus encoder delay, so the decoded track can be up to 1792 samples
+    /// longer than the range; the mux must cut it to the video's length.
     Ac351(PathBuf),
     /// FLAC 24 bit, stereo (quality improvement without 5.1).
     FlacStereo(PathBuf),
@@ -312,6 +341,8 @@ pub fn run_with(
     let plan = plan_job(&spec.settings, src.as_ref(), ai.is_some())?;
     let dir = job_dir(spec);
     if let Some(done) = load_result(&dir) {
+        // A crash right after the result was saved may have left the intermediates.
+        remove_intermediates(&dir);
         return Ok(done);
     }
     let (t0, dur, n) = range(&spec.info, spec.start, spec.end);
@@ -361,7 +392,7 @@ pub fn run_with(
                 emit(AudioEvent::Stage(AudioStage::Encoding));
                 tracks = job.encode(gain, limiter, cancel, emit)?;
                 emit(AudioEvent::Stage(AudioStage::Checking));
-                match measure(tools, &file_input(tracks[0].path()), cancel) {
+                match measure(tools, &file_input(tracks[0].path()), false, cancel) {
                     Ok(l) => res_level = l,
                     Err(e) if is_cancelled(&e) => return Err(e),
                     Err(e) => warn(format!("The loudness check could not run: {e:#}")),
@@ -398,10 +429,15 @@ pub fn run_with(
     let result = AudioResult { tracks, warnings };
     save_result(&dir, &result)?;
     // The result is cached; the intermediates are big (several GB for a film).
-    let _ = std::fs::remove_file(&raw);
+    remove_intermediates(&dir);
+    Ok(result)
+}
+
+/// Removes the extracted source, the sections and the temp files (best effort).
+fn remove_intermediates(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("source.f32"));
     let _ = std::fs::remove_dir_all(dir.join("sections"));
     let _ = std::fs::remove_dir_all(dir.join("tmp"));
-    Ok(result)
 }
 
 fn load_result(dir: &Path) -> Option<AudioResult> {
@@ -806,8 +842,11 @@ impl Job<'_> {
             "-i".into(),
             self.source_path().into_os_string(),
         ];
-        let src = measure(self.tools, &raw, cancel)?;
-        let res = measure(self.tools, &file_input(result), cancel)?;
+        // A mono source becomes L = R stereo (or sits in a 5.1 as a pair): BS.1770 counts
+        // mono played on two speakers as dual mono, +3 dB against a single channel.
+        let dual_mono = self.plan.source_channels == 1;
+        let src = measure(self.tools, &raw, dual_mono, cancel)?;
+        let res = measure(self.tools, &file_input(result), false, cancel)?;
         Ok((src, res))
     }
 
@@ -863,18 +902,21 @@ pub struct Loudness {
     pub true_peak: f64,
 }
 
-/// Runs `ebur128` over the input given by `input` (FFmpeg input arguments).
-fn measure(tools: &Tools, input: &[OsString], cancel: &AtomicBool) -> Result<Loudness> {
+/// Runs `ebur128` over the input given by `input` (FFmpeg input arguments). `dual_mono`
+/// measures a mono input as if played on two speakers (`dualmono=true`).
+fn measure(
+    tools: &Tools,
+    input: &[OsString],
+    dual_mono: bool,
+    cancel: &AtomicBool,
+) -> Result<Loudness> {
+    let filter = format!("ebur128=peak=true:dualmono={dual_mono}:framelog=verbose");
     let mut cmd = process::command(&tools.ffmpeg);
     cmd.args(["-hide_banner", "-nostdin", "-nostats"])
         .args(input)
-        .args([
-            "-af",
-            "ebur128=peak=true:framelog=verbose",
-            "-f",
-            "null",
-            "-",
-        ]);
+        .arg("-af")
+        .arg(filter)
+        .args(["-f", "null", "-"]);
     let out = process::run(cmd, None, cancel, None)?;
     if !out.success {
         bail!("ffmpeg could not measure the loudness: {}", out.tail(4));
@@ -1038,8 +1080,9 @@ mod tests {
     struct FakeAi {
         separations: AtomicUsize,
         enhancements: Mutex<Vec<usize>>,
-        /// Sets this flag on the given separation call (1-based).
-        cancel_on: Option<(usize, &'static AtomicBool)>,
+        /// Returns `Cancelled` on the given separation call (1-based), as the real worker
+        /// does when it is stopped mid-section.
+        cancel_on: Option<usize>,
     }
 
     impl AudioAi for FakeAi {
@@ -1051,6 +1094,9 @@ mod tests {
             _progress: &mut dyn FnMut(f32),
         ) -> Result<Stems> {
             let call = self.separations.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.cancel_on == Some(call) {
+                bail!(Cancelled);
+            }
             let x = read_wav(wav)?;
             std::fs::create_dir_all(out_dir)?;
             let stem = |name: &str, g: f32| -> Result<PathBuf> {
@@ -1071,11 +1117,6 @@ mod tests {
                 music: stem("music.wav", 0.3)?,
                 effects: stem("effects.wav", 0.2)?,
             };
-            if let Some((n, flag)) = self.cancel_on {
-                if n == call {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            }
             Ok(stems)
         }
 
@@ -1154,10 +1195,31 @@ mod tests {
             change(&mut c);
             assert_ne!(key(&c), base, "{c:?}");
         }
-        // Pixel settings do not touch the audio.
+        // Pixel settings and pixel-only state (crop, SAR override) do not touch the audio.
         let mut prompt = spec.clone();
         prompt.settings.prompt = "something else".into();
         assert_eq!(key(&prompt), base);
+        let mut cropped = spec.clone();
+        cropped.info.crop = Some(crate::ffmpeg::Crop {
+            w: 640,
+            h: 272,
+            x: 0,
+            y: 44,
+        });
+        assert_ne!(cropped.info.identity(), spec.info.identity());
+        assert_eq!(key(&cropped), base);
+        let mut sar = spec.clone();
+        sar.info.sar = (4, 3);
+        assert_ne!(sar.info.identity(), spec.info.identity());
+        assert_eq!(key(&sar), base);
+        // The AI pack's identity is part of the key when the AI may be used, not otherwise.
+        assert_ne!(base, key_with(&spec, "another pack"));
+        let mut classic = spec.clone();
+        classic.settings.surround_engine = SurroundEngine::Classic;
+        assert_eq!(key(&classic), key_with(&classic, "another pack"));
+        let mut enhanced = classic.clone();
+        enhanced.settings.audio_enhance = true;
+        assert_ne!(key(&enhanced), key_with(&enhanced, "another pack"));
         let mut s2 = spec.clone();
         s2.settings.project_dir = Some(PathBuf::from("proj"));
         assert_eq!(
@@ -1238,7 +1300,6 @@ mod tests {
 
     #[test]
     fn resumes_after_partial_section() {
-        static CANCEL: AtomicBool = AtomicBool::new(false);
         let dir = tempfile::tempdir().unwrap();
         let tools = tools();
         let plan = plan_job(
@@ -1260,14 +1321,16 @@ mod tests {
         );
         write_raw(&job.source_path(), &src).unwrap();
 
-        // First run: cancelled while section 2 is separated, so 2 of 3 are written.
+        // First run: the AI is cancelled while separating section 3, so 2 of 3 are written.
         let first = FakeAi {
-            cancel_on: Some((2, &CANCEL)),
+            cancel_on: Some(3),
             ..FakeAi::default()
         };
-        let err = job.render(Some(&first), &CANCEL, &no_events).unwrap_err();
+        let err = job
+            .render(Some(&first), &AtomicBool::new(false), &no_events)
+            .unwrap_err();
         assert!(is_cancelled(&err), "{err}");
-        assert_eq!(first.separations.load(Ordering::SeqCst), 2);
+        assert_eq!(first.separations.load(Ordering::SeqCst), 3);
         assert!(job.section_path(0).is_file() && job.section_path(1).is_file());
         assert!(!job.section_path(2).exists());
         // A crash left a partial file behind for section 3: it must not count.

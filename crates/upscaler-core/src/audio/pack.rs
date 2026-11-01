@@ -25,6 +25,16 @@ pub const SCRIPT: &str = include_str!("../../assets/audio_ai.py");
 const INSTALLED_FILE: &str = "installed.json";
 const PYTHON_EXE: &str = "python.exe";
 
+/// What decides the AI's output: the pack version (only a pack of exactly this version
+/// opens) and the worker script (rewritten into the pack when it differs). Cache keys of
+/// AI results include it.
+pub fn identity() -> String {
+    format!(
+        "audio-ai-pack-v{PACK_VERSION}-{}",
+        crate::cache::key(&[SCRIPT])
+    )
+}
+
 // Verified 2026-11-01 (see "Spike findings" in docs/superpowers/plans/2026-11-01-surround-audio.md).
 /// Embeddable CPython 3.12 (AMD's ROCm torch wheels are cp312 only; 3.12.10 is the last
 /// 3.12 release with Windows binaries).

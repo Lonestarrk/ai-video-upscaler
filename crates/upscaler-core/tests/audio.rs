@@ -499,6 +499,84 @@ mod job_tests {
         assert_eq!((dec.channels, dec.frames()), (6, 6 * RATE as usize));
     }
 
+    /// Pass-through AI: enhancement returns its input unchanged.
+    struct PassAi;
+
+    impl upscaler_core::audio::ai::AudioAi for PassAi {
+        fn separate(
+            &self,
+            _wav: &Path,
+            _out_dir: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<upscaler_core::audio::ai::Stems> {
+            anyhow::bail!("not used")
+        }
+
+        fn enhance(
+            &self,
+            wav: &Path,
+            out: &Path,
+            _cancel: &AtomicBool,
+            _progress: &mut dyn FnMut(f32),
+        ) -> anyhow::Result<()> {
+            std::fs::copy(wav, out)?;
+            Ok(())
+        }
+    }
+
+    fn rms_db(x: &[f32]) -> f64 {
+        let p = x.iter().map(|v| *v as f64 * *v as f64).sum::<f64>() / x.len() as f64;
+        10.0 * p.log10()
+    }
+
+    /// Mono becomes L = R stereo: each channel keeps the mono level, so no loudness gain
+    /// may be applied (BS.1770 counts a mono source as dual mono).
+    #[test]
+    fn mono_source_gets_no_gain() {
+        let Some(tools) = tools() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("mono.mkv");
+        video(
+            &tools,
+            &src,
+            6,
+            "aevalsrc=0.2*sin(2*PI*300*t)*(0.6+0.4*sin(2*PI*3*t))+0.05*random(0):s=48000:d=6,\
+             aformat=channel_layouts=mono",
+        );
+        let spec = AudioSpec {
+            info: ffmpeg::probe(&tools, &src).unwrap(),
+            start: 0,
+            end: 144,
+            settings: Settings {
+                audio_mode: AudioMode::Original,
+                audio_enhance: true,
+                project_dir: Some(dir.path().to_path_buf()),
+                ..Settings::default()
+            },
+        };
+        let result = run(
+            &tools,
+            &spec,
+            Some(&PassAi),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        eprintln!("warnings: {:?}", result.warnings);
+        let flac = match &result.tracks[..] {
+            [AudioTrack::FlacStereo(p)] => p.clone(),
+            t => panic!("expected one FLAC stereo track, got {t:?}"),
+        };
+        let out = decode(&tools, &flac, &dir.path().join("out.wav"));
+        assert_eq!((out.channels, out.frames()), (2, 6 * RATE as usize));
+        let orig = decode(&tools, &src, &dir.path().join("src.wav"));
+        let n = out.frames().min(orig.frames());
+        let d = rms_db(&out.channel(0)[..n]) - rms_db(&orig.channel(0)[..n]);
+        assert!(d.abs() <= 0.2, "mono level changed by {d:.2} dB");
+        assert_eq!(out.channel(0), out.channel(1));
+    }
+
     fn lag(a: &[f32], b: &[f32], max: i64) -> i64 {
         let (lo, hi) = (a.len() / 4, a.len() * 3 / 4);
         (-max..=max)
