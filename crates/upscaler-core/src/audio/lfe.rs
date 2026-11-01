@@ -27,9 +27,15 @@ const GUARD_KNEE_DB: f32 = 3.0;
 const GAIN_SMOOTH_MS: f32 = 10.0;
 const CEILING_DB: f32 = -1.0;
 const SYNTH_MIX_DB: f32 = -9.0;
-/// Empirical: makes the filtered square's fundamental match the detection
-/// band's sine amplitude before the mix gain is applied.
-const SYNTH_NORM: f32 = 2.07;
+/// Gain on the filtered square so that, before `SYNTH_MIX_DB`, the 35 Hz
+/// fundamental matches the detection band's amplitude. Derivation: the
+/// envelope follower reads ~0.637 of a sine's amplitude (mean |x|), the square
+/// fundamental is 4/pi of its height, and zero-phase LP55 + HP20 cost ~0.6 at
+/// 35 Hz, giving ~2.07 on paper; the measured result (pinned by
+/// `cinema_adds_subharmonic`, 70 Hz in) was 3.6 dB low, so 1.37 is the
+/// calibrated value (fast attack/release of the follower and the finite
+/// square edges account for the difference).
+const SYNTH_NORM: f32 = 1.37;
 
 /// Smooth per-sample gate gain in dB (0 = open, `GATE_CLOSED_DB` = closed).
 fn open_amount(value_db: f32, closed_at: f32, knee: f32) -> f32 {
@@ -123,7 +129,9 @@ pub fn make_lfe(input: &[f32], source: LfeSource, level: LfeLevel, rate: f32) ->
         .map(|(&x, &g)| x * db_to_gain(g))
         .collect();
     let hp = zero_phase(&gated, |s| lr4_highpass(s, 20.0, rate));
-    let mut lfe = zero_phase(&hp, |s| lr4_lowpass(s, 90.0, rate));
+    let lp = zero_phase(&hp, |s| lr4_lowpass(s, 90.0, rate));
+    // Second low-pass: HP20 x LP90 alone leaves ~-40 dB of 150-1000 Hz energy.
+    let mut lfe = zero_phase(&lp, |s| lr4_lowpass(s, 120.0, rate));
     if level.synth() && source == LfeSource::Effects {
         for (o, s) in lfe.iter_mut().zip(subharmonic(&gated, rate)) {
             *o += s;
@@ -184,7 +192,15 @@ mod tests {
         let seg = |x: &[f32]| rms_db(&x[48_000 + 4_800..48_000 + 14_400]);
         let delta = seg(&lfe) - seg(&burst);
         println!("explosion delta {delta}");
-        assert!((delta - -13.0).abs() <= 2.0, "delta {delta}");
+        // Zero-phase LR4 magnitude is (1 / (1 + x^4))^2 with x = f/fc (low-pass)
+        // or fc/f (high-pass); that is the exact passband loss at 45 Hz.
+        let loss = |x: f32| 20.0 * (1.0 / (1.0 + x.powi(4)).powi(2)).log10();
+        let expected = -13.0 + loss(20.0 / 45.0) + loss(45.0 / 90.0) + loss(45.0 / 120.0);
+        println!("explosion expected {expected}");
+        assert!(
+            (delta - expected).abs() <= 0.5,
+            "delta {delta} expected {expected}"
+        );
     }
 
     #[test]
@@ -227,6 +243,23 @@ mod tests {
         let (c, s) = (at35(LfeLevel::Cinema), at35(LfeLevel::Strong));
         println!("35 Hz cinema {c} strong {s}");
         assert!(c >= s + 20.0, "cinema {c} strong {s}");
+
+        // Pin SYNTH_NORM: the synth's 35 Hz level relative to the detection
+        // band's 70 Hz level must be SYNTH_MIX_DB +-2 dB.
+        let bin = |y: &[f32], f: f64| {
+            let w = &y[48_000 + 6_000..48_000 + 42_000];
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in w.iter().enumerate() {
+                let h = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / w.len() as f64).cos();
+                let ph = 2.0 * std::f64::consts::PI * f * i as f64 / RATE as f64;
+                re += v as f64 * h * ph.cos();
+                im += v as f64 * h * ph.sin();
+            }
+            20.0 * ((re * re + im * im).sqrt() / w.len() as f64).log10()
+        };
+        let rel = bin(&subharmonic(&x, RATE), 35.0) - bin(&band(&x, 50.0, 90.0, RATE), 70.0);
+        println!("synth relative to detection band {rel}");
+        assert!((rel - SYNTH_MIX_DB as f64).abs() <= 2.0, "rel {rel}");
     }
 
     #[test]
@@ -242,14 +275,74 @@ mod tests {
         let x = noise(4 * 48_000, 5);
         let lfe = make_lfe(&x, LfeSource::Effects, LfeLevel::Strong, RATE);
         let n = lfe.len();
-        let mid = &lfe[n / 4..n * 3 / 4];
-        // The analysis band is applied twice: a single LR4 band-pass at 150 Hz
-        // only rejects 60..90 Hz by ~38 dB, which would measure the LFE's own
-        // passband leaking through the analyser rather than content > 150 Hz.
-        let high = band(&band(&lfe, 150.0, 1000.0, RATE), 150.0, 1000.0, RATE);
-        let rel = rms_db(&high[n / 4..n * 3 / 4]) - rms_db(mid);
+        // One second in the middle, Hann-windowed DFT at 1 Hz resolution:
+        // energy in 150..1000 Hz relative to the total energy (Parseval).
+        let w: Vec<f64> = lfe[n / 2..n / 2 + 48_000]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let h = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / 48_000.0).cos();
+                v as f64 * h
+            })
+            .collect();
+        let total: f64 = w.iter().map(|v| v * v).sum::<f64>() * w.len() as f64 / 2.0;
+        let mut high = 0.0f64;
+        for k in 150..=1000 {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in w.iter().enumerate() {
+                let ph = 2.0 * std::f64::consts::PI * k as f64 * i as f64 / 48_000.0;
+                re += v * ph.cos();
+                im += v * ph.sin();
+            }
+            high += re * re + im * im;
+        }
+        let rel = 10.0 * (high / total).log10();
         println!("150-1000 relative {rel}");
         assert!(rel < -50.0, "relative {rel}");
+    }
+
+    #[test]
+    fn deep_voice_is_kept_out() {
+        let n = 4 * 48_000;
+        let voice: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE;
+                let amp = db_to_gain(-23.0) * std::f32::consts::SQRT_2;
+                [90.0f32, 180.0, 270.0]
+                    .iter()
+                    .map(|f| amp * (2.0 * std::f32::consts::PI * f * t).sin())
+                    .sum()
+            })
+            .collect();
+        let mid = |x: &[f32]| rms_db(&x[n / 4..n * 3 / 4]);
+        let guarded = mid(&make_lfe(
+            &voice,
+            LfeSource::MonoSum,
+            LfeLevel::Normal,
+            RATE,
+        ));
+        let open = mid(&make_lfe(
+            &voice,
+            LfeSource::Effects,
+            LfeLevel::Normal,
+            RATE,
+        ));
+        println!("deep voice guarded {guarded} unguarded {open}");
+        assert!(guarded < -65.0, "guarded {guarded}");
+        assert!(open >= guarded + 10.0, "guarded {guarded} open {open}");
+    }
+
+    #[test]
+    fn onset_is_not_softened() {
+        let x = padded(sine(45.0, -18.0, 48_000));
+        let lfe = make_lfe(&x, LfeSource::Effects, LfeLevel::Normal, RATE);
+        let first = rms_db(&lfe[48_000..48_000 + 960]);
+        let steady = rms_db(&lfe[48_000 + 9_600..48_000 + 19_200]);
+        println!("onset {first} steady {steady}");
+        assert!(
+            (first - steady).abs() <= 3.0,
+            "first {first} steady {steady}"
+        );
     }
 
     #[test]
