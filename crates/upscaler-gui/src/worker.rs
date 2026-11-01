@@ -80,6 +80,13 @@ pub enum Event {
         source: Option<egui::ColorImage>,
         result: Option<egui::ColorImage>,
     },
+    /// The current result and the rejected earlier versions of one frame.
+    FrameHistory {
+        dir: PathBuf,
+        n: u64,
+        current: Option<egui::ColorImage>,
+        versions: Vec<(PathBuf, job::Rejection, Option<egui::ColorImage>)>,
+    },
 }
 
 #[derive(Clone)]
@@ -344,6 +351,31 @@ pub fn frame_pair(bus: Bus, dir: PathBuf, n: u64) {
         bus.send(Event::FramePair {
             source: load(&src),
             result: load(&out),
+            dir,
+            n,
+        });
+    });
+}
+
+/// Thumbnails of the finished frame and of every rejected earlier version of it.
+pub fn frame_history(bus: Bus, dir: PathBuf, n: u64) {
+    spawn("frame-history", move || {
+        let load = |p: &std::path::Path| {
+            image::open(p)
+                .ok()
+                .map(|i| to_color_image(&i.thumbnail(360, 360).to_rgb8()))
+        };
+        let (_, out) = job::job_frame_files(&dir, n);
+        let versions = job::rejected_versions(&dir, n)
+            .into_iter()
+            .map(|(path, r)| {
+                let img = load(&path);
+                (path, r, img)
+            })
+            .collect();
+        bus.send(Event::FrameHistory {
+            current: load(&out),
+            versions,
             dir,
             n,
         });

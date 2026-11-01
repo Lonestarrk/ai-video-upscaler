@@ -401,6 +401,7 @@ fn export(
         out_dir: &out_dir,
         review_file: &dir.join(REVIEW_FILE),
         rejects_dir: &dir.join(REJECTS_DIR),
+        rejected_dir: &dir.join(REJECTED_DIR),
         target: geo.work,
     };
     upscale_all(&plan, s, provider.as_ref(), cancel, emit)?;
@@ -444,6 +445,7 @@ fn export(
 
 const REVIEW_FILE: &str = "review.json";
 const REJECTS_DIR: &str = "rejects";
+pub const REJECTED_DIR: &str = "rejected";
 
 /// An export job found in a work folder.
 #[derive(Clone, Debug, PartialEq)]
@@ -568,6 +570,8 @@ struct Plan<'a> {
     review_file: &'a Path,
     /// Frames rejected by hand, one `<n>.txt` (with the reason) per frame.
     rejects_dir: &'a Path,
+    /// Where rejected results are kept (`<n>_try<k>.png` + `.json`).
+    rejected_dir: &'a Path,
     target: (u32, u32),
 }
 
@@ -622,6 +626,133 @@ pub struct Record {
     pub rejections: u32,
     /// The last rejection was made by hand.
     pub manual: bool,
+    /// Every rejection so far, oldest first.
+    pub history: Vec<Rejection>,
+}
+
+/// Who rejected a result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectedBy {
+    Ai,
+    User,
+}
+
+impl RejectedBy {
+    fn id(self) -> &'static str {
+        match self {
+            RejectedBy::Ai => "ai",
+            RejectedBy::User => "user",
+        }
+    }
+}
+
+/// One rejected result of a frame.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Rejection {
+    /// The attempt (1-based) that made the result.
+    pub attempt: u32,
+    pub by: RejectedBy,
+    pub problems: String,
+    /// File name inside `rejected/`; `None` when the frame was kept in `out/`.
+    pub file: Option<String>,
+    /// RFC 3339, UTC.
+    pub time: String,
+}
+
+/// Seconds since the epoch as an RFC 3339 UTC timestamp.
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Moves the rejected result of frame `n` from `out/` to `rejected/` with a description
+/// next to it. The result leaves `out/` even if keeping it fails. Returns the file name.
+fn archive(
+    plan: &Plan,
+    n: u64,
+    attempt: u32,
+    by: RejectedBy,
+    problems: &str,
+    prompt: &str,
+) -> Option<String> {
+    let from = plan.out(n);
+    if !from.is_file() {
+        return None;
+    }
+    let result = (|| -> Result<String> {
+        std::fs::create_dir_all(plan.rejected_dir)?;
+        let base = format!("{n:06}_try{attempt}");
+        let mut stem = base.clone();
+        let mut i = 2;
+        while plan.rejected_dir.join(format!("{stem}.png")).exists()
+            || plan.rejected_dir.join(format!("{stem}.json")).exists()
+        {
+            stem = format!("{base}_{i}");
+            i += 1;
+        }
+        let png = plan.rejected_dir.join(format!("{stem}.png"));
+        if std::fs::rename(&from, &png).is_err() {
+            std::fs::copy(&from, &png)?;
+        }
+        let meta = serde_json::json!({
+            "frame": n,
+            "attempt": attempt,
+            "by": by.id(),
+            "problems": problems,
+            "prompt": prompt,
+            "time": now_rfc3339(),
+        });
+        std::fs::write(
+            plan.rejected_dir.join(format!("{stem}.json")),
+            serde_json::to_string_pretty(&meta)?,
+        )?;
+        Ok(format!("{stem}.png"))
+    })();
+    let _ = std::fs::remove_file(&from);
+    match result {
+        Ok(name) => Some(name),
+        Err(e) => {
+            log::warn!("could not keep the rejected frame {n}: {e:#}");
+            None
+        }
+    }
+}
+
+/// The earlier, rejected results of frame `n` with their records, oldest first.
+pub fn rejected_versions(job_dir: &Path, n: u64) -> Vec<(PathBuf, Rejection)> {
+    let records: std::collections::BTreeMap<u64, Record> =
+        std::fs::read_to_string(job_dir.join(REVIEW_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+    records
+        .get(&n)
+        .into_iter()
+        .flat_map(|r| r.history.iter())
+        .filter_map(|h| {
+            let path = job_dir.join(REJECTED_DIR).join(h.file.as_ref()?);
+            path.is_file().then(|| (path, h.clone()))
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -632,6 +763,8 @@ struct Slot {
     settled: bool,
     /// Bumped whenever a new result is written, so a late verdict on an old one is ignored.
     version: u64,
+    /// The prompt of the latest result, for the history if it is rejected.
+    prompt: String,
 }
 
 struct Board {
@@ -798,13 +931,16 @@ fn upscale_all(
                 b.settled_weight -= weight[n as usize];
             }
             b.unreviewed.remove(&n);
-            let _ = std::fs::remove_file(plan.out(n));
             b.missing.insert(n);
             let problems = if note.trim().is_empty() {
                 "rejected by the user".to_string()
             } else {
                 format!("rejected by the user: {}", note.trim())
             };
+            let had_result = plan.out(n).is_file();
+            let attempt = b.record(n).attempts.max(1);
+            let prompt = b.slots[n as usize].prompt.clone();
+            let file = archive(plan, n, attempt, RejectedBy::User, &problems, &prompt);
             {
                 let r = b.record(n);
                 r.attempts = 0;
@@ -812,6 +948,15 @@ fn upscale_all(
                 r.problems = problems.clone();
                 r.rejections += 1;
                 r.manual = true;
+                if had_result {
+                    r.history.push(Rejection {
+                        attempt,
+                        by: RejectedBy::User,
+                        problems: problems.clone(),
+                        file,
+                        time: now_rfc3339(),
+                    });
+                }
             }
             let _ = std::fs::remove_file(&path);
             log::info!("frame {n} {problems}");
@@ -890,7 +1035,8 @@ fn upscale_all(
         let mut b = board.lock().unwrap();
         b.slots[n as usize].generating = false;
         match result {
-            Ok(()) => {
+            Ok(prompt) => {
+                b.slots[n as usize].prompt = prompt;
                 b.record(n).attempts += 1;
                 new_result(&mut b, n);
                 b.save(plan.review_file);
@@ -954,21 +1100,36 @@ fn upscale_all(
             Err(e) => (ReviewOutcome::Unchecked, format!("{e:#}")),
         };
         log::info!("review of frame {n} (attempt {attempts}): {outcome:?} {problems}");
+        let rejected = outcome != ReviewOutcome::Approved && outcome != ReviewOutcome::Unchecked;
+        // A rejected result is moved to the history; a kept one stays but is noted there.
+        let entry = rejected.then(|| {
+            let prompt = b.slots[n as usize].prompt.clone();
+            let file = (outcome == ReviewOutcome::Rejected)
+                .then(|| archive(plan, n, attempts, RejectedBy::Ai, &problems, &prompt))
+                .flatten();
+            Rejection {
+                attempt: attempts,
+                by: RejectedBy::Ai,
+                problems: problems.clone(),
+                file,
+                time: now_rfc3339(),
+            }
+        });
         {
             let r = b.record(n);
             r.outcome = Some(outcome);
             r.problems = problems.clone();
-            if outcome != ReviewOutcome::Approved && outcome != ReviewOutcome::Unchecked {
+            if rejected {
                 r.rejections += 1;
                 r.manual = false;
             }
+            r.history.extend(entry);
         }
         b.save(plan.review_file);
         if outcome.is_final() {
             b.slots[n as usize].settled = true;
             b.settled_weight += weight[n as usize];
         } else {
-            let _ = std::fs::remove_file(plan.out(n));
             b.missing.insert(n);
         }
         emit(ExportEvent::Reviewed {
@@ -1018,13 +1179,13 @@ fn make_frame(
     feedback: Option<&str>,
     cancel: &AtomicBool,
     emit: &(dyn Fn(ExportEvent) + Sync),
-) -> Result<()> {
+) -> Result<String> {
     let src = image::open(plan.src(n))?.to_rgb8();
     let mut attempt = 0;
     loop {
         check(cancel)?;
         let tmp = temp_dir(s);
-        let r = provider::upscale_frame(
+        let r = provider::upscale_frame_with_prompt(
             provider,
             s,
             &src,
@@ -1035,10 +1196,10 @@ fn make_frame(
             cancel,
         );
         match r {
-            Ok(img) => {
+            Ok((img, prompt)) => {
                 let _ = std::fs::remove_dir_all(&tmp);
                 save_atomic(&img, &plan.out(n))?;
-                return Ok(());
+                return Ok(prompt);
             }
             Err(e) if process::is_cancelled(&e) => return Err(e),
             Err(e) if attempt < 2 => {
@@ -1243,6 +1404,7 @@ mod tests {
             out_dir: &out_dir,
             review_file: &review_file,
             rejects_dir: &rejects_dir,
+            rejected_dir: &dir.path().join(REJECTED_DIR),
             target: (8, 6),
         };
         let mut s = Settings::default();
@@ -1310,5 +1472,58 @@ mod tests {
         assert_eq!(r2.rejections, 1);
         assert!(r2.manual);
         assert_eq!(st[2].record.as_ref().unwrap().rejections, 1); // frame 3 from the AI
+
+        // Rejected results are kept with their history.
+        let rej = dir.path().join(REJECTED_DIR);
+        assert!(rej.join("000003_try1.png").is_file());
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(rej.join("000003_try1.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["frame"], 3);
+        assert_eq!(meta["attempt"], 1);
+        assert_eq!(meta["by"], "ai");
+        assert!(meta["problems"].as_str().unwrap().contains("face changed"));
+        assert!(!meta["prompt"].as_str().unwrap().is_empty());
+        assert!(meta["time"].as_str().unwrap().ends_with('Z'));
+        let kept3 = image::open(rej.join("000003_try1.png")).unwrap().to_rgb8();
+        assert_eq!(kept3.get_pixel(0, 0).0[0], 128); // the grey, rejected result
+        assert!(rej.join("000002_try1.png").is_file());
+        let h3 = &st[2].record.as_ref().unwrap().history;
+        assert_eq!(h3.len(), 1);
+        assert_eq!(h3[0].by, RejectedBy::Ai);
+        assert_eq!(h3[0].attempt, 1);
+        assert_eq!(h3[0].file.as_deref(), Some("000003_try1.png"));
+        let h2 = &r2.history;
+        assert_eq!(h2.len(), 1);
+        assert_eq!(h2[0].by, RejectedBy::User);
+        assert_eq!(h2[0].file.as_deref(), Some("000002_try1.png"));
+        let v3 = rejected_versions(dir.path(), 3);
+        assert_eq!(v3.len(), 1);
+        assert_eq!(v3[0].0, rej.join("000003_try1.png"));
+        assert_eq!(rejected_versions(dir.path(), 2).len(), 1);
+        assert!(rejected_versions(dir.path(), 1).is_empty());
+
+        // A second hand rejection of the same attempt number does not overwrite the first.
+        reject_frame(dir.path(), 2, "too dark").unwrap();
+        let third = Fake {
+            log: Mutex::new(Vec::new()),
+        };
+        upscale_all(&plan, &s, &third, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert!(rej.join("000002_try1_2.png").is_file());
+        assert_eq!(rejected_versions(dir.path(), 2).len(), 2);
+    }
+
+    #[test]
+    fn old_review_files_without_history_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(REVIEW_FILE),
+            r#"{"1":{"attempts":2,"outcome":"approved","problems":"","rejections":1,"manual":false}}"#,
+        )
+        .unwrap();
+        let st = job_frames(dir.path(), 1);
+        let r = st[0].record.clone().unwrap();
+        assert_eq!(r.attempts, 2);
+        assert!(r.history.is_empty());
     }
 }

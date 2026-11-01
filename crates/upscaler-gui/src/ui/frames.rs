@@ -90,6 +90,16 @@ pub struct FrameBrowser {
         Option<egui::TextureHandle>,
     )>,
     note: String,
+    history: Option<History>,
+}
+
+/// The window with the rejected earlier versions of one frame.
+struct History {
+    n: u64,
+    /// Nothing arrived yet.
+    loading: bool,
+    current: Option<egui::TextureHandle>,
+    versions: Vec<(PathBuf, job::Rejection, Option<egui::TextureHandle>)>,
 }
 
 impl Default for FrameBrowser {
@@ -108,6 +118,7 @@ impl Default for FrameBrowser {
             selected: None,
             big: None,
             note: String::new(),
+            history: None,
         }
     }
 }
@@ -144,6 +155,7 @@ impl FrameBrowser {
         self.asked.clear();
         self.selected = None;
         self.big = None;
+        self.history = None;
         self.page = 0;
     }
 
@@ -202,6 +214,35 @@ impl FrameBrowser {
                 }
                 true
             }
+            Event::FrameHistory {
+                dir,
+                n,
+                current,
+                versions,
+            } => {
+                if Some(dir) == self.dir.as_ref()
+                    && self.history.as_ref().is_some_and(|h| h.n == *n)
+                {
+                    let load = |name: String, img: &Option<egui::ColorImage>| {
+                        img.as_ref().map(|i| {
+                            ctx.load_texture(name, i.clone(), egui::TextureOptions::LINEAR)
+                        })
+                    };
+                    self.history = Some(History {
+                        n: *n,
+                        loading: false,
+                        current: load(format!("hcur{n}"), current),
+                        versions: versions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (p, r, img))| {
+                                (p.clone(), r.clone(), load(format!("hrej{n}_{i}"), img))
+                            })
+                            .collect(),
+                    });
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -237,6 +278,97 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
         .resizable(true)
         .show(ctx, |ui| body(ui, app));
     app.frame_browser.open = open;
+    history_window(ctx, &mut app.frame_browser);
+}
+
+/// Rejected earlier versions of the double-clicked frame, next to the current result.
+fn history_window(ctx: &egui::Context, b: &mut FrameBrowser) {
+    let Some(h) = &b.history else { return };
+    let mut open = true;
+    let mut opened_png = None;
+    egui::Window::new(format!(
+        "{} #{}",
+        tr("Tidigare versioner – bildruta", "Earlier versions – frame"),
+        h.n
+    ))
+    .open(&mut open)
+    .default_size([820.0, 560.0])
+    .resizable(true)
+    .show(ctx, |ui| {
+        if h.loading {
+            ui.add(egui::Spinner::new());
+            return;
+        }
+        if h.versions.is_empty() {
+            ui.label(tr(
+                "Inga underkända versioner av den här bildrutan.",
+                "No rejected versions of this frame.",
+            ));
+        }
+        egui::ScrollArea::both().show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr("Nuvarande resultat", "Current result")).strong(),
+                    );
+                    match &h.current {
+                        Some(t) => {
+                            ui.add(egui::Image::new((t.id(), thumb_size(t))));
+                        }
+                        None => {
+                            ui.label(tr("saknas ännu", "not made yet"));
+                        }
+                    }
+                });
+                for (path, r, tex) in &h.versions {
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_width(360.0);
+                        let by = match r.by {
+                            job::RejectedBy::Ai => tr("AI", "AI"),
+                            job::RejectedBy::User => tr("du", "you"),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} · {} {by}",
+                                tr("Försök", "Attempt"),
+                                r.attempt,
+                                tr("underkänd av", "rejected by"),
+                            ))
+                            .strong(),
+                        );
+                        ui.label(egui::RichText::new(&r.time).small().weak());
+                        if let Some(t) = tex {
+                            let resp = ui
+                                .add(
+                                    egui::Image::new((t.id(), thumb_size(t)))
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(tr(
+                                    "Klicka för att öppna i full storlek",
+                                    "Click to open full size",
+                                ));
+                            if resp.clicked() {
+                                opened_png = Some(path.clone());
+                            }
+                        }
+                        ui.label(egui::RichText::new(&r.problems).small().color(WARN));
+                    });
+                }
+            });
+        });
+    });
+    if let Some(p) = opened_png {
+        worker::open(&p);
+    }
+    if !open {
+        b.history = None;
+    }
+}
+
+fn thumb_size(t: &egui::TextureHandle) -> egui::Vec2 {
+    let s = t.size_vec2();
+    egui::vec2(360.0, 360.0 * s.y / s.x.max(1.0))
 }
 
 fn body(ui: &mut egui::Ui, app: &mut UpscalerApp) {
@@ -369,7 +501,7 @@ fn body(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 .spacing([8.0, 8.0])
                 .show(ui, |ui| {
                     for (i, f) in page.iter().enumerate() {
-                        tile(ui, b, f, w);
+                        tile(ui, b, &bus, f, w);
                         if (i + 1) % COLUMNS == 0 {
                             ui.end_row();
                         }
@@ -428,7 +560,13 @@ fn status_text(f: &FrameStatus) -> (Color32, String) {
     }
 }
 
-fn tile(ui: &mut egui::Ui, b: &mut FrameBrowser, f: &FrameStatus, w: f32) {
+fn tile(
+    ui: &mut egui::Ui,
+    b: &mut FrameBrowser,
+    bus: &crate::worker::Bus,
+    f: &FrameStatus,
+    w: f32,
+) {
     let h = w * 9.0 / 16.0;
     let selected = b.selected == Some(f.n);
     let (color, text) = status_text(f);
@@ -477,11 +615,39 @@ fn tile(ui: &mut egui::Ui, b: &mut FrameBrowser, f: &FrameStatus, w: f32) {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("#{}", f.n)).strong());
                 ui.label(egui::RichText::new(text).small().color(color));
+                let earlier = f.record.as_ref().map_or(0, |r| r.history.len());
+                if earlier > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("↺ {earlier}"))
+                            .small()
+                            .color(WARN),
+                    )
+                    .on_hover_text(tr(
+                        "Tidigare underkända versioner – dubbelklicka för att se dem",
+                        "Earlier rejected versions – double-click to see them",
+                    ));
+                }
             });
         })
         .response
         .interact(egui::Sense::click());
-    if resp.clicked() {
+    if resp.double_clicked() {
+        // The first click of the pair may have toggled the detail view off.
+        if b.selected != Some(f.n) {
+            b.selected = Some(f.n);
+            b.big = None;
+            b.note.clear();
+        }
+        b.history = Some(History {
+            n: f.n,
+            loading: true,
+            current: None,
+            versions: Vec::new(),
+        });
+        if let Some(dir) = b.dir.clone() {
+            worker::frame_history(bus.clone(), dir, f.n);
+        }
+    } else if resp.clicked() {
         if b.selected == Some(f.n) {
             b.selected = None;
             b.big = None;

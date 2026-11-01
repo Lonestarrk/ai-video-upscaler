@@ -97,6 +97,25 @@ pub fn upscale_frame(
     work_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RgbImage> {
+    upscale_frame_with_prompt(
+        provider, settings, source, reference, feedback, target, work_dir, cancel,
+    )
+    .map(|(img, _)| img)
+}
+
+/// Like [`upscale_frame`], and also returns the exact prompt text sent to the service
+/// (empty for services that take none).
+#[allow(clippy::too_many_arguments)]
+pub fn upscale_frame_with_prompt(
+    provider: &dyn Provider,
+    settings: &Settings,
+    source: &RgbImage,
+    reference: Option<&RgbImage>,
+    feedback: Option<&str>,
+    target: (u32, u32),
+    work_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(RgbImage, String)> {
     std::fs::create_dir_all(work_dir)?;
     if !settings.provider.is_generative() {
         let req = Request {
@@ -107,7 +126,7 @@ pub fn upscale_frame(
             work_dir,
         };
         let out = provider.upscale(&req, cancel)?;
-        return Ok(if out.dimensions() == target {
+        let img = if out.dimensions() == target {
             out
         } else {
             image::imageops::resize(
@@ -116,7 +135,8 @@ pub fn upscale_frame(
                 target.1,
                 image::imageops::FilterType::Lanczos3,
             )
-        });
+        };
+        return Ok((img, String::new()));
     }
     // A new aspect ratio: the frame sits on a grey canvas of that shape for the AI to fill.
     let aspect = settings.aspect_change();
@@ -162,7 +182,7 @@ pub fn upscale_frame(
         work_dir,
     };
     let result = provider.upscale(&req, cancel)?;
-    Ok(frame::finish(&result, &prepared, target))
+    Ok((frame::finish(&result, &prepared, target), text))
 }
 
 /// Decodes PNG/JPEG/WebP bytes to RGB.
