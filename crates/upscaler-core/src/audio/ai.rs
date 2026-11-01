@@ -283,9 +283,16 @@ fn error_tail(lines: &[String]) -> String {
         .map(|l| l.trim_end())
         .filter(|l| !l.trim().is_empty())
         .collect();
-    let start = lines.len().saturating_sub(8);
-    let tail = lines[start..].join("\n");
-    match lines.iter().rev().find_map(|l| l.strip_prefix("ERROR: ")) {
+    let message = lines.iter().rev().find_map(|l| l.strip_prefix("ERROR: "));
+    // The ERROR: line leads the text, so the tail leaves it out.
+    let rest: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| message.is_none() || !l.starts_with("ERROR: "))
+        .collect();
+    let tail = rest[rest.len().saturating_sub(8)..].join("\n");
+    match message {
+        Some(msg) if tail.is_empty() => msg.to_string(),
         Some(msg) => format!("{msg}\n{tail}"),
         None if tail.is_empty() => "no error output".into(),
         None => tail,
@@ -295,6 +302,22 @@ fn error_tail(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_tail_names_the_error_once() {
+        let lines: Vec<String> = [
+            "Traceback (most recent call last):",
+            "  File x",
+            "ERROR: boom",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let text = error_tail(&lines);
+        assert_eq!(text.matches("boom").count(), 1, "{text}");
+        assert!(text.starts_with("boom"), "{text}");
+        assert!(text.contains("Traceback"), "{text}");
+    }
 
     #[test]
     fn parses_progress_lines() {

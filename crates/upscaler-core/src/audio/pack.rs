@@ -9,6 +9,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -186,8 +187,23 @@ pub fn remove() -> Result<()> {
     remove_in(&pack_dir())
 }
 
+/// Removes the pack. `installed.json` goes first and the step markers next, so a remove that
+/// is interrupted halfway never leaves a pack that looks installed or half-done.
 pub fn remove_in(dir: &Path) -> Result<()> {
     if dir.exists() {
+        let installed = dir.join(INSTALLED_FILE);
+        if installed.exists() {
+            std::fs::remove_file(&installed)
+                .with_context(|| format!("could not remove {}", installed.display()))?;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(".steps-v") {
+                    std::fs::remove_dir_all(e.path())
+                        .with_context(|| format!("could not remove {}", e.path().display()))?;
+                }
+            }
+        }
         std::fs::remove_dir_all(dir)
             .with_context(|| format!("could not remove {}", dir.display()))?;
     }
@@ -212,7 +228,9 @@ pub fn install_in(
     let downloads = dir.join("downloads");
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("ai-video-upscaler/", env!("CARGO_PKG_VERSION")))
+        // No total timeout (wheels are hundreds of MB); stalls are caught by download_with.
         .timeout(None)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()?;
     let py = python_exe(dir);
     let script = write_script(dir)?;
@@ -324,9 +342,19 @@ pub fn install_in(
     let _ = std::fs::remove_dir_all(&downloads);
 
     report(stage::CHECK, 0.95, 1.0, 0.0);
-    let out = ai::run_worker(&py, &script, &["device"], cancel, &mut |_| {})
-        .context("the AI audio pack does not start")?;
-    let device = ai::parse_device(&out)?;
+    let probe = ai::run_worker(&py, &script, &["device"], cancel, &mut |_| {})
+        .context("the AI audio pack does not start")
+        .and_then(|out| ai::parse_device(&out));
+    let device = match probe {
+        Ok(d) => d,
+        Err(e) => {
+            // Torch has no cheap file check: a pack that does not start redoes torch next time.
+            if !process::is_cancelled(&e) {
+                forget_step(dir, "torch");
+            }
+            return Err(e);
+        }
+    };
     let marker =
         serde_json::json!({"version": PACK_VERSION, "device": ai::device_to_json(&device)});
     write_atomic(&dir.join(INSTALLED_FILE), marker.to_string().as_bytes())?;
@@ -441,8 +469,7 @@ fn python<S: AsRef<std::ffi::OsStr>>(py: &Path, args: &[S], cancel: &AtomicBool)
     Ok(())
 }
 
-/// Downloads `url` to `dest` through `dest.part`; an existing `dest` counts as done.
-/// `progress` gets 0..=1 when the size is known.
+/// [`download_with`] with the standard idle timeout.
 fn download(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -450,55 +477,7 @@ fn download(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32),
 ) -> Result<()> {
-    if dest.is_file() {
-        progress(1.0);
-        return Ok(());
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let part = part_path(dest);
-    let result = (|| -> Result<()> {
-        let mut resp = client
-            .get(url)
-            .send()
-            .with_context(|| format!("could not download {url}"))?
-            .error_for_status()
-            .with_context(|| format!("could not download {url}"))?;
-        let total = resp.content_length();
-        let mut file = std::fs::File::create(&part)?;
-        let mut buf = vec![0u8; 1 << 16];
-        let mut done = 0u64;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                bail!(Cancelled);
-            }
-            let n = resp
-                .read(&mut buf)
-                .with_context(|| format!("the download of {url} broke off"))?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])?;
-            done += n as u64;
-            if let Some(t) = total.filter(|&t| t > 0) {
-                progress((done as f32 / t as f32).min(1.0));
-            }
-        }
-        if let Some(t) = total {
-            if done != t {
-                bail!("the download of {url} is incomplete ({done} of {t} bytes)");
-            }
-        }
-        file.flush()?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
-    }
-    std::fs::rename(&part, dest).with_context(|| format!("could not finish {}", dest.display()))?;
-    Ok(())
+    download_with(client, url, dest, cancel, progress, IDLE_TIMEOUT)
 }
 
 fn part_path(path: &Path) -> PathBuf {
@@ -559,15 +538,174 @@ fn unpack_stripped(zip_path: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs `f` unless step `name` is already marked done in `dir`; marks it done on success.
+/// The folder of finished-step markers; per pack version, so a newer pack redoes every step.
+fn steps_dir(dir: &Path) -> PathBuf {
+    dir.join(format!(".steps-v{PACK_VERSION}"))
+}
+
+/// Whether what step `name` produced is still on disk. Steps without a cheap file check
+/// (torch, packages) count as present; the final `device` probe covers torch.
+fn step_outputs_present(dir: &Path, name: &str) -> bool {
+    match name {
+        // pip, torch and the packages live inside the Python folder.
+        "python" | "pip" | "torch" | "packages" if !python_exe(dir).is_file() => false,
+        "msst" => dir.join("msst").join("utils").join("settings.py").is_file(),
+        "models" => MODELS
+            .iter()
+            .all(|(_, file)| dir.join("models").join(file).is_file()),
+        _ => true,
+    }
+}
+
+/// Runs `f` unless step `name` is marked done in `dir` and its outputs are still there;
+/// marks it done on success.
 fn step(dir: &Path, name: &str, f: impl FnOnce() -> Result<()>) -> Result<()> {
-    // Per pack version, so a newer pack redoes every step.
-    let marker = dir.join(format!(".steps-v{PACK_VERSION}")).join(name);
-    if marker.is_file() {
+    let marker = steps_dir(dir).join(name);
+    if marker.is_file() && step_outputs_present(dir, name) {
         return Ok(());
+    }
+    if name == "python" {
+        // A new Python folder has none of pip, torch or the packages: redo everything.
+        let _ = std::fs::remove_dir_all(steps_dir(dir));
+    } else {
+        let _ = std::fs::remove_file(&marker);
     }
     f()?;
     write_atomic(&marker, b"done")
+}
+
+/// Clears step `name`'s marker so the next install runs it again.
+fn forget_step(dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(steps_dir(dir).join(name));
+}
+
+/// No data for this long fails a download.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum Chunk {
+    Start(Option<u64>),
+    Data(Vec<u8>),
+    Done,
+    Failed(anyhow::Error),
+}
+
+/// Downloads `url` to `dest` through `dest.part`; an existing `dest` counts as done.
+/// `progress` gets 0..=1 when the size is known. The network is read on a helper thread so
+/// cancel is seen within ~100 ms and `idle` without data is an error even when the socket
+/// stalls; any failure removes the `.part`.
+fn download_with(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+    idle: Duration,
+) -> Result<()> {
+    if dest.is_file() {
+        progress(1.0);
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let part = part_path(dest);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(16);
+    {
+        let client = client.clone();
+        let url = url.to_string();
+        // Detached: on cancel or a stall it ends when its next send fails or the socket dies.
+        std::thread::spawn(move || {
+            let resp = client.get(&url).send().and_then(|r| r.error_for_status());
+            let mut resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Chunk::Failed(
+                        anyhow::Error::new(e).context(format!("could not download {url}")),
+                    ));
+                    return;
+                }
+            };
+            if tx.send(Chunk::Start(resp.content_length())).is_err() {
+                return;
+            }
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                match resp.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(Chunk::Done);
+                        return;
+                    }
+                    Ok(n) => {
+                        if tx.send(Chunk::Data(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Chunk::Failed(
+                            anyhow::Error::new(e)
+                                .context(format!("the download of {url} broke off")),
+                        ));
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    let result = (|| -> Result<()> {
+        let mut file: Option<std::fs::File> = None;
+        let mut total = None;
+        let mut done = 0u64;
+        let mut last_data = std::time::Instant::now();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!(Cancelled);
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Chunk::Start(len)) => {
+                    total = len;
+                    file = Some(std::fs::File::create(&part)?);
+                    last_data = std::time::Instant::now();
+                }
+                Ok(Chunk::Data(bytes)) => {
+                    let f = file.as_mut().context("download data before its start")?;
+                    f.write_all(&bytes)?;
+                    done += bytes.len() as u64;
+                    last_data = std::time::Instant::now();
+                    if let Some(t) = total.filter(|&t| t > 0) {
+                        progress((done as f32 / t as f32).min(1.0));
+                    }
+                }
+                Ok(Chunk::Done) => break,
+                Ok(Chunk::Failed(e)) => return Err(e),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if last_data.elapsed() > idle {
+                        bail!(
+                            "the download of {url} stalled (no data for {} s)",
+                            idle.as_secs()
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("the download of {url} stopped unexpectedly");
+                }
+            }
+        }
+        if let Some(t) = total {
+            if done != t {
+                bail!("the download of {url} is incomplete ({done} of {t} bytes)");
+            }
+        }
+        let mut f = file.context("the download produced no file")?;
+        f.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, dest).with_context(|| format!("could not finish {}", dest.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -692,15 +830,146 @@ mod tests {
     }
 
     #[test]
+    fn markers_without_outputs_rerun_the_step() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_pack(dir.path(), r#"{"device":"cpu"}"#);
+        for name in ["python", "pip", "torch", "msst", "packages", "models"] {
+            step(dir.path(), name, || Ok(())).unwrap();
+        }
+        // A deleted model: the models step runs again, the others stay done.
+        std::fs::remove_file(dir.path().join("models").join(MODELS[0].1)).unwrap();
+        let mut ran = Vec::new();
+        for name in ["msst", "packages", "models"] {
+            step(dir.path(), name, || {
+                ran.push(name);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(ran, ["models"]);
+
+        // Deleted MSST source: msst runs again.
+        std::fs::remove_dir_all(dir.path().join("msst")).unwrap();
+        let mut ran = false;
+        step(dir.path(), "msst", || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(ran);
+
+        // Deleted Python: everything that lives inside it (pip, torch, packages) redoes too.
+        std::fs::remove_file(python_exe(dir.path())).unwrap();
+        let mut ran = Vec::new();
+        for name in ["python", "pip", "torch", "packages"] {
+            step(dir.path(), name, || {
+                ran.push(name);
+                if name == "python" {
+                    std::fs::write(python_exe(dir.path()), b"exe")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(ran, ["python", "pip", "torch", "packages"]);
+    }
+
+    #[test]
+    fn forgetting_a_step_makes_it_run_again() {
+        let dir = tempfile::tempdir().unwrap();
+        step(dir.path(), "torch", || Ok(())).unwrap();
+        forget_step(dir.path(), "torch");
+        let mut ran = false;
+        step(dir.path(), "torch", || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(ran);
+    }
+
+    #[test]
+    fn pack_without_installed_file_is_not_installed() {
+        // What an interrupted remove leaves behind: installed.json goes first.
+        let dir = tempfile::tempdir().unwrap();
+        fake_pack(dir.path(), r#"{"device":"cpu"}"#);
+        step(dir.path(), "models", || Ok(())).unwrap();
+        std::fs::remove_file(dir.path().join(INSTALLED_FILE)).unwrap();
+        assert!(dir.path().join("models").exists());
+        assert!(!status_in(dir.path()).installed);
+    }
+
+    /// A local server that sends headers and 3 of 1000 body bytes, then stalls.
+    fn stalling_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nabc");
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        (url, handle)
+    }
+
+    fn run_download(
+        url: String,
+        dest: PathBuf,
+        cancel: std::sync::Arc<AtomicBool>,
+        idle: Duration,
+    ) -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::new();
+            let r = download_with(&client, &url, &dest, &cancel, &mut |_| {}, idle);
+            let _ = tx.send(r);
+        });
+        rx.recv_timeout(Duration::from_secs(4))
+            .expect("the download hung")
+    }
+
+    #[test]
+    fn stalled_download_times_out_and_leaves_no_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        let (url, _server) = stalling_server();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let err = run_download(url, dest.clone(), cancel, Duration::from_millis(500)).unwrap_err();
+        assert!(format!("{err:#}").contains("stalled"), "{err:#}");
+        assert!(!dest.exists());
+        assert!(!part_path(&dest).exists());
+    }
+
+    #[test]
+    fn cancel_stops_a_stalled_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        let (url, _server) = stalling_server();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let err = run_download(url, dest.clone(), cancel, Duration::from_secs(60)).unwrap_err();
+        assert!(process::is_cancelled(&err), "{err:#}");
+        assert!(!part_path(&dest).exists());
+    }
+
+    #[test]
     fn done_steps_are_skipped_and_failed_steps_rerun() {
         let dir = tempfile::tempdir().unwrap();
+        fake_pack(dir.path(), r#"{"device":"cpu"}"#);
         let mut calls = 0;
-        step(dir.path(), "models", || {
+        step(dir.path(), "packages", || {
             calls += 1;
             Ok(())
         })
         .unwrap();
-        step(dir.path(), "models", || {
+        step(dir.path(), "packages", || {
             calls += 1;
             Ok(())
         })
