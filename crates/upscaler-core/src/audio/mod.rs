@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod classic;
 pub mod dsp;
+pub mod enhance;
 pub mod io;
 pub mod lfe;
 pub mod pack;
