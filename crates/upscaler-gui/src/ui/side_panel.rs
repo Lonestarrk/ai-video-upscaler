@@ -626,13 +626,16 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     .desired_width(ui.available_width()),
             );
             if x.stage == Stage::Audio {
-                ui.label(format!(
-                    "{} {} {} {}",
-                    tr("Ljuddel", "Audio section"),
-                    x.done,
-                    tr("av", "of"),
-                    x.total
-                ));
+                // Until the job reports its sections the count is a placeholder (0 of 1).
+                if x.audio_sections_known {
+                    ui.label(format!(
+                        "{} {} {} {}",
+                        tr("Ljuddel", "Audio section"),
+                        x.done,
+                        tr("av", "of"),
+                        x.total
+                    ));
+                }
             } else {
                 ui.label(format!("{} / {}", x.done, x.total));
             }
@@ -774,7 +777,7 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new(super::audio::error_text(e))
+                    egui::RichText::new(super::audio::plan_error_text(e))
                         .small()
                         .color(BAD),
                 );
@@ -844,14 +847,23 @@ fn export(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         );
     }
     ui.add_space(4.0);
-    let ready = app.tools.is_some() && app.preview.is_none();
-    if primary_button(
+    // The audio AI pack is being installed or removed while the export would use it.
+    let pack_busy = app.audio_pack.busy() && super::audio::export_needs_ai(app);
+    let ready = app.tools.is_some() && app.preview.is_none() && !pack_busy;
+    let button = primary_button(
         ui,
         format!("⬇ {}", tr("Exportera video…", "Export video…")),
         ready,
-    )
-    .clicked()
-    {
+    );
+    let button = if pack_busy {
+        button.on_disabled_hover_text(tr(
+            "Ljud-AI installeras eller tas bort just nu. Vänta tills det är klart, eller välj Klassisk motor och stäng av Förbättra ljudkvaliteten.",
+            "The audio AI is being installed or removed. Wait until it is done, or choose the Classic engine and turn off Improve the audio quality.",
+        ))
+    } else {
+        button
+    };
+    if button.clicked() {
         app.start_export();
     }
     if app.preview.is_some() {

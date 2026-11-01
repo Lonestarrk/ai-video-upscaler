@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENGLISH: AtomicBool = AtomicBool::new(false);
 
+/// Tests that switch the language hold this, so they never see each other's language.
+#[cfg(test)]
+pub static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn set_english(en: bool) {
     ENGLISH.store(en, Ordering::Relaxed);
 }
@@ -95,18 +99,22 @@ pub fn format_duration(seconds: f64) -> String {
     }
 }
 
+/// "5,7 GB" / "5.7 GB": decimal units (1 GB = 10⁹ bytes, as Windows' download sizes and
+/// disk makers state them), with the decimal comma in Swedish.
 pub fn format_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;
     let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
         u += 1;
     }
     if u == 0 {
         format!("{b} B")
     } else {
-        format!("{v:.1} {}", UNITS[u])
+        let n = format!("{v:.1}");
+        let n = if english() { n } else { n.replace('.', ",") };
+        format!("{n} {}", UNITS[u])
     }
 }
 
@@ -118,6 +126,12 @@ mod tests {
     fn formats() {
         assert_eq!(format_time(83.5), "01:23.50");
         assert_eq!(format_time(3723.0), "1:02:03.00");
-        assert_eq!(format_bytes(1536), "1.5 KB");
+        let _lang = TEST_LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
+        set_english(true);
+        assert_eq!(format_bytes(1500), "1.5 KB");
+        assert_eq!(format_bytes(5_700_000_000), "5.7 GB");
+        set_english(false);
+        assert_eq!(format_bytes(5_700_000_000), "5,7 GB");
+        assert_eq!(format_bytes(999), "999 B");
     }
 }

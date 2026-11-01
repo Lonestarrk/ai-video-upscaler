@@ -17,6 +17,9 @@ use crate::app::UpscalerApp;
 use crate::i18n::{english, format_bytes, format_duration, tr};
 use crate::worker;
 
+/// The installed pack's size on disk (about 5.7 GB with the GPU torch), for the install button.
+pub const PACK_SIZE_BYTES: u64 = 5_700_000_000;
+
 /// Rough local-AI speed on a CPU: seconds of work per minute of audio.
 pub const CPU_SECONDS_PER_AUDIO_MINUTE: f64 = 250.0;
 
@@ -156,11 +159,12 @@ fn device_line(app: &UpscalerApp) -> Option<(Color32, String, Option<String>)> {
 pub fn side_section(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     section(ui, tr("Ljud", "Audio"));
     let src = source_of(app);
-    let (mono, surround_src, no_audio) = match src {
-        Source::Some(a) => (a.channels == 1, a.is_surround(), false),
-        Source::None => (false, false, true),
-        _ => (false, false, false),
+    let (mono, surround_src) = match src {
+        Source::Some(a) => (a.channels == 1, a.is_surround()),
+        _ => (false, false),
     };
+    let reading = matches!(src, Source::Reading);
+    let failed = matches!(src, Source::Failed(_));
     let known: Option<SourceAudio> = match src {
         Source::Some(a) => Some(a.clone()),
         _ => None,
@@ -189,11 +193,13 @@ pub fn side_section(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             .on_hover_text(e.to_string());
         }
         Source::None => {
+            // Nothing to choose: the saved choices stay for the next video.
             ui.label(
                 egui::RichText::new(tr("Videon har inget ljud.", "The video has no audio."))
                     .weak()
                     .small(),
             );
+            return;
         }
         Source::Some(a) => {
             ui.label(
@@ -219,7 +225,7 @@ pub fn side_section(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     }
 
     let locked = app.exporting();
-    ui.add_enabled_ui(!locked && !no_audio, |ui| {
+    ui.add_enabled_ui(!locked, |ui| {
         let s = &mut app.settings;
         let mut mode = s.audio_mode;
         ui.horizontal(|ui| {
@@ -358,11 +364,30 @@ pub fn side_section(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         ));
     });
 
-    status_lines(ui, app, known.as_ref());
+    status_lines(ui, app, known.as_ref(), reading, failed);
+}
+
+/// Whether an export started now would use the AI audio pack.
+pub fn export_needs_ai(app: &UpscalerApp) -> bool {
+    let s = &app.settings;
+    if !s.audio_active() {
+        return false;
+    }
+    match source_of(app) {
+        Source::Some(a) => audio_job::plan_job(s, Some(a), true).is_ok_and(|p| p.needs_ai()),
+        Source::None | Source::Failed(_) => false,
+        Source::NoVideo | Source::Reading => audio_job::may_use_ai(s),
+    }
 }
 
 /// Where the work runs, what the file gets, and the "pack missing" warning.
-fn status_lines(ui: &mut egui::Ui, app: &mut UpscalerApp, src: Option<&SourceAudio>) {
+fn status_lines(
+    ui: &mut egui::Ui,
+    app: &mut UpscalerApp,
+    src: Option<&SourceAudio>,
+    reading: bool,
+    failed: bool,
+) {
     let s = &app.settings;
     if !s.audio_active() {
         ui.label(
@@ -375,14 +400,32 @@ fn status_lines(ui: &mut egui::Ui, app: &mut UpscalerApp, src: Option<&SourceAud
         );
         return;
     }
+    if reading {
+        return; // the spinner above says it; the lines follow once the source is known
+    }
+    if failed {
+        ui.label(
+            egui::RichText::new(tr(
+                "Utan läsbart ljudspår går det inte att exportera med nytt ljud. Välj Oförändrat.",
+                "Without a readable audio track the export cannot make new audio. Choose Unchanged.",
+            ))
+            .small()
+            .color(BAD),
+        );
+        return;
+    }
     let plan = src.map(|a| audio_job::plan_job(s, Some(a), true));
     let (needs_ai, channels) = match &plan {
         Some(Ok(p)) => (p.needs_ai(), p.channels()),
         Some(Err(e)) => {
             ui.label(
-                egui::RichText::new(format!("{} {e}", tr("Går inte:", "Not possible:")))
-                    .small()
-                    .color(BAD),
+                egui::RichText::new(format!(
+                    "{} {}",
+                    tr("Går inte:", "Not possible:"),
+                    plan_error_text(&e.to_string())
+                ))
+                .small()
+                .color(BAD),
             );
             return;
         }
@@ -611,9 +654,13 @@ pub fn pack_tab(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         ui.horizontal_wrapped(|ui| {
             if !installed {
                 let label = if on_disk {
-                    tr("Fortsätt installera", "Continue installing")
+                    tr("Fortsätt installera", "Continue installing").to_string()
                 } else {
-                    tr("Installera (cirka 5,7 GB)", "Install (about 5.7 GB)")
+                    format!(
+                        "{} {})",
+                        tr("Installera (cirka", "Install (about"),
+                        format_bytes(PACK_SIZE_BYTES)
+                    )
                 };
                 install = primary_button(ui, label, !exporting)
                     .on_hover_text(tr(
@@ -690,9 +737,13 @@ pub fn pack_tab(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !app.audio_pack.probing,
+                    !app.audio_pack.probing && !exporting,
                     egui::Button::new(tr("Testa", "Test")),
                 )
+                .on_disabled_hover_text(tr(
+                    "Vänta tills exporten är klar.",
+                    "Wait for the export to finish.",
+                ))
                 .on_hover_text(tr(
                     "Startar ljud-AI:n och frågar vilken enhet den använder (tar några sekunder).",
                     "Starts the audio AI and asks which device it uses (takes a few seconds).",
@@ -817,6 +868,38 @@ pub fn warning_text(w: &str) -> String {
     format!("Ljudvarning: {w}")
 }
 
+/// `plan_job`'s refusals (English from core) in the UI language; others as they are.
+pub fn plan_error_text(e: &str) -> String {
+    if e.contains("mono source cannot be turned into 5.1") {
+        return tr(
+            "Källan är mono, och 5.1 kan inte göras av en enda kanal.",
+            "The source is mono, and 5.1 cannot be made from a single channel.",
+        )
+        .into();
+    }
+    if e.contains("the video has no audio track") {
+        return tr("Videon har inget ljud.", "The video has no audio.").into();
+    }
+    if let Some(n) = e
+        .split_once("-channel audio is not supported")
+        .and_then(|(n, _)| n.rsplit(' ').next())
+    {
+        return if english() {
+            format!("{n}-channel audio is not supported (mono, stereo and 5.1 are).")
+        } else {
+            format!("Ljud med {n} kanaler stöds inte (mono, stereo och 5.1 gör det).")
+        };
+    }
+    if e.contains("keep the original audio") {
+        return tr(
+            "Inställningarna behåller originalljudet.",
+            "The settings keep the original audio.",
+        )
+        .into();
+    }
+    error_text(e)
+}
+
 /// An export error in the UI language when it is a known audio one.
 pub fn error_text(e: &str) -> String {
     if e.contains(PACK_MISSING) {
@@ -835,6 +918,9 @@ mod tests {
 
     #[test]
     fn translates_known_warnings() {
+        let _lang = crate::i18n::TEST_LANGUAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_english(false);
         assert_eq!(
             warning_text("The new audio's loudness differs from the source by +1.3 LU."),
@@ -858,7 +944,44 @@ mod tests {
     }
 
     #[test]
+    fn translates_plan_errors() {
+        let _lang = crate::i18n::TEST_LANGUAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set_english(false);
+        // Built from the real refusals, so a changed core text shows up here.
+        let s = upscaler_core::settings::Settings {
+            audio_mode: AudioMode::Surround,
+            ..Default::default()
+        };
+        let src = |channels| SourceAudio {
+            channels,
+            codec: "ac3".into(),
+            dolby_surround: false,
+            dialnorm: None,
+        };
+        let err = |a: &SourceAudio| {
+            audio_job::plan_job(&s, Some(a), true)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            plan_error_text(&err(&src(1))),
+            "Källan är mono, och 5.1 kan inte göras av en enda kanal."
+        );
+        assert_eq!(
+            plan_error_text(&err(&src(4))),
+            "Ljud med 4 kanaler stöds inte (mono, stereo och 5.1 gör det)."
+        );
+        let none = audio_job::plan_job(&s, None, true).unwrap_err().to_string();
+        assert_eq!(plan_error_text(&none), "Videon har inget ljud.");
+    }
+
+    #[test]
     fn cpu_estimate_scales_with_duration() {
+        let _lang = crate::i18n::TEST_LANGUAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::i18n::set_english(false);
         // 45 min × 250 s = 3.1 h.
         assert_eq!(

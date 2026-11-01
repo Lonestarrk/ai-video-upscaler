@@ -106,6 +106,8 @@ pub struct ExportState {
     pub audio_path: bool,
     /// The audio job's current step.
     pub audio_stage: Option<AudioStage>,
+    /// A section count has arrived (before that the audio progress is a placeholder 0/1).
+    pub audio_sections_known: bool,
     /// The audio job's warnings (English from core; translated when shown).
     pub audio_warnings: Vec<String>,
 }
@@ -596,6 +598,7 @@ impl UpscalerApp {
             review_notes: Vec::new(),
             audio_path,
             audio_stage: None,
+            audio_sections_known: false,
             audio_warnings: Vec::new(),
         });
     }
@@ -965,7 +968,8 @@ impl UpscalerApp {
                             x.audio_warnings.push(w);
                         }
                     }
-                    AudioEvent::Section { .. } => {} // also sent as Progress
+                    // The counts come as Progress; this only says they are real now.
+                    AudioEvent::Section { .. } => x.audio_sections_known = true,
                 }
             }
             ExportEvent::Finished(p) => {
