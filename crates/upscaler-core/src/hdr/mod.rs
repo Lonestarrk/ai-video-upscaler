@@ -2,6 +2,7 @@
 //! and the encoder parameters.
 
 pub mod convert;
+pub mod hdr10plus;
 pub mod itm;
 pub mod measure;
 
@@ -37,12 +38,31 @@ pub fn x265_params(h: &HdrEncode, crf: u8) -> String {
             h.max_fall
         ));
         if let Some(json) = &h.hdr10plus_json {
-            p.push_str(&format!(":dhdr10-info={}", json.display()));
+            p.push_str(&format!(":dhdr10-info={}", escape_param(json)));
         }
     } else {
         p.push_str(":transfer=arib-std-b67");
     }
     p
+}
+
+/// A path as a value inside ffmpeg's `-x265-params key=value:key=value`. ffmpeg splits that
+/// string on `:` and honours backslash escapes, so the `:` of a Windows drive letter and the
+/// backslashes of the path would break it. Separators become `/` (accepted by Windows) and
+/// `:` and `'` are backslash-escaped for ffmpeg's parser.
+fn escape_param(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '\\' => out.push('/'),
+            ':' | '\'' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The `-color_trc` name of the mode.
@@ -84,6 +104,17 @@ mod tests {
         let mut h = enc(HdrMode::Hdr10Plus);
         h.hdr10plus_json = Some(PathBuf::from("m.json"));
         assert!(x265_params(&h, 18).contains("dhdr10-info=m.json"));
+    }
+
+    #[test]
+    fn x265_params_escapes_windows_path() {
+        let mut h = enc(HdrMode::Hdr10Plus);
+        h.hdr10plus_json = Some(PathBuf::from(r"H:\My Jobs\a'b\hdr10plus.json"));
+        let p = x265_params(&h, 18);
+        assert!(
+            p.contains(r"dhdr10-info=H\:/My Jobs/a\'b/hdr10plus.json"),
+            "{p}"
+        );
     }
 
     #[test]

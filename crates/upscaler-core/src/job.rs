@@ -653,12 +653,25 @@ fn export(
         check(cancel)?;
         base += weight;
         // HLG carries no static light levels.
+        let mut hdr10plus_json = None;
         let (max_cll, max_fall) = if pq {
             let m = crate::hdr::measure::measure_dir(&hdr_frames, encode_total, cancel, |f| {
                 report(base, f)
             });
             check(cancel)?;
             let m = m?;
+            if s.hdr_mode == crate::settings::HdrMode::Hdr10Plus {
+                // Scene ids follow the export's cut list, mapped to the encoded frames.
+                let cuts = crate::hdr::hdr10plus::encoded_cuts(
+                    &cut,
+                    s.skip_duplicates || s.sequential(),
+                    divisor,
+                    m.frames.len(),
+                );
+                let path = dir.join("hdr10plus.json");
+                crate::hdr::hdr10plus::write_json(&m, &cuts, s.hdr_peak_nits, &path)?;
+                hdr10plus_json = Some(path);
+            }
             (m.max_cll, m.max_fall)
         } else {
             (0, 0)
@@ -668,8 +681,7 @@ fn export(
             peak_nits: s.hdr_peak_nits,
             max_cll,
             max_fall,
-            // Per-scene HDR10+ metadata comes later; Hdr10Plus encodes as HDR10 until then.
-            hdr10plus_json: None,
+            hdr10plus_json,
         });
     }
     let encode_dir = if hdr.is_some() { &hdr_frames } else { &out_dir };

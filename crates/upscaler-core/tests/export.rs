@@ -1525,3 +1525,100 @@ fn hdr_encode_keeps_pq_code_values() {
         );
     }
 }
+
+#[test]
+fn hdr10plus_export_carries_dynamic_metadata() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    // The temp dir (and so the job folder with hdr10plus.json) has a drive letter and
+    // backslashes on Windows: the path must survive ffmpeg's -x265-params parsing.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10Plus, "hdr10plus.mp4");
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    let json = spec.job_dir().join("hdr10plus.json");
+    assert!(json.is_file(), "{} missing", json.display());
+    eprintln!("json path: {}", json.display());
+
+    let j = first_frame_json(&tools, &spec.output);
+    let side = j["frames"][0]["side_data_list"].as_array().unwrap();
+    let types: Vec<&str> = side
+        .iter()
+        .map(|d| d["side_data_type"].as_str().unwrap())
+        .collect();
+    assert!(
+        types.iter().any(|t| t.contains("SMPTE2094-40")),
+        "no HDR10+ side data: {types:?}"
+    );
+    assert!(types.iter().any(|t| t.starts_with("Mastering display")));
+}
+
+/// Round trip through `hdr10plus_tool extract`: frame count and MaxScl of frame 0 match the
+/// measurement. Needs the tool on PATH or in UPSCALER_HDR10PLUS_TOOL; skipped otherwise.
+#[test]
+fn hdr10plus_round_trip() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let tool = std::env::var("UPSCALER_HDR10PLUS_TOOL")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "hdr10plus_tool".into());
+    if std::process::Command::new(&tool)
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("hdr10plus_tool not found (PATH or UPSCALER_HDR10PLUS_TOOL), skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10Plus, "hdr10plus.mp4");
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    let hevc = dir.path().join("raw.hevc");
+    let st = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&spec.output)
+        .args(["-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc"])
+        .arg(&hevc)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let extracted = dir.path().join("extracted.json");
+    let st = std::process::Command::new(&tool)
+        .arg("extract")
+        .arg(&hevc)
+        .arg("-o")
+        .arg(&extracted)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let j: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&extracted).unwrap()).unwrap();
+    let m = upscaler_core::hdr::measure::measure_dir(
+        &upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()),
+        spec.job_frames(),
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    let frames = j["SceneInfo"].as_array().unwrap();
+    assert_eq!(frames.len(), m.frames.len());
+    let got: Vec<f64> = frames[0]["LuminanceParameters"]["MaxScl"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    for (g, want) in got.iter().zip(m.frames[0].max_scl) {
+        assert!(
+            (g - want as f64 * 10.0).abs() <= 2.0,
+            "{got:?} vs {:?}",
+            m.frames[0]
+        );
+    }
+}
