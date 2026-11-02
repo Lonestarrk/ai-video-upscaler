@@ -689,23 +689,52 @@ pub fn encode(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
-    let build = |audio_codec: &str| {
+    // The audio: first cut by stream copy into a file of its own with `cut_original`'s
+    // two-stage seek. A plain `-ss` before the source's `-i` with `-c:a copy` keeps every
+    // packet back to the demuxer's seek point (the video keyframe before the range: seconds
+    // of audio before the picture on long-GOP sources). Encoding to AAC straight from the
+    // source is the fallback; when decoding, the input seek is exact.
+    let audio_cut = out.with_extension("audio.part.mka");
+    let mut copied = None;
+    if let Some((src, start, dur)) = &opts.audio_from {
+        match cut_original(tools, src, *start, *dur, true, &audio_cut, cancel) {
+            Ok(()) => copied = Some(audio_cut.clone()),
+            Err(e) if process::is_cancelled(&e) => {
+                let _ = std::fs::remove_file(&audio_cut);
+                return Err(e);
+            }
+            Err(e) => log::info!("cutting the audio by stream copy failed ({e})"),
+        }
+    }
+    let build = |audio: Option<&Path>| {
         let mut cmd = tools.ffmpeg_cmd();
-        cmd.arg("-y")
-            .arg("-framerate")
+        cmd.arg("-y");
+        if audio.is_some() {
+            // Keeps the cut's sub-frame start (its first whole packet may begin a few ms
+            // into the range), as `mux` does.
+            cmd.arg("-copyts");
+        }
+        cmd.arg("-framerate")
             .arg(format!("{}/{}", opts.in_fps_num, opts.in_fps_den))
             .args(["-start_number", "1", "-i"])
             .arg(frames_dir.join("%06d.png"));
-        if let Some((src, start, dur)) = &opts.audio_from {
-            cmd.arg("-ss")
-                .arg(format!("{start:.4}"))
-                .arg("-t")
-                .arg(format!("{dur:.4}"))
-                .arg("-i")
-                .arg(src);
-            cmd.args(["-map", "0:v:0", "-map", "1:a:0?"]);
-        } else {
-            cmd.args(["-map", "0:v:0"]);
+        match (audio, &opts.audio_from) {
+            (Some(cut), _) => {
+                cmd.arg("-i").arg(cut);
+                cmd.args(["-map", "0:v:0", "-map", "1:a:0?"]);
+            }
+            (None, Some((src, start, dur))) => {
+                cmd.arg("-ss")
+                    .arg(format!("{start:.4}"))
+                    .arg("-t")
+                    .arg(format!("{dur:.4}"))
+                    .arg("-i")
+                    .arg(src);
+                cmd.args(["-map", "0:v:0", "-map", "1:a:0?"]);
+            }
+            (None, None) => {
+                cmd.args(["-map", "0:v:0"]);
+            }
         }
         let mut filters: Vec<String> = Vec::new();
         if opts.hdr.is_some() {
@@ -759,9 +788,10 @@ pub fn encode(
             cmd.args(["-crf", &opts.crf.to_string(), "-pix_fmt", "yuv420p"]);
         }
         if opts.audio_from.is_some() {
-            cmd.args(["-c:a", audio_codec]);
-            if audio_codec == "aac" {
-                cmd.args(["-b:a", "256k"]);
+            if audio.is_some() {
+                cmd.args(["-c:a", "copy"]);
+            } else {
+                cmd.args(["-c:a", "aac", "-b:a", "256k"]);
             }
             cmd.arg("-shortest");
         }
@@ -770,14 +800,18 @@ pub fn encode(
         cmd
     };
     let _ = frames;
-    match run_with_progress(build("copy"), cancel, &mut progress) {
-        Ok(()) => Ok(()),
-        Err(e) if process::is_cancelled(&e) || opts.audio_from.is_none() => Err(e),
-        Err(e) => {
-            log::info!("audio copy failed ({e}), re-encoding audio to AAC");
-            run_with_progress(build("aac"), cancel, &mut progress)
-        }
-    }
+    let result = match &copied {
+        None => run_with_progress(build(None), cancel, &mut progress),
+        Some(cut) => match run_with_progress(build(Some(cut)), cancel, &mut progress) {
+            Err(e) if !process::is_cancelled(&e) => {
+                log::info!("audio copy failed ({e}), re-encoding audio to AAC");
+                run_with_progress(build(None), cancel, &mut progress)
+            }
+            r => r,
+        },
+    };
+    let _ = std::fs::remove_file(&audio_cut);
+    result
 }
 
 /// Codecs the "Original" track keeps by stream copy; anything else (PCM above all, which the

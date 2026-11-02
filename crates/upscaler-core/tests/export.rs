@@ -408,7 +408,7 @@ fn decoded_front_left(tools: &Tools, path: &Path, index: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The lag `l` (within ±`max`) at which `b[n + l]` matches `a[n]` best, over 0.5 s of `a`
+/// The lag `l` (within Â±`max`) at which `b[n + l]` matches `a[n]` best, over 0.5 s of `a`
 /// from 0.1 s on.
 fn best_lag(a: &[f32], b: &[f32], max: i64) -> i64 {
     let (from, len) = (4800usize, 24000usize);
@@ -577,6 +577,91 @@ fn audio_matches_video_length() {
         "original placed {offset} samples off (lag {lag}, start difference {starts} s)"
     );
     assert!(!dir.path().join("out.part.mkv").exists());
+}
+
+/// Original audio copied from a long-GOP source into a range that starts mid-GOP: the copy
+/// must start where the picture starts, not at the keyframe before it (input seeking with
+/// stream copy keeps that pre-roll).
+#[test]
+fn original_audio_has_no_preroll_on_long_gop() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("gop.avi");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=160x90:rate=25:duration=10")
+        .args(["-f", "lavfi", "-i"])
+        .arg(
+            "aevalsrc=0.4*sin(2*PI*(150*t+40*t*t))|0.4*sin(2*PI*(230*t+30*t*t))\
+             :s=48000:d=10,aformat=channel_layouts=stereo",
+        )
+        .args(["-c:v", "libx264", "-g", "250", "-keyint_min", "250"])
+        .args(["-sc_threshold", "0", "-pix_fmt", "yuv420p"])
+        .args(["-c:a", "ac3", "-b:a", "192k", "-shortest"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let info = ffmpeg::probe(&tools, &src).unwrap();
+    let mut settings = surround_settings(&dir.path().join("work"));
+    settings.audio_mode = AudioMode::Original;
+    // The source's audio decoded from 6 s on, to check the copy's content against.
+    let reference = dir.path().join("reference.wav");
+    let st = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&src)
+        .args(["-ss", "6", "-t", "1", "-vn", "-ar", "48000"])
+        .arg(&reference)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let want = decoded_front_left(&tools, &reference, 0);
+    for name in ["out.mkv", "out.mp4"] {
+        // 1 s from 6 s on: the only keyframe before it is at 0 s.
+        let spec = ExportSpec {
+            info: info.clone(),
+            start: 150,
+            end: 175,
+            output: dir.path().join(name),
+            settings: settings.clone(),
+        };
+        check_no_preroll(&tools, &spec, &want);
+    }
+}
+
+fn check_no_preroll(tools: &Tools, spec: &ExportSpec, want: &[f32]) {
+    let log = run_events(tools, spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    let (v0, a0) = (
+        start_time(&tools, &spec.output, "v:0"),
+        start_time(&tools, &spec.output, "a:0"),
+    );
+    assert!(
+        (a0 - v0).abs() <= 0.032,
+        "{}: audio starts at {a0}, video at {v0}",
+        spec.output.display()
+    );
+    let out = std::process::Command::new(&tools.ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration"])
+        .args(["-of", "default=nw=1"])
+        .arg(&spec.output)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    let duration: f64 = entry(&text, "duration").unwrap().parse().unwrap();
+    assert!((duration - 1.0).abs() <= 0.05, "duration {duration}");
+    // The content is the range's: the source decoded from 6 s lines up with the copy.
+    let got = decoded_front_left(tools, &spec.output, 0);
+    let lag = best_lag(want, &got, 4000);
+    let offset = (a0 - v0) * 48000.0 + lag as f64;
+    assert!(
+        offset.abs() <= 1536.0,
+        "audio placed {offset} samples off (lag {lag}, start difference {} s)",
+        a0 - v0
+    );
 }
 
 #[test]
