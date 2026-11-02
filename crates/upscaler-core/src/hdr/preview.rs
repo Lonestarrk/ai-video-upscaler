@@ -56,7 +56,12 @@ pub fn to_sdr_preview(
     mode: HdrMode,
     peak_nits: u32,
 ) -> RgbImage {
-    let peak = (peak_nits as f32).max(SDR_PEAK);
+    // HLG is graded against its nominal 1000 nits whatever the peak setting says.
+    let peak = if mode == HdrMode::Hlg {
+        1000.0
+    } else {
+        (peak_nits as f32).max(SDR_PEAK)
+    };
     let mut out = RgbImage::new(img16.width(), img16.height());
     for (x, y, px) in img16.enumerate_pixels() {
         let e = px.0.map(|v| v as f32 / 65535.0);

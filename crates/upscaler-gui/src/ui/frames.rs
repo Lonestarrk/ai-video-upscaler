@@ -105,6 +105,8 @@ struct BigView(
     Option<egui::TextureHandle>,
     Option<egui::TextureHandle>,
     Option<egui::TextureHandle>,
+    /// The worker's answer has arrived (the images that are `None` could not be read).
+    bool,
 );
 
 /// The window with the rejected earlier versions of one frame.
@@ -193,7 +195,9 @@ impl FrameBrowser {
                 if let (Some(sel), Some(BigView(n, ..))) = (self.selected, &self.big) {
                     let old = self.frames.iter().find(|f| f.n == sel).map(stamp);
                     let new = frames.iter().find(|f| f.n == sel).map(stamp);
-                    if *n == sel && old != new {
+                    let hdr_of =
+                        |h: &Option<HdrInfo>| h.as_ref().and_then(|h| h.status.get(&sel).copied());
+                    if *n == sel && (old != new || hdr_of(&self.hdr) != hdr_of(&hdr)) {
                         self.big = None;
                     }
                 }
@@ -237,6 +241,7 @@ impl FrameBrowser {
                         load("fsrc", source),
                         load("fout", result),
                         load("fhdr", hdr),
+                        true,
                     ));
                 }
                 true
@@ -667,8 +672,6 @@ fn tile(
                     };
                     ui.label(egui::RichText::new(badge).small().color(color))
                         .on_hover_text(hint);
-                } else if f.done {
-                    ui.label(egui::RichText::new("SDR").small().weak());
                 }
                 let earlier = f.record.as_ref().map_or(0, |r| r.history.len());
                 if earlier > 0 {
@@ -728,7 +731,7 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
         return;
     };
     if b.big.as_ref().is_none_or(|v| v.0 != n) {
-        b.big = Some(BigView(n, None, None, None));
+        b.big = Some(BigView(n, None, None, None, false));
         worker::frame_pair(bus.clone(), dir.clone(), n);
     }
     let (color, text) = status_text(&f);
@@ -784,7 +787,8 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
     let columns = if hdr_ready.is_some() { 3.0 } else { 2.0 };
     let img_w = (avail - 12.0 * columns) / columns;
     ui.horizontal(|ui| {
-        let BigView(_, src, out, hdr_img) = b.big.clone().unwrap_or(BigView(n, None, None, None));
+        let BigView(_, src, out, hdr_img, loaded) =
+            b.big.clone().unwrap_or(BigView(n, None, None, None, false));
         for (label, tex) in [
             (tr("Original", "Original"), src),
             (tr("Resultat", "Result"), out),
@@ -828,6 +832,15 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
                             egui::Label::new(tr(
                                 "HDR-versionen är inte klar",
                                 "The HDR version is not ready",
+                            )),
+                        );
+                    }
+                    None if loaded => {
+                        ui.add_sized(
+                            [img_w, 120.0],
+                            egui::Label::new(tr(
+                                "HDR-versionen kunde inte läsas",
+                                "The HDR version could not be read",
                             )),
                         );
                     }

@@ -105,21 +105,55 @@ pub fn job_hdr(job_dir: &Path) -> Option<JobHdr> {
     })
 }
 
-/// The `hdr/` file of `out/` frame `k` (1-based) and whether it is there and current.
-/// Without interpolation a frame older than its SDR source counts as not ready (it is
-/// converted again at the next export).
-pub fn frame_hdr_status(job_dir: &Path, k: u64, divisor: u32) -> HdrStatus {
-    let hdr = frame_path(
-        &hdr_dir(job_dir),
-        super::hdr10plus::hdr_frame_for_out(k, divisor),
-    );
-    if !hdr.is_file() {
-        return HdrStatus::Converting;
-    }
-    if divisor <= 1 && is_stale(&frame_path(&job_dir.join("out"), k), &hdr) {
-        return HdrStatus::Converting;
-    }
-    HdrStatus::Ready
+/// File name to modification time of the PNGs in `dir`, from one directory read.
+fn mtimes_of(dir: &Path) -> std::collections::HashMap<String, Option<std::time::SystemTime>> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    rd.flatten()
+        .map(|e| {
+            let m = e.metadata().and_then(|m| m.modified()).ok();
+            (e.file_name().to_string_lossy().into_owned(), m)
+        })
+        .collect()
+}
+
+/// The state of the `hdr/` frame of every `out/` frame `1..=total`, from one directory read
+/// of `hdr/` (and of `out/` when the stale check applies). A frame is `Ready` when its file
+/// is there and, without interpolation, not older than its SDR source (it is converted
+/// again at the next export); otherwise `Converting`.
+pub fn hdr_statuses(
+    job_dir: &Path,
+    total: u64,
+    divisor: u32,
+) -> std::collections::HashMap<u64, HdrStatus> {
+    let hdr = mtimes_of(&hdr_dir(job_dir));
+    let out = if divisor <= 1 {
+        mtimes_of(&job_dir.join("out"))
+    } else {
+        Default::default()
+    };
+    let name = |n: u64| format!("{n:06}.png");
+    (1..=total)
+        .map(|k| {
+            let h = hdr.get(&name(super::hdr10plus::hdr_frame_for_out(k, divisor)));
+            let ready = match h {
+                None => false,
+                Some(h) => match (h, out.get(&name(k)).copied().flatten()) {
+                    (Some(h), Some(o)) if divisor <= 1 => o <= *h,
+                    _ => true,
+                },
+            };
+            (
+                k,
+                if ready {
+                    HdrStatus::Ready
+                } else {
+                    HdrStatus::Converting
+                },
+            )
+        })
+        .collect()
 }
 
 /// The `hdr/` frame file of `out/` frame `k`.
@@ -329,12 +363,18 @@ mod tests {
         run(&o, &h, 3, 1000).unwrap();
         let j = job_hdr(t.path()).unwrap();
         assert_eq!((j.mode, j.peak_nits, j.divisor), (HdrMode::Hdr10, 1000, 1));
-        assert_eq!(frame_hdr_status(t.path(), 2, 1), HdrStatus::Ready);
+        assert_eq!(hdr_statuses(t.path(), 3, 1)[&2], HdrStatus::Ready);
         std::fs::remove_file(frame_path(&h, 2)).unwrap();
-        assert_eq!(frame_hdr_status(t.path(), 2, 1), HdrStatus::Converting);
-        assert_eq!(frame_hdr_status(t.path(), 3, 1), HdrStatus::Ready);
+        assert_eq!(hdr_statuses(t.path(), 3, 1)[&2], HdrStatus::Converting);
+        assert_eq!(hdr_statuses(t.path(), 3, 1)[&3], HdrStatus::Ready);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        RgbImage::from_pixel(4, 2, Rgb([9, 9, 9]))
+            .save(frame_path(&o, 3))
+            .unwrap();
+        assert_eq!(hdr_statuses(t.path(), 3, 1)[&3], HdrStatus::Converting);
+        assert_eq!(hdr_statuses(t.path(), 3, 3)[&3], HdrStatus::Converting);
         // With interpolation out/2 is hdr/4 (divisor 3) and a missing hdr/2 does not matter.
-        assert_eq!(frame_hdr_status(t.path(), 2, 3), HdrStatus::Converting);
+        assert_eq!(hdr_statuses(t.path(), 3, 3)[&2], HdrStatus::Converting);
         std::fs::create_dir_all(t.path().join("interp")).unwrap();
         std::fs::write(
             t.path().join("interp").join(SETTINGS_FILE),

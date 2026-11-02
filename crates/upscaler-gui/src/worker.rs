@@ -354,10 +354,7 @@ pub fn frame_statuses(bus: Bus, work_dir: PathBuf, dir: Option<PathBuf>) {
         // HDR status only exists while the job keeps its HDR frames.
         let hdr = chosen.as_ref().and_then(|j| {
             let job = hdr_convert::job_hdr(&j.dir)?;
-            let status = frames
-                .iter()
-                .map(|f| (f.n, hdr_convert::frame_hdr_status(&j.dir, f.n, job.divisor)))
-                .collect();
+            let status = hdr_convert::hdr_statuses(&j.dir, j.total, job.divisor);
             Some(HdrInfo { job, status })
         });
         bus.send(Event::FrameStatuses {
