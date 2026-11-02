@@ -170,12 +170,15 @@ Under *Utdata → HDR* i sidopanelen kan exporten bli HDR i stället för vanlig
 | **HDR10** | Samma bild, men bara ett värde för hela filmen (MaxCLL/MaxFALL, den ljusaste pixeln och den ljusaste bildrutan i genomsnitt). | Nästan alla HDR-TV, projektorer och spelare. |
 | **HLG** | En annan kurva, gjord för sändnings-TV. Ingen metadata, fast 1000 nits. | De flesta HDR-TV. Välj den bara om apparaten saknar HDR10. |
 
-- **Toppljusstyrka:** 600, 1000 (standard) eller 1500 nits, det ljusaste filen får bli. 1000 nits passar de flesta TV-apparater; med en projektor eller en enklare TV gör TV:n själv om toppen till det den klarar.
-- **Kodek:** HDR blir alltid H.265 med 10 bitar. Valet H.264 gäller bara SDR.
+- **Toppljusstyrka:** 600, 1000 (standard) eller 1500 nits, det ljusaste filen får bli. 1000 nits passar de flesta TV-apparater; med en projektor eller en enklare TV gör TV:n själv om toppen till det den klarar. HLG använder alltid 1000 nits.
+- **SDR-vitt:** 203 (standard, BT.2408), 300 eller 400 nits: där vanligt vitt hamnar i HDR-bilden. **Varför:** en projektor i HDR-läge visar 203 nits vitt mörkare än samma bild i SDR-läge, eftersom den sparar ljus till topparna. Högre SDR-vitt gör hela bilden ljusare (300 gav ungefär 40 % högre medelljus i salongscenen), toppen ligger kvar.
+- **Jämna högdagrar:** över ungefär 80 % av vitt sträcks varje 8-bitarssteg ut till många HDR-steg, så en mjuk ljusglöd kunde bli synliga band. Appen räknar därför förstärkningen från en kantbevarande utjämnad ljusstyrka: mjuka ytor blir jämna, kanter och allt under SDR-vitt är exakt som förut.
+- **Kodek:** HDR blir alltid H.265 med 10 bitar. Valet H.264 gäller bara SDR. HDR kodas med CRF två steg lägre än inställningen (16 blir 14) och `aq-mode=3`, eftersom PQ behöver fler bitar för jämna högdagrar och mörk struktur. RGB → YUV görs med zscale och felspridning (dither) när FFmpeg har den (appen kontrollerar det), annars med swscale, som är en aning mindre exakt.
 - **Förhandsvisningen visar SDR.** Datorskärmen visar inte HDR, så jämförelsen i appen är alltid SDR. Bildrutebläddraren kan visa en tonmappad HDR-bild (HDR räknad tillbaka till SDR) för att kontrollera att inget har gått fel, men hur det verkligen ser ut syns bara på TV:n eller projektorn.
-- **Diskutrymme:** HDR-bildrutorna sparas först som 16-bitars PNG i jobbmappen (`hdr\`). De är ungefär 4,4 gånger så stora som de vanliga: **~6,5–7 MB per bildruta vid 1440×1080** (uppmätt), ungefär 35 MB vid 4K. Ett 45-minutersavsnitt i 1440×1080 behöver alltså runt 450 GB ledigt under exporten.
-- **Ta bort HDR-bildrutor efter lyckad export** (på som standard): mappen `hdr\` tas bort när filen är klar. **Varför:** den behövs bara för att koda videon. De vanliga uppskalade bildrutorna sparas ändå, så en ny HDR-export räknar bara om dem, utan nya AI-anrop.
-- **Tid:** omräkningen tar ~16 ms, mätningen ~25 ms och kodningen ~30 ms per bildruta i 1440×1080 (Core i7-12700KF), alltså några minuter för ett avsnitt. Uppskalningen tar fortfarande mest tid.
+- **Diskutrymme:** inga HDR-bildrutor sparas. Exporten räknar om varje bildruta två gånger i minnet: först för att mäta ljuset (resultatet, ~150 byte per bildruta, sparas i `hdr\stats.txt` i jobbmappen), sedan rakt in i kodaren. Utöver de vanliga uppskalade bildrutorna behövs alltså bara plats för den färdiga filen. **Varför:** 16-bitars HDR-bildrutor var ~6,5 MB styck vid 1440×1080, runt 440 GB för ett avsnitt.
+- **Ta bort mellanbildrutor efter lyckad export** (på som standard, visas bara med "var 2:a/3:e bildruta"): HDR räknar fram de överhoppade bildrutorna som vanliga 8-bitars PNG i `interp\` innan omräkningen. Mappen tas bort när filen är klar. Behålls den slipper en ny export räkna fram dem igen.
+- **En ny export gör bara det som ändrats:** mätningen sparas per bildruta och gäller så länge bildrutan är oförändrad, så en avbruten export fortsätter där den var, och en underkänd bildruta mäts om ensam. Med nytt ljud återanvänds den kodade videon helt om bara ljudinställningarna ändrats.
+- **Tid:** mätningen tar ~8 ms och omräkning plus kodning ~38 ms per bildruta i 1440×1080 (Core i7-12700KF, alla kärnor), alltså några minuter för ett avsnitt. Uppskalningen tar fortfarande mest tid.
 
 ## Kom igång: bygga, testa och utveckla vidare
 
@@ -278,7 +281,7 @@ OpenAI:s officiella [Codex CLI](https://github.com/openai/codex) loggar in med d
 3. Om modellen bara svarar i vissa format läggs svarta kanter till.
 4. Prompten byggs: din prompt plus appens tekniska regler.
 5. AI:n svarar, kanterna beskärs bort och bilden skalas till exakt rätt storlek.
-6. Med HDR räknas de färdiga bildrutorna om till 16-bitars HDR (PQ eller HLG, BT.2020) och mäts för metadatan.
+6. Med HDR räknas de färdiga bildrutorna om till HDR (PQ eller HLG, BT.2020) i minnet: först för att mäta ljuset till metadatan, sedan direkt in i kodaren. Inget 16-bitars sparas.
 7. Vid export sätts bildrutorna ihop med originalljudet. Anamorfa källor kläms tillbaka till originalets pixelformat.
 
 ### Struktur och data

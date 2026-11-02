@@ -62,15 +62,24 @@ cargo fmt --all                            # run before committing
     (±1 LU), true peak (≤ -1 dBTP) and sync checks, cache in `<work>\audio\<key>`.
     `job.rs` (export) encodes the video to `video.mkv` in the job folder and
     `ffmpeg::mux` writes the MKV: FLAC 5.1 (default), AC-3 5.1, Original.
-  - `hdr/` HDR export, pure Rust on the CPU (no GPU, no Vulkan): `itm.rs` the inverse tone
-    mapping SDR → PQ/HLG BT.2020 (curve approved by the owner); `convert.rs` the stage
-    `out/` (or `interp/`) → `hdr/%06d.png` 16-bit, parallel, cached by mode/peak/version in
-    `hdr/settings.txt`, stale frames redone; `measure.rs` PQ math, per-frame MaxSCL /
-    average maxRGB / percentiles, MaxCLL/MaxFALL; `hdr10plus.rs` the ST 2094-40 JSON for
-    x265 `dhdr10-info` (scene ids from the export's cut list); `preview.rs` HDR → 100-nit
-    sRGB for the frame browser; `mod.rs` `HdrEncode` and `x265_params`. `ffmpeg::encode`
-    takes `EncodeOptions::hdr` (always libx265 10-bit). `examples/hdr_test.rs` runs a folder
-    of SDR frames through this path.
+  - `hdr/` HDR export, pure Rust on the CPU (no GPU, no Vulkan), nothing 16-bit on disk:
+    `itm.rs` the inverse tone mapping 8-bit SDR frame → 16-bit PQ/HLG BT.2020 (curve approved
+    by the owner, SDR white `hdr_sdr_white_nits` 203/300/400, the expansion ratio taken from a
+    self-guided filter of the gamma luminance, r 8, eps (1.5/255)², so 8-bit steps above SDR
+    code ~238 do not band; PQ by table); `convert.rs` pass 1 `measure_pass` (convert +
+    measure in memory, parallel, one line per frame in `hdr/stats.txt`, valid while the SDR
+    file's size+mtime match; header = `hdr/settings.txt`: mode, peak (1000 for HLG), white,
+    `HDR_VERSION`) and pass 2 `stream_frames` (convert again, in order through a bounded
+    reorder window, raw rgb48le into ffmpeg's stdin), `frame_statuses` / `tone_mapped_frame`
+    for the frame browser; `measure.rs` PQ math, per-frame MaxSCL / average maxRGB /
+    percentiles, MaxCLL/MaxFALL; `hdr10plus.rs` the ST 2094-40 JSON for x265 `dhdr10-info`
+    (scene ids from the export's cut list); `preview.rs` HDR → 100-nit sRGB for the frame
+    browser; `mod.rs` `HdrEncode`, `x265_params` (CRF − 2, aq-mode 3). `ffmpeg::encode`
+    takes `VideoInput::Frames(dir)` or `VideoInput::Rgb48 { feed }` and `EncodeOptions::hdr`
+    (always libx265 10-bit; RGB → YUV by zscale with error-diffusion dither, swscale when the
+    FFmpeg has no zimg). With new audio, `video.mkv` is reused before any HDR work (its key
+    holds the HDR header). `examples/hdr_test.rs` runs a folder of SDR frames through this
+    path.
 - `crates/upscaler-gui` (egui 0.37 / eframe)
   - `app.rs` state, events, background workers' results; `worker.rs` threads + `Bus`.
   - `ui/viewer.rs` comparison (side by side / swipe, shared zoom-pan in the original's
@@ -81,7 +90,7 @@ cargo fmt --all                            # run before committing
 
 Data: settings `%APPDATA%\AI Video Upscaler\settings.json`; log, previews, export jobs and
 downloaded FFmpeg in `%LOCALAPPDATA%\AI Video Upscaler\` (`upscaler.log`, `work\previews`,
-`work\jobs\<key>\{src,out}`, `work\audio\<key>` audio jobs and `work\audio\stems` the stem
+`work\jobs\<key>\{src,out,hdr,interp}`, `work\audio\<key>` audio jobs and `work\audio\stems` the stem
 cache, `work\tmp\<id>` per request, `tools\bin`).
 
 ## How the pieces fit
@@ -154,15 +163,20 @@ planet/eclipse 271 s, 240 frames each. Files in the owner's `tester\HDR\`.
   9 percentiles equal the JSON's frame in display order (ffprobe prints `JSON/100000`, i.e.
   the JSON's 0.1 cd/m² integer over 100000; nits = JSON / 10). Frame count = SceneInfo length.
   `-read_intervals %+#N` counts packets in decode order, so its frames 1.. are not JSON 1..
-- Time per frame at 1440×1080: convert 16 ms, measure 25 ms, encode (x265 medium, CRF 16)
-  27–30 ms. Disk: 16-bit `hdr/` frames 6.5–6.8 MB vs 1.54 MB SDR (~440 GB for a 45-min
-  episode at this size, all on disk before encoding).
-- Audio: `ffmpeg::encode`'s own audio input (`-ss` before `-i`, `-c:a copy`) keeps the
-  pre-roll back to the seek point. With the AVI source the planet range got 5.9 s of audio
-  before the video (video pts started at 5.9 s), the lounge 0.15 s. The example therefore
-  muxes with `ffmpeg::mux` (two-stage seek, audio 13–19 ms late at most, AC-3 packet
-  granularity). The plain SDR/HDR export with unchanged audio still uses the broken path.
-- Not yet judged on the owner's projector. hdr10plus_tool not installed (not used).
+- Owner's projector verdict on those files (Sony VPL-XW5000ES): lounge "too dark / flat",
+  planet "bands / blocky". Investigation (`.superpowers/sdd/2026-11-01-hdr/`
+  `hdr-look-investigation.md`): the approved v2 came from a 2.6× brighter ChatGPT SDR input
+  (curve unchanged); the bands were 8-bit steps magnified ~12× above SDR code ~238. Fixed
+  2026-11-02 (HDR_VERSION 2): guided-filter gain, zscale dither, CRF − 2 + aq-mode 3, SDR
+  white setting (default 203 until the owner picks 203/300/400 on the projector).
+- Streaming two-pass HDR (2026-11-02, planet 240 frames, i7-12700KF): pass 1 8 ms/frame,
+  pass 2 (convert + x265 medium CRF 14 aq 3) 38 ms/frame; ITM single-thread 71 ms/frame
+  (was 146 ms per-pixel without the filter); disk `hdr/` 37 KB for 240 frames (was
+  6.5 MB per frame). MaxCLL/MaxFALL 996/344. hdr10plus_tool 1.7.2 extract: 240/240 frames
+  identical to the app's JSON; `hdr10plus_round_trip` passes.
+- Audio: `ffmpeg::encode` now cuts copied audio with `cut_original`'s two-stage seek
+  (`-ss` before `-i` with `-c:a copy` had kept 5.9 s of pre-roll on the AVI); tested with a
+  long-GOP source.
 
 NOT verified against the real services (no accounts in the dev container). This is what to
 test first on the owner's Windows PC:
