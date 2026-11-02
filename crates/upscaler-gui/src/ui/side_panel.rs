@@ -262,6 +262,16 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                 );
                 ui.end_row();
             });
+        if app.settings.hdr_mode != HdrMode::Off {
+            // Outside the grid so it wraps at the panel width.
+            ui.label(
+                egui::RichText::new(tr(
+                    "Förhandsvisningen visar SDR – HDR syns på TV:n",
+                    "The preview shows SDR – HDR shows on the TV",
+                ))
+                .weak(),
+            );
+        }
         source_aspect(ui, app);
         black_bars(ui, app);
         aspect_change(ui, app);
@@ -321,15 +331,6 @@ fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             "Ta bort HDR-bildrutor efter lyckad export",
             "Delete HDR frames after a successful export",
         ),
-    );
-    ui.end_row();
-    ui.label("");
-    ui.label(
-        egui::RichText::new(tr(
-            "Förhandsvisningen visar SDR – HDR syns på TV:n",
-            "The preview shows SDR – HDR shows on the TV",
-        ))
-        .weak(),
     );
     ui.end_row();
 }
