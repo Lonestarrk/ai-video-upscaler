@@ -4,7 +4,8 @@ use eframe::egui::{self, Color32};
 use upscaler_core::job::Stage;
 use upscaler_core::provider::codex::LoginState;
 use upscaler_core::settings::{
-    AiRate, AspectChoice, OutputSize, PromptPreset, ProviderKind, VideoCodec, DEFAULT_PROMPT,
+    AiRate, AspectChoice, HdrMode, OutputSize, PromptPreset, ProviderKind, VideoCodec,
+    DEFAULT_PROMPT,
 };
 
 use super::style::{self, primary_button, section, BAD, GOOD, WARN};
@@ -224,11 +225,36 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
                     ui.end_row();
                 }
                 ui.label(tr("Kodek", "Codec"));
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut app.settings.video_codec, VideoCodec::H264, "H.264");
-                    ui.selectable_value(&mut app.settings.video_codec, VideoCodec::H265, "H.265");
-                });
+                if app.settings.hdr_mode != HdrMode::Off {
+                    // HDR needs 10-bit H.265; the saved choice stays untouched.
+                    let mut shown = app.settings.effective_codec();
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut shown, VideoCodec::H264, "H.264");
+                            ui.selectable_value(&mut shown, VideoCodec::H265, "H.265");
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text(tr(
+                        "HDR kräver H.265 (10 bitar).",
+                        "HDR requires H.265 (10-bit).",
+                    ));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut app.settings.video_codec,
+                            VideoCodec::H264,
+                            "H.264",
+                        );
+                        ui.selectable_value(
+                            &mut app.settings.video_codec,
+                            VideoCodec::H265,
+                            "H.265",
+                        );
+                    });
+                }
                 ui.end_row();
+                hdr_rows(ui, app);
                 ui.label(tr("Kvalitet (CRF)", "Quality (CRF)"));
                 ui.add(
                     egui::Slider::new(&mut app.settings.crf, 10..=30)
@@ -240,6 +266,72 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         black_bars(ui, app);
         aspect_change(ui, app);
     });
+}
+
+/// HDR rows of the output grid: mode, peak brightness, keep/delete the HDR frames.
+fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
+    ui.label("HDR");
+    let mode = &mut app.settings.hdr_mode;
+    egui::ComboBox::from_id_salt("hdr_mode")
+        .selected_text(match *mode {
+            HdrMode::Off => tr("Av", "Off").to_string(),
+            HdrMode::Hdr10Plus => tr(
+                "HDR10+ (fungerar även som HDR10)",
+                "HDR10+ (also plays as HDR10)",
+            )
+            .to_string(),
+            m => m.name().to_string(),
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(mode, HdrMode::Off, tr("Av", "Off"));
+            ui.selectable_value(
+                mode,
+                HdrMode::Hdr10Plus,
+                tr(
+                    "HDR10+ (fungerar även som HDR10)",
+                    "HDR10+ (also plays as HDR10)",
+                ),
+            );
+            ui.selectable_value(mode, HdrMode::Hdr10, "HDR10");
+            ui.selectable_value(mode, HdrMode::Hlg, "HLG");
+        });
+    ui.end_row();
+    if app.settings.hdr_mode == HdrMode::Off {
+        return;
+    }
+    ui.label(tr("Toppljusstyrka", "Peak brightness"));
+    if app.settings.hdr_mode == HdrMode::Hlg {
+        ui.label(
+            egui::RichText::new(tr("HLG har fast 1000 nits", "HLG uses a fixed 1000 nits")).weak(),
+        );
+    } else {
+        egui::ComboBox::from_id_salt("hdr_peak")
+            .selected_text(format!("{} nits", app.settings.hdr_peak_nits))
+            .show_ui(ui, |ui| {
+                for n in [600u32, 1000, 1500] {
+                    ui.selectable_value(&mut app.settings.hdr_peak_nits, n, format!("{n} nits"));
+                }
+            });
+    }
+    ui.end_row();
+    ui.label("");
+    ui.checkbox(
+        &mut app.settings.hdr_delete_frames_after,
+        tr(
+            "Ta bort HDR-bildrutor efter lyckad export",
+            "Delete HDR frames after a successful export",
+        ),
+    );
+    ui.end_row();
+    ui.label("");
+    ui.label(
+        egui::RichText::new(tr(
+            "Förhandsvisningen visar SDR – HDR syns på TV:n",
+            "The preview shows SDR – HDR shows on the TV",
+        ))
+        .weak(),
+    );
+    ui.end_row();
 }
 
 /// Frame shapes the user can give the source instead of its flag.
