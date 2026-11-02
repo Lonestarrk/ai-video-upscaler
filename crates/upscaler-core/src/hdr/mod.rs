@@ -5,6 +5,7 @@ pub mod convert;
 pub mod hdr10plus;
 pub mod itm;
 pub mod measure;
+pub mod preview;
 
 use std::path::PathBuf;
 

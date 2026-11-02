@@ -66,6 +66,70 @@ pub fn hdr_status(job_dir: &Path, n: u64) -> HdrStatus {
     }
 }
 
+/// What a job's `hdr/` folder was made with, read from its `settings.txt`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobHdr {
+    pub mode: HdrMode,
+    pub peak_nits: u32,
+    /// Full-rate frames per `out/` frame (2/3 with "every 2nd/3rd frame").
+    pub divisor: u32,
+}
+
+/// The HDR settings of the job in `job_dir`, or `None` when it has no `hdr/` folder (HDR was
+/// off, or the frames were deleted after the export).
+pub fn job_hdr(job_dir: &Path) -> Option<JobHdr> {
+    let text = std::fs::read_to_string(hdr_dir(job_dir).join(SETTINGS_FILE)).ok()?;
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+    };
+    let name = value("mode:")?;
+    let mode = [HdrMode::Hdr10Plus, HdrMode::Hdr10, HdrMode::Hlg]
+        .into_iter()
+        .find(|m| m.name() == name)?;
+    let peak_nits = value("peak:")?.parse().ok()?;
+    // The interpolation stage's marker says how many full-rate frames one AI frame covers.
+    let divisor = std::fs::read_to_string(job_dir.join("interp").join(SETTINGS_FILE))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("divisor:"))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(1);
+    Some(JobHdr {
+        mode,
+        peak_nits,
+        divisor,
+    })
+}
+
+/// The `hdr/` file of `out/` frame `k` (1-based) and whether it is there and current.
+/// Without interpolation a frame older than its SDR source counts as not ready (it is
+/// converted again at the next export).
+pub fn frame_hdr_status(job_dir: &Path, k: u64, divisor: u32) -> HdrStatus {
+    let hdr = frame_path(
+        &hdr_dir(job_dir),
+        super::hdr10plus::hdr_frame_for_out(k, divisor),
+    );
+    if !hdr.is_file() {
+        return HdrStatus::Converting;
+    }
+    if divisor <= 1 && is_stale(&frame_path(&job_dir.join("out"), k), &hdr) {
+        return HdrStatus::Converting;
+    }
+    HdrStatus::Ready
+}
+
+/// The `hdr/` frame file of `out/` frame `k`.
+pub fn hdr_frame_file(job_dir: &Path, k: u64, divisor: u32) -> PathBuf {
+    frame_path(
+        &hdr_dir(job_dir),
+        super::hdr10plus::hdr_frame_for_out(k, divisor),
+    )
+}
+
 /// Converts frames `1..=total` of `out_dir` into `hdr_dir`. Does nothing when the folder was
 /// made with the same mode, peak and version and is complete; otherwise clears and redoes it.
 /// `progress` gets the number of frames done; stops with an error when `cancel` is set.
@@ -256,6 +320,28 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         run(&o, &h, 3, 1000).unwrap();
         assert_eq!(before, mtimes(&h, 3));
+    }
+
+    #[test]
+    fn job_hdr_and_frame_status() {
+        let (t, o, h) = setup(3);
+        assert_eq!(job_hdr(t.path()), None);
+        run(&o, &h, 3, 1000).unwrap();
+        let j = job_hdr(t.path()).unwrap();
+        assert_eq!((j.mode, j.peak_nits, j.divisor), (HdrMode::Hdr10, 1000, 1));
+        assert_eq!(frame_hdr_status(t.path(), 2, 1), HdrStatus::Ready);
+        std::fs::remove_file(frame_path(&h, 2)).unwrap();
+        assert_eq!(frame_hdr_status(t.path(), 2, 1), HdrStatus::Converting);
+        assert_eq!(frame_hdr_status(t.path(), 3, 1), HdrStatus::Ready);
+        // With interpolation out/2 is hdr/4 (divisor 3) and a missing hdr/2 does not matter.
+        assert_eq!(frame_hdr_status(t.path(), 2, 3), HdrStatus::Converting);
+        std::fs::create_dir_all(t.path().join("interp")).unwrap();
+        std::fs::write(
+            t.path().join("interp").join(SETTINGS_FILE),
+            "fps: 24/1\ndivisor: 3\nframes: 9\nversion: 1\n",
+        )
+        .unwrap();
+        assert_eq!(job_hdr(t.path()).unwrap().divisor, 3);
     }
 
     #[test]

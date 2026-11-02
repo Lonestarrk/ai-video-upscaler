@@ -59,6 +59,13 @@ pub fn write_json(m: &Measurement, cuts: &[bool], peak_nits: u32, path: &Path) -
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// The `hdr/` frame (1-based file number) that belongs to `out/` frame `k` (1-based). With
+/// "every 2nd/3rd frame" the SDR frames are interpolated to the full rate first, so AI frame
+/// `k` sits at full-rate frame `(k - 1) * divisor + 1`.
+pub fn hdr_frame_for_out(k: u64, divisor: u32) -> u64 {
+    (k.max(1) - 1) * divisor.max(1) as u64 + 1
+}
+
 /// Scene starts per *encoded* frame (0-based) from the export's cut list.
 ///
 /// `ai_cuts` is indexed by `out/` frame number (1-based, entry 0 unused) like the job's cut
@@ -75,7 +82,7 @@ pub fn encoded_cuts(ai_cuts: &[bool], analysed: bool, divisor: u32, encoded: usi
     }
     if analysed {
         for (k, _) in ai_cuts.iter().enumerate().skip(1).filter(|(_, c)| **c) {
-            if let Some(c) = cuts.get_mut((k - 1) * divisor.max(1) as usize) {
+            if let Some(c) = cuts.get_mut(hdr_frame_for_out(k as u64, divisor) as usize - 1) {
                 *c = true;
             }
         }
@@ -147,6 +154,15 @@ mod tests {
             j["SceneInfoSummary"]["SceneFrameNumbers"],
             serde_json::json!([5])
         );
+    }
+
+    #[test]
+    fn hdr_frame_for_out_maps_to_full_rate() {
+        assert_eq!(hdr_frame_for_out(1, 1), 1);
+        assert_eq!(hdr_frame_for_out(5, 1), 5);
+        assert_eq!(hdr_frame_for_out(1, 3), 1);
+        assert_eq!(hdr_frame_for_out(3, 3), 7);
+        assert_eq!(hdr_frame_for_out(4, 2), 7);
     }
 
     #[test]

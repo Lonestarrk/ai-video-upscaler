@@ -12,9 +12,17 @@ use upscaler_core::audio::ai::{Device, LocalAi};
 use upscaler_core::audio::pack::{self, PackStatus};
 use upscaler_core::audio::source::{self, SourceAudio};
 use upscaler_core::ffmpeg::{self, Tools, VideoInfo};
+use upscaler_core::hdr::convert::{self as hdr_convert, HdrStatus, JobHdr as HdrJob};
 use upscaler_core::job::{self, ExportEvent, ExportSpec};
 use upscaler_core::provider::codex::{self, LoginState};
 use upscaler_core::settings::Settings;
+
+/// How a job's `hdr/` folder was made and which of its frames are ready, per `out/` frame.
+#[derive(Clone, Debug)]
+pub struct HdrInfo {
+    pub job: HdrJob,
+    pub status: std::collections::HashMap<u64, HdrStatus>,
+}
 
 pub enum Event {
     Probed {
@@ -69,6 +77,8 @@ pub enum Event {
         jobs: Vec<job::JobSummary>,
         dir: Option<PathBuf>,
         frames: Vec<job::FrameStatus>,
+        /// The job's HDR frames, when it still has them.
+        hdr: Option<HdrInfo>,
     },
     FrameThumb {
         dir: PathBuf,
@@ -82,6 +92,8 @@ pub enum Event {
         n: u64,
         source: Option<egui::ColorImage>,
         result: Option<egui::ColorImage>,
+        /// The HDR frame tone mapped for the screen (`None`: no HDR frame).
+        hdr: Option<egui::ColorImage>,
     },
     /// The current result and the rejected earlier versions of one frame.
     FrameHistory {
@@ -339,10 +351,20 @@ pub fn frame_statuses(bus: Bus, work_dir: PathBuf, dir: Option<PathBuf>) {
             .as_ref()
             .map(|j| job::job_frames(&j.dir, j.total))
             .unwrap_or_default();
+        // HDR status only exists while the job keeps its HDR frames.
+        let hdr = chosen.as_ref().and_then(|j| {
+            let job = hdr_convert::job_hdr(&j.dir)?;
+            let status = frames
+                .iter()
+                .map(|f| (f.n, hdr_convert::frame_hdr_status(&j.dir, f.n, job.divisor)))
+                .collect();
+            Some(HdrInfo { job, status })
+        });
         bus.send(Event::FrameStatuses {
             jobs,
             dir: chosen.map(|j| j.dir),
             frames,
+            hdr,
         });
     });
 }
@@ -373,9 +395,19 @@ pub fn frame_pair(bus: Bus, dir: PathBuf, n: u64) {
                 .ok()
                 .map(|i| to_color_image(&upscaler_core::frame::limit_size(&i.to_rgb8(), 2048)))
         };
+        // Load the 16-bit HDR frame and tone map it here, never on the UI thread.
+        let hdr = hdr_convert::job_hdr(&dir).and_then(|j| {
+            let file = hdr_convert::hdr_frame_file(&dir, n, j.divisor);
+            let img = image::open(file).ok()?.into_rgb16();
+            let sdr = upscaler_core::hdr::preview::to_sdr_preview(&img, j.mode, j.peak_nits);
+            Some(to_color_image(&upscaler_core::frame::limit_size(
+                &sdr, 2048,
+            )))
+        });
         bus.send(Event::FramePair {
             source: load(&src),
             result: load(&out),
+            hdr,
             dir,
             n,
         });

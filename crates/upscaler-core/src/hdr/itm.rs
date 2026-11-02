@@ -14,6 +14,10 @@ const KNEE: f32 = 0.8;
 const HLG_NOMINAL_PEAK: f32 = 1000.0;
 /// System gamma of HLG at the nominal peak (BT.2100).
 const HLG_GAMMA: f32 = 1.2;
+/// HLG OETF constants (BT.2100).
+const HLG_A: f32 = 0.178_832_77;
+const HLG_B: f32 = 0.284_668_92;
+const HLG_C: f32 = 0.559_910_73;
 
 /// BT.709 to BT.2020 primaries (linear light).
 const M709_TO_2020: [[f32; 3]; 3] = [
@@ -92,12 +96,29 @@ fn code(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * 65535.0).round() as u16
 }
 
+/// HLG signal (BT.2020) to display light in nits: inverse OETF, then the OOTF at the nominal
+/// peak. The inverse of `hlg_signal`.
+pub fn hlg_to_nits(e: [f32; 3]) -> [f32; 3] {
+    let es = e.map(|v| {
+        let v = v.clamp(0.0, 1.0);
+        if v <= 0.5 {
+            v * v / 3.0
+        } else {
+            (((v - HLG_C) / HLG_A).exp() + HLG_B) / 12.0
+        }
+    });
+    let ys = 0.2627 * es[0] + 0.6780 * es[1] + 0.0593 * es[2];
+    let g = if ys > 1e-9 {
+        ys.powf(HLG_GAMMA - 1.0)
+    } else {
+        0.0
+    };
+    es.map(|v| v * g * HLG_NOMINAL_PEAK)
+}
+
 /// BT.2020 display light in nits to an HLG signal: normalise by the nominal peak, undo the
 /// OOTF (system gamma 1.2) and apply the HLG OETF.
 fn hlg_signal(nits: [f32; 3]) -> [f32; 3] {
-    const A: f32 = 0.178_832_77;
-    const B: f32 = 0.284_668_92;
-    const C: f32 = 0.559_910_73;
     let d = nits.map(|v| v / HLG_NOMINAL_PEAK);
     let yd = 0.2627 * d[0] + 0.6780 * d[1] + 0.0593 * d[2];
     // Scene light Es = Fd * Yd^((1 - gamma) / gamma).
@@ -111,7 +132,7 @@ fn hlg_signal(nits: [f32; 3]) -> [f32; 3] {
         if e <= 1.0 / 12.0 {
             (3.0 * e).sqrt()
         } else {
-            A * (12.0 * e - B).ln() + C
+            HLG_A * (12.0 * e - HLG_B).ln() + HLG_C
         }
     })
 }
@@ -123,6 +144,15 @@ mod tests {
 
     fn gray_code(lin: f32) -> u16 {
         (lin.powf(1.0 / 2.4) * 65535.0).round() as u16
+    }
+
+    #[test]
+    fn hlg_to_nits_inverts_hlg_signal() {
+        let n = [120.0, 400.0, 60.0];
+        let back = hlg_to_nits(hlg_signal(n));
+        for (a, b) in n.iter().zip(back) {
+            assert!((a - b).abs() / a < 0.01, "{n:?} {back:?}");
+        }
     }
 
     #[test]

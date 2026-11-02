@@ -12,7 +12,8 @@ use upscaler_core::job::{self, FrameStatus, JobSummary, ReviewOutcome};
 use super::style::{BAD, GOOD, WARN};
 use crate::app::UpscalerApp;
 use crate::i18n::tr;
-use crate::worker::{self, Event};
+use crate::worker::{self, Event, HdrInfo};
+use upscaler_core::hdr::convert::HdrStatus;
 
 const PAGE: usize = 24;
 const COLUMNS: usize = 4;
@@ -28,15 +29,18 @@ pub enum Filter {
     Manual,
     /// Not finished yet.
     Waiting,
+    /// No finished HDR frame (only while the job keeps its HDR frames).
+    HdrMissing,
 }
 
 impl Filter {
-    const ALL: [Filter; 5] = [
+    const ALL: [Filter; 6] = [
         Filter::All,
         Filter::Problems,
         Filter::Kept,
         Filter::Manual,
         Filter::Waiting,
+        Filter::HdrMissing,
     ];
 
     fn label(self) -> &'static str {
@@ -46,10 +50,11 @@ impl Filter {
             Filter::Kept => tr("Behållna trots fel", "Kept despite problems"),
             Filter::Manual => tr("Underkända av mig", "Rejected by me"),
             Filter::Waiting => tr("Väntar", "Waiting"),
+            Filter::HdrMissing => tr("HDR saknas", "HDR missing"),
         }
     }
 
-    fn keeps(self, f: &FrameStatus) -> bool {
+    fn keeps(self, f: &FrameStatus, hdr: Option<&HdrInfo>) -> bool {
         let r = f.record.as_ref();
         let outcome = r.and_then(|r| r.outcome);
         match self {
@@ -68,6 +73,9 @@ impl Filter {
             ),
             Filter::Manual => f.pending_reject || r.is_some_and(|r| r.manual),
             Filter::Waiting => !f.done || f.pending_reject,
+            Filter::HdrMissing => {
+                hdr.is_some_and(|h| h.status.get(&f.n) != Some(&HdrStatus::Ready))
+            }
         }
     }
 }
@@ -84,14 +92,20 @@ pub struct FrameBrowser {
     thumbs: HashMap<u64, (u64, Option<egui::TextureHandle>)>,
     asked: HashSet<(u64, u64)>,
     selected: Option<u64>,
-    big: Option<(
-        u64,
-        Option<egui::TextureHandle>,
-        Option<egui::TextureHandle>,
-    )>,
+    big: Option<BigView>,
+    hdr: Option<HdrInfo>,
     note: String,
     history: Option<History>,
 }
+
+/// Frame number, original, result and the tone-mapped HDR frame of the detail view.
+#[derive(Clone)]
+struct BigView(
+    u64,
+    Option<egui::TextureHandle>,
+    Option<egui::TextureHandle>,
+    Option<egui::TextureHandle>,
+);
 
 /// The window with the rejected earlier versions of one frame.
 struct History {
@@ -117,6 +131,7 @@ impl Default for FrameBrowser {
             asked: HashSet::new(),
             selected: None,
             big: None,
+            hdr: None,
             note: String::new(),
             history: None,
         }
@@ -162,7 +177,12 @@ impl FrameBrowser {
     /// Takes the browser's events; returns false for events meant for someone else.
     pub fn handle(&mut self, ctx: &egui::Context, event: &Event) -> bool {
         match event {
-            Event::FrameStatuses { jobs, dir, frames } => {
+            Event::FrameStatuses {
+                jobs,
+                dir,
+                frames,
+                hdr,
+            } => {
                 self.loading = false;
                 self.jobs = jobs.clone();
                 if &self.dir != dir {
@@ -170,7 +190,7 @@ impl FrameBrowser {
                     self.reset_view();
                 }
                 // A frame with a new result needs its large view again.
-                if let (Some(sel), Some((n, _, _))) = (self.selected, &self.big) {
+                if let (Some(sel), Some(BigView(n, ..))) = (self.selected, &self.big) {
                     let old = self.frames.iter().find(|f| f.n == sel).map(stamp);
                     let new = frames.iter().find(|f| f.n == sel).map(stamp);
                     if *n == sel && old != new {
@@ -178,6 +198,7 @@ impl FrameBrowser {
                     }
                 }
                 self.frames = frames.clone();
+                self.hdr = hdr.clone();
                 true
             }
             Event::FrameThumb {
@@ -203,6 +224,7 @@ impl FrameBrowser {
                 n,
                 source,
                 result,
+                hdr,
             } => {
                 if Some(dir) == self.dir.as_ref() && self.selected == Some(*n) {
                     let load = |name: &str, img: &Option<egui::ColorImage>| {
@@ -210,7 +232,12 @@ impl FrameBrowser {
                             ctx.load_texture(name, i.clone(), egui::TextureOptions::LINEAR)
                         })
                     };
-                    self.big = Some((*n, load("fsrc", source), load("fout", result)));
+                    self.big = Some(BigView(
+                        *n,
+                        load("fsrc", source),
+                        load("fout", result),
+                        load("fhdr", hdr),
+                    ));
                 }
                 true
             }
@@ -423,8 +450,18 @@ fn body(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             }
             ui.separator();
         }
+        if b.hdr.is_none() && b.filter == Filter::HdrMissing {
+            b.filter = Filter::All;
+        }
         for f in Filter::ALL {
-            let count = b.frames.iter().filter(|s| f.keeps(s)).count();
+            if f == Filter::HdrMissing && b.hdr.is_none() {
+                continue;
+            }
+            let count = b
+                .frames
+                .iter()
+                .filter(|s| f.keeps(s, b.hdr.as_ref()))
+                .count();
             if ui
                 .selectable_label(b.filter == f, format!("{} ({count})", f.label()))
                 .clicked()
@@ -439,7 +476,7 @@ fn body(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     let shown: Vec<FrameStatus> = b
         .frames
         .iter()
-        .filter(|f| b.filter.keeps(f))
+        .filter(|f| b.filter.keeps(f, b.hdr.as_ref()))
         .cloned()
         .collect();
     let pages = shown.len().div_ceil(PAGE).max(1);
@@ -615,6 +652,24 @@ fn tile(
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("#{}", f.n)).strong());
                 ui.label(egui::RichText::new(text).small().color(color));
+                if let Some(h) = &b.hdr {
+                    let (badge, color, hint) = match h.status.get(&f.n) {
+                        Some(HdrStatus::Ready) => (
+                            "HDR",
+                            GOOD,
+                            tr("HDR-versionen är klar", "The HDR version is ready"),
+                        ),
+                        _ => (
+                            "HDR …",
+                            WARN,
+                            tr("HDR-versionen görs", "The HDR version is being made"),
+                        ),
+                    };
+                    ui.label(egui::RichText::new(badge).small().color(color))
+                        .on_hover_text(hint);
+                } else if f.done {
+                    ui.label(egui::RichText::new("SDR").small().weak());
+                }
                 let earlier = f.record.as_ref().map_or(0, |r| r.history.len());
                 if earlier > 0 {
                     ui.label(
@@ -672,8 +727,8 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
     let Some(f) = b.frames.iter().find(|f| f.n == n).cloned() else {
         return;
     };
-    if b.big.as_ref().is_none_or(|(m, _, _)| *m != n) {
-        b.big = Some((n, None, None));
+    if b.big.as_ref().is_none_or(|v| v.0 != n) {
+        b.big = Some(BigView(n, None, None, None));
         worker::frame_pair(bus.clone(), dir.clone(), n);
     }
     let (color, text) = status_text(&f);
@@ -722,9 +777,14 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
         ui.label(egui::RichText::new(p).small().color(WARN));
     }
     let avail = ui.available_width();
-    let img_w = (avail - 12.0) / 2.0;
+    let hdr_ready = b
+        .hdr
+        .as_ref()
+        .map(|h| h.status.get(&n) == Some(&HdrStatus::Ready));
+    let columns = if hdr_ready.is_some() { 3.0 } else { 2.0 };
+    let img_w = (avail - 12.0 * columns) / columns;
     ui.horizontal(|ui| {
-        let (_, src, out) = b.big.clone().unwrap_or((n, None, None));
+        let BigView(_, src, out, hdr_img) = b.big.clone().unwrap_or(BigView(n, None, None, None));
         for (label, tex) in [
             (tr("Original", "Original"), src),
             (tr("Resultat", "Result"), out),
@@ -744,6 +804,45 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
                         ui.add_sized([img_w, 120.0], egui::Spinner::new());
                     }
                 }
+            });
+        }
+        if let Some(ready) = hdr_ready {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(tr("HDR (tonmappad)", "HDR (tone mapped)"))
+                        .small()
+                        .weak(),
+                );
+                match &hdr_img {
+                    Some(t) => {
+                        let s = t.size_vec2();
+                        let mut size = egui::vec2(img_w, img_w * s.y / s.x);
+                        if size.y > 220.0 {
+                            size *= 220.0 / size.y;
+                        }
+                        ui.add(egui::Image::new((t.id(), size)).corner_radius(3.0));
+                    }
+                    None if !ready => {
+                        ui.add_sized(
+                            [img_w, 120.0],
+                            egui::Label::new(tr(
+                                "HDR-versionen är inte klar",
+                                "The HDR version is not ready",
+                            )),
+                        );
+                    }
+                    None => {
+                        ui.add_sized([img_w, 120.0], egui::Spinner::new());
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(tr(
+                        "Underkänns bildrutan görs både SDR- och HDR-versionen om.",
+                        "Rejecting the frame remakes both the SDR and the HDR version.",
+                    ))
+                    .small()
+                    .weak(),
+                );
             });
         }
     });
