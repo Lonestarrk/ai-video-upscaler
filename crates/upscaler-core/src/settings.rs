@@ -421,7 +421,8 @@ pub struct Settings {
     /// Peak brightness (nits) the inverse tone map expands the top range to (HDR10/HDR10+;
     /// HLG always uses its nominal 1000 nits).
     pub hdr_peak_nits: u32,
-    /// Where SDR white lands in the HDR picture, in nits (203 = BT.2408). Higher makes the
+    /// Where SDR white lands in the HDR picture, in nits (203 = BT.2408; 400 by default, the
+    /// owner's choice on his projector). Higher makes the
     /// whole picture brighter, for projectors and dim displays; the peak stays.
     pub hdr_sdr_white_nits: u32,
     /// Remove the full-rate in-between frames (`interp/`, made for HDR with "every 2nd/3rd
@@ -495,7 +496,7 @@ impl Default for Settings {
             crf: 16,
             hdr_mode: HdrMode::Off,
             hdr_peak_nits: 1000,
-            hdr_sdr_white_nits: 203,
+            hdr_sdr_white_nits: 400,
             hdr_delete_interp_after: true,
             audio_mode: AudioMode::Original,
             surround_engine: SurroundEngine::LocalAi,
@@ -659,7 +660,7 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.hdr_mode, HdrMode::Off);
         assert_eq!(s.hdr_peak_nits, 1000);
-        assert_eq!(s.hdr_sdr_white_nits, 203);
+        assert_eq!(s.hdr_sdr_white_nits, 400);
         assert!(s.hdr_delete_interp_after);
         assert!(!HdrMode::Off.is_pq());
         assert!(HdrMode::Hdr10.is_pq());

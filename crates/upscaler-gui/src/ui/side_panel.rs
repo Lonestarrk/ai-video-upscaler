@@ -336,9 +336,9 @@ fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
         .response
         .on_hover_text(tr(
             "Där vanligt vitt hamnar i HDR-bilden. Högre ger en ljusare bild överlag, \
-             bra för projektorer och mörkare skärmar. 203 är standard (BT.2408).",
+             bra för projektorer och mörkare skärmar. 203 är BT.2408:s referens, 400 är förval.",
             "Where ordinary white lands in the HDR picture. Higher makes the whole picture \
-             brighter, good for projectors and dimmer displays. 203 is the standard (BT.2408).",
+             brighter, good for projectors and dimmer displays. 203 is BT.2408's reference, 400 the default.",
         ));
     ui.end_row();
     // Only "every 2nd/3rd frame" makes in-between frames for HDR.

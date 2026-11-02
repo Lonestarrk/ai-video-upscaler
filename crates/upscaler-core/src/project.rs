@@ -375,7 +375,7 @@ mod tests {
         let old: ProjectSettings =
             serde_json::from_str(r#"{"hdr_delete_frames_after": false}"#).unwrap();
         assert!(!old.hdr_delete_interp_after);
-        assert_eq!(old.hdr_sdr_white_nits, 203);
+        assert_eq!(old.hdr_sdr_white_nits, 400);
     }
 
     #[test]

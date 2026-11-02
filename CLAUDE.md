@@ -64,7 +64,7 @@ cargo fmt --all                            # run before committing
     `ffmpeg::mux` writes the MKV: FLAC 5.1 (default), AC-3 5.1, Original.
   - `hdr/` HDR export, pure Rust on the CPU (no GPU, no Vulkan), nothing 16-bit on disk:
     `itm.rs` the inverse tone mapping 8-bit SDR frame → 16-bit PQ/HLG BT.2020 (curve approved
-    by the owner, SDR white `hdr_sdr_white_nits` 203/300/400, the expansion ratio taken from a
+    by the owner, SDR white `hdr_sdr_white_nits` 203/300/400 (default 400), the expansion ratio taken from a
     self-guided filter of the gamma luminance, r 8, eps (1.5/255)², so 8-bit steps above SDR
     code ~238 do not band; PQ by table); `convert.rs` pass 1 `measure_pass` (convert +
     measure in memory, parallel, one line per frame in `hdr/stats.txt`, valid while the SDR
@@ -168,7 +168,9 @@ planet/eclipse 271 s, 240 frames each. Files in the owner's `tester\HDR\`.
   `hdr-look-investigation.md`): the approved v2 came from a 2.6× brighter ChatGPT SDR input
   (curve unchanged); the bands were 8-bit steps magnified ~12× above SDR code ~238. Fixed
   2026-11-02 (HDR_VERSION 2): guided-filter gain, zscale dither, CRF − 2 + aq-mode 3, SDR
-  white setting (default 203 until the owner picks 203/300/400 on the projector).
+  white setting. Owner's projector verdict on the fixed files: lounge best at white 400
+  (over 300), planet at 300 "almost no problems" vs 203 "blocky when the sun overexposes";
+  default white 400.
 - Streaming two-pass HDR (2026-11-02, planet 240 frames, i7-12700KF): pass 1 8 ms/frame,
   pass 2 (convert + x265 medium CRF 14 aq 3) 38 ms/frame; ITM single-thread 71 ms/frame
   (was 146 ms per-pixel without the filter); disk `hdr/` 37 KB for 240 frames (was

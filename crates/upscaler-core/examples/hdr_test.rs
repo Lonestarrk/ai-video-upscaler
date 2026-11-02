@@ -7,7 +7,7 @@
 //!
 //! cargo run -p upscaler-core --release --example hdr_test -- \
 //!     <sdr frames dir> <source video> <start s> <out.mkv> <work dir> \
-//!     [--mode hdr10plus|hdr10|hlg] [--peak 1000] [--white 203]
+//!     [--mode hdr10plus|hdr10|hlg] [--peak 1000] [--white 400]
 //!     [--previews 1,120,200 --share <dir> --name <prefix>]
 //!
 //! The frames are taken in name order and must be the range's frames at the source's rate,
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         m => bail!("unknown mode {m}"),
     };
     let peak: u32 = opt("--peak").as_deref().unwrap_or("1000").parse()?;
-    let white: u32 = opt("--white").as_deref().unwrap_or("203").parse()?;
+    let white: u32 = opt("--white").as_deref().unwrap_or("400").parse()?;
     let previews: Vec<u64> = opt("--previews")
         .map(|v| v.split(',').map(|n| n.trim().parse()).collect())
         .transpose()?

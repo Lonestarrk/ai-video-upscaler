@@ -1,5 +1,6 @@
 //! Inverse tone mapping of SDR frames to HDR, in pure Rust. The curve is the owner-approved
-//! "hdr10-v2" look: SDR white sits at `sdr_white` nits (203 by default, BT.2408), everything
+//! "hdr10-v2" look: SDR white sits at `sdr_white` nits (the setting, 400 by default; BT.2408's
+//! reference is 203), everything
 //! up to 80 % of SDR white luminance is unchanged, and above that a cubic expands the
 //! highlights towards the peak. Colour is kept by scaling R, G and B with the same ratio.
 //!
