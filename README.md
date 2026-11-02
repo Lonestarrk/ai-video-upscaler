@@ -7,6 +7,7 @@ Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade r
 - [Funktioner](#funktioner)
 - [Kom igång: använda appen](#kom-igång-använda-appen)
 - [Ljud](#ljud)
+- [HDR](#hdr)
 - [Kom igång: bygga, testa och utveckla vidare](#kom-igång-bygga-testa-och-utveckla-vidare)
 - [Felsökning](#felsökning)
 - [Hur det fungerar](#hur-det-fungerar)
@@ -29,6 +30,7 @@ Dra in en video, hoppa i tidslinjen och jämför originalet med det uppskalade r
 - **Sparar kvot:** identiska bildrutor återanvänder resultatet, och du kan välja att bara skicka varannan eller var tredje bildruta till AI:n och skapa resten med rörelseinterpolering.
 - **Återupptagbar export:** färdiga bildrutor sparas. En export som avbryts, får nätverksfel eller når planens gräns fortsätter där den slutade när du startar den igen.
 - **Utdata:** 2×/3×/4× eller 1080p/1440p/4K, H.264 eller H.265, valfri kvalitet (CRF).
+- **HDR:** exportera som HDR10+, HDR10 eller HLG. Se [HDR](#hdr).
 - **Ljud:** originalljudet oförändrat, eller 5.1 gjort av stereoljudet (lokal AI eller klassisk uppmixning) med valbar basnivå, och förbättrad ljudkvalitet. Se [Ljud](#ljud).
 - **Flera AI-tjänster:**
 
@@ -158,6 +160,23 @@ Med bara kvalitetsförbättring: FLAC stereo + Original.
 
 **Varför MKV:** MP4 kan inte bära FLAC tillsammans med AC-3 och originalspåret på ett sätt som alla spelare klarar, och MKV hanterar flera ljudspår med namn och ett standardspår. Välj spår i spelaren (VLC, Kodi, Plex, mediaspelare i TV:n). Skulle förstärkaren vara tyst på FLAC-spåret, välj AC-3.
 
+## HDR
+
+Under *Utdata → HDR* i sidopanelen kan exporten bli HDR i stället för vanlig SDR. **Varför:** gamla källor är gjorda för 100 nits, men en HDR-TV eller projektor klarar mycket mer. Appen räknar om de uppskalade bildrutorna så att ljusa partier (lampor, stjärnor, solsken, explosioner) får lysa starkare, medan hudtoner och mellantoner ligger kvar där de var. Det är en beräkning i appen, ingen AI, och den kör på processorn.
+
+| Läge | Vad det betyder | Spelas på |
+|---|---|---|
+| **HDR10+** | HDR10 plus *dynamisk metadata*: för varje bildruta står hur ljus den är, så att en TV som inte når 1000 nits kan anpassa varje scen i stället för hela filmen. | TV och projektorer med HDR10+ (Samsung, Panasonic, Philips, Hisense, TCL, många projektorer). Andra HDR-apparater spelar filmen som vanlig HDR10. |
+| **HDR10** | Samma bild, men bara ett värde för hela filmen (MaxCLL/MaxFALL, den ljusaste pixeln och den ljusaste bildrutan i genomsnitt). | Nästan alla HDR-TV, projektorer och spelare. |
+| **HLG** | En annan kurva, gjord för sändnings-TV. Ingen metadata, fast 1000 nits. | De flesta HDR-TV. Välj den bara om apparaten saknar HDR10. |
+
+- **Toppljusstyrka:** 600, 1000 (standard) eller 1500 nits, det ljusaste filen får bli. 1000 nits passar de flesta TV-apparater; med en projektor eller en enklare TV gör TV:n själv om toppen till det den klarar.
+- **Kodek:** HDR blir alltid H.265 med 10 bitar. Valet H.264 gäller bara SDR.
+- **Förhandsvisningen visar SDR.** Datorskärmen visar inte HDR, så jämförelsen i appen är alltid SDR. Bildrutebläddraren kan visa en tonmappad HDR-bild (HDR räknad tillbaka till SDR) för att kontrollera att inget har gått fel, men hur det verkligen ser ut syns bara på TV:n eller projektorn.
+- **Diskutrymme:** HDR-bildrutorna sparas först som 16-bitars PNG i jobbmappen (`hdr\`). De är ungefär 4,4 gånger så stora som de vanliga: **~6,5–7 MB per bildruta vid 1440×1080** (uppmätt), ungefär 35 MB vid 4K. Ett 45-minutersavsnitt i 1440×1080 behöver alltså runt 450 GB ledigt under exporten.
+- **Ta bort HDR-bildrutor efter lyckad export** (på som standard): mappen `hdr\` tas bort när filen är klar. **Varför:** den behövs bara för att koda videon. De vanliga uppskalade bildrutorna sparas ändå, så en ny HDR-export räknar bara om dem, utan nya AI-anrop.
+- **Tid:** omräkningen tar ~16 ms, mätningen ~25 ms och kodningen ~30 ms per bildruta i 1440×1080 (Core i7-12700KF), alltså några minuter för ett avsnitt. Uppskalningen tar fortfarande mest tid.
+
 ## Kom igång: bygga, testa och utveckla vidare
 
 Det här behövs bara om du ska bygga appen själv eller fortsätta utvecklingen, till exempel med Claude Code.
@@ -259,11 +278,12 @@ OpenAI:s officiella [Codex CLI](https://github.com/openai/codex) loggar in med d
 3. Om modellen bara svarar i vissa format läggs svarta kanter till.
 4. Prompten byggs: din prompt plus appens tekniska regler.
 5. AI:n svarar, kanterna beskärs bort och bilden skalas till exakt rätt storlek.
-6. Vid export sätts bildrutorna ihop med originalljudet. Anamorfa källor kläms tillbaka till originalets pixelformat.
+6. Med HDR räknas de färdiga bildrutorna om till 16-bitars HDR (PQ eller HLG, BT.2020) och mäts för metadatan.
+7. Vid export sätts bildrutorna ihop med originalljudet. Anamorfa källor kläms tillbaka till originalets pixelformat.
 
 ### Struktur och data
 
-- `crates/upscaler-core`: allt utom gränssnittet: inställningar, FFmpeg, AI-tjänsterna (`provider/`), bildgeometri, bildformatkontroll, prompter, exportjobbet och ljudet (`audio/`: 5.1, LFE, kvalitetsförbättring och Ljud-AI).
+- `crates/upscaler-core`: allt utom gränssnittet: inställningar, FFmpeg, AI-tjänsterna (`provider/`), bildgeometri, bildformatkontroll, prompter, exportjobbet, ljudet (`audio/`: 5.1, LFE, kvalitetsförbättring och Ljud-AI) och HDR (`hdr/`: omräkning, mätning, HDR10+-metadata och SDR-förhandsvisning).
 - `crates/upscaler-gui`: egui-appen: jämförelsevy, tidslinje, sidopanel och inställningar.
 - Inställningar: `%APPDATA%\AI Video Upscaler\settings.json`. Förhandsvisningar, exportjobb, nedladdad FFmpeg och logg: `%LOCALAPPDATA%\AI Video Upscaler\`. Arbetsmappen kan flyttas och tömmas i inställningarna; långa exporter kan ta många GB eftersom varje bildruta sparas som PNG.
 
