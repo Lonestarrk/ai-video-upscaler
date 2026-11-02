@@ -278,38 +278,46 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     });
 }
 
-/// HDR rows of the output grid: mode, peak brightness, SDR white, keep/delete the in-between
-/// frames.
+/// HDR rows of the output grid: on/off, format, peak brightness, SDR white, keep/delete the
+/// in-between frames.
 fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
-    ui.label("HDR");
+    // The format chosen last, so switching HDR off and on again keeps it (this session).
+    let last_id = egui::Id::unique("hdr_last_mode");
     let mode = &mut app.settings.hdr_mode;
+    if *mode != HdrMode::Off {
+        let m = *mode;
+        ui.data_mut(|d| d.insert_temp(last_id, m));
+    }
+    let mut on = *mode != HdrMode::Off;
+    if ui.checkbox(&mut on, tr("HDR", "HDR")).changed() {
+        *mode = if on {
+            ui.data(|d| d.get_temp(last_id))
+                .unwrap_or(HdrMode::Hdr10Plus)
+        } else {
+            HdrMode::Off
+        };
+    }
+    ui.label("");
+    ui.end_row();
+    if *mode == HdrMode::Off {
+        return;
+    }
+    let plus = tr(
+        "HDR10+ (fungerar även som HDR10)",
+        "HDR10+ (also plays as HDR10)",
+    );
+    ui.label(tr("Format", "Format"));
     egui::ComboBox::from_id_salt("hdr_mode")
         .selected_text(match *mode {
-            HdrMode::Off => tr("Av", "Off").to_string(),
-            HdrMode::Hdr10Plus => tr(
-                "HDR10+ (fungerar även som HDR10)",
-                "HDR10+ (also plays as HDR10)",
-            )
-            .to_string(),
+            HdrMode::Hdr10Plus => plus.to_string(),
             m => m.name().to_string(),
         })
         .show_ui(ui, |ui| {
-            ui.selectable_value(mode, HdrMode::Off, tr("Av", "Off"));
-            ui.selectable_value(
-                mode,
-                HdrMode::Hdr10Plus,
-                tr(
-                    "HDR10+ (fungerar även som HDR10)",
-                    "HDR10+ (also plays as HDR10)",
-                ),
-            );
+            ui.selectable_value(mode, HdrMode::Hdr10Plus, plus);
             ui.selectable_value(mode, HdrMode::Hdr10, "HDR10");
             ui.selectable_value(mode, HdrMode::Hlg, "HLG");
         });
     ui.end_row();
-    if app.settings.hdr_mode == HdrMode::Off {
-        return;
-    }
     ui.label(tr("Toppljusstyrka", "Peak brightness"));
     if app.settings.hdr_mode == HdrMode::Hlg {
         ui.label(
