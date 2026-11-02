@@ -59,7 +59,7 @@ pub fn write_json(m: &Measurement, cuts: &[bool], peak_nits: u32, path: &Path) -
         .with_context(|| format!("writing {}", path.display()))
 }
 
-/// The `hdr/` frame (1-based file number) that belongs to `out/` frame `k` (1-based). With
+/// The encoded (full-rate) frame, 1-based, that belongs to `out/` frame `k` (1-based). With
 /// "every 2nd/3rd frame" the SDR frames are interpolated to the full rate first, so AI frame
 /// `k` sits at full-rate frame `(k - 1) * divisor + 1`.
 pub fn hdr_frame_for_out(k: u64, divisor: u32) -> u64 {

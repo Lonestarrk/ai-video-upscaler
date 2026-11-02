@@ -1261,6 +1261,8 @@ fn wrongly_flagged_dvd_is_detected_and_fixed() {
 
 // ---- HDR output -------------------------------------------------------------------------
 
+use upscaler_core::hdr::convert::{self as hdr_convert, HdrParams};
+use upscaler_core::hdr::measure::Measurement;
 use upscaler_core::settings::HdrMode;
 
 fn hdr_settings(work: &Path, mode: HdrMode) -> Settings {
@@ -1269,7 +1271,7 @@ fn hdr_settings(work: &Path, mode: HdrMode) -> Settings {
         output_size: OutputSize::Scale2,
         hdr_mode: mode,
         hdr_peak_nits: 1000,
-        hdr_delete_frames_after: false,
+        hdr_delete_interp_after: false,
         ..Settings::default()
     };
     s.work_dir = work.display().to_string();
@@ -1279,6 +1281,7 @@ fn hdr_settings(work: &Path, mode: HdrMode) -> Settings {
 fn hdr_spec(tools: &Tools, dir: &Path, mode: HdrMode, out: &str) -> ExportSpec {
     let src = dir.join("in.mp4");
     if !src.is_file() {
+        std::fs::create_dir_all(dir).unwrap();
         make_video(tools, &src);
     }
     let info = ffmpeg::probe(tools, &src).unwrap();
@@ -1289,6 +1292,33 @@ fn hdr_spec(tools: &Tools, dir: &Path, mode: HdrMode, out: &str) -> ExportSpec {
         output: dir.join(out),
         settings: hdr_settings(&dir.join("work"), mode),
     }
+}
+
+/// The light levels the export measured (read back from `hdr/stats.txt`; every frame is
+/// cached, nothing is converted again).
+fn measured(spec: &ExportSpec) -> Measurement {
+    let job = spec.job_dir();
+    let params = HdrParams::from_settings(&spec.settings).unwrap();
+    let frames = hdr_convert::measure_pass(
+        &job.join("out"),
+        &hdr_convert::hdr_dir(&job),
+        spec.job_frames(),
+        &params,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    Measurement::from_frames(frames)
+}
+
+/// Files in the job's `hdr/` folder: only the two text files, never a frame.
+fn hdr_files(spec: &ExportSpec) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(hdr_convert::hdr_dir(&spec.job_dir()))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// ffprobe JSON of the first video frame (with side data) and the stream.
@@ -1335,6 +1365,7 @@ fn hdr10_export_is_pq_bt2020_10bit() {
     assert_eq!(s["color_transfer"], "smpte2084");
     assert_eq!(s["color_primaries"], "bt2020");
     assert_eq!(s["color_space"], "bt2020nc");
+    assert_eq!(ffmpeg::probe(&tools, &spec.output).unwrap().frame_count, 12);
     let side = j["frames"][0]["side_data_list"].as_array().unwrap();
     let find = |name: &str| {
         side.iter()
@@ -1347,15 +1378,10 @@ fn hdr10_export_is_pq_bt2020_10bit() {
     let max_cll = cll["max_content"].as_u64().unwrap();
     let max_fall = cll["max_average"].as_u64().unwrap();
     assert!(max_cll > 0 && max_fall > 0 && max_fall <= max_cll, "{cll}");
-    // The values are measured from the HDR frames, not fixed ones.
-    let m = upscaler_core::hdr::measure::measure_dir(
-        &upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()),
-        spec.job_frames(),
-        &AtomicBool::new(false),
-        |_| {},
-    )
-    .unwrap();
+    // The values are the measured ones, and no 16-bit frame was stored to measure them.
+    let m = measured(&spec);
     assert_eq!((max_cll, max_fall), (m.max_cll as u64, m.max_fall as u64));
+    assert_eq!(hdr_files(&spec), ["settings.txt", "stats.txt"]);
 }
 
 #[test]
@@ -1365,7 +1391,9 @@ fn hlg_export_has_hlg_transfer() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hlg, "hlg.mp4");
+    let mut spec = hdr_spec(&tools, dir.path(), HdrMode::Hlg, "hlg.mp4");
+    // HLG always works at its nominal 1000 nits, whatever the peak setting says.
+    spec.settings.hdr_peak_nits = 1500;
     let log = run(&tools, &spec);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
     let j = first_frame_json(&tools, &spec.output);
@@ -1382,6 +1410,8 @@ fn hlg_export_has_hlg_transfer() {
         })),
         "{side:?}"
     );
+    let job = hdr_convert::job_hdr(&spec.job_dir()).unwrap();
+    assert_eq!(job.params.peak_nits, 1000);
 }
 
 /// Distinct luma codes (10-bit) along the middle row of frame `n` of `path`, and the share of
@@ -1423,7 +1453,8 @@ fn hdr_with_interpolation_and_anamorphic() {
     let status = std::process::Command::new(&tools.ffmpeg)
         .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
         .arg(
-            "nullsrc=size=1024x64:rate=30000/1001:duration=3,             geq=lum='16+219*X/W':cb=128:cr=128,setsar=32/27",
+            "nullsrc=size=1024x64:rate=30000/1001:duration=3,\
+             geq=lum='16+219*X/W':cb=128:cr=128,setsar=32/27",
         )
         .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
         .arg(&src)
@@ -1463,6 +1494,10 @@ fn hdr_with_interpolation_and_anamorphic() {
     assert_eq!(entry(&v, "color_transfer").as_deref(), Some("smpte2084"));
     assert_eq!(entry(&v, "color_primaries").as_deref(), Some("bt2020"));
     assert_eq!(entry(&v, "pix_fmt").as_deref(), Some("yuv420p10le"));
+    // 24 source frames from 12 AI frames. minterpolate stops at the last AI frame, so the
+    // last few full-rate frames are missing (as in the SDR export); never more.
+    let frames = video_frames(&tools, &spec.output);
+    assert!((21..=24).contains(&frames), "{frames} frames");
     // An interpolated (odd) frame still has the fine PQ steps: an 8-bit PQ stage would put
     // (nearly) every sample on the 8-bit grid (measured 67 % after encoding, vs 26 % here).
     let (levels, grid) = luma_levels(&tools, &spec.output, 5);
@@ -1475,36 +1510,78 @@ fn hdr_with_interpolation_and_anamorphic() {
 }
 
 #[test]
-fn hdr_frames_deleted_after_export_when_set() {
+fn interp_frames_deleted_after_hdr_export_when_set() {
     let Some(tools) = Tools::locate("") else {
         eprintln!("ffmpeg not installed, skipping");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
     let mut spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "del.mp4");
-    spec.settings.hdr_delete_frames_after = true;
-    // Every 2nd frame: the interpolated SDR frames go too.
+    spec.settings.hdr_delete_interp_after = true;
+    // Every 2nd frame: HDR makes full-rate in-between frames in interp/.
     spec.settings.ai_rate = AiRate::Half;
     let log = run(&tools, &spec);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
-    assert!(!upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()).exists());
     assert!(!spec.job_dir().join("interp").exists());
     assert!(spec.job_dir().join("out").is_dir(), "out/ is never deleted");
+    assert_eq!(hdr_files(&spec), ["settings.txt", "stats.txt"]);
 
     let mut keep = hdr_spec(&tools, dir.path(), HdrMode::Hdr10, "keep.mp4");
-    keep.settings.hdr_delete_frames_after = false;
+    keep.settings.ai_rate = AiRate::Half;
+    keep.settings.hdr_delete_interp_after = false;
     let log = run(&tools, &keep);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
-    assert!(upscaler_core::hdr::convert::hdr_dir(&keep.job_dir()).is_dir());
+    assert!(keep.job_dir().join("interp").is_dir());
+}
+
+/// Changing only the audio (or exporting again) reuses `video.mkv` without any HDR work:
+/// no interpolation, no conversion, no encode, even after `interp/` was deleted.
+#[test]
+fn hdr_reexport_reuses_the_video() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // Stereo audio (5.1 needs it).
+    let src = dir.path().join("ntsc.mkv");
+    make_ntsc_clip(&tools, &src);
+    let mut spec = ExportSpec {
+        info: ffmpeg::probe(&tools, &src).unwrap(),
+        start: 2,
+        end: 14,
+        output: dir.path().join("again.mp4"),
+        settings: hdr_settings(&dir.path().join("work"), HdrMode::Hdr10Plus),
+    };
+    spec.settings.ai_rate = AiRate::Half;
+    spec.settings.hdr_delete_interp_after = true;
+    spec.settings.audio_mode = AudioMode::Surround;
+    spec.settings.surround_engine = SurroundEngine::Classic;
+    let log = run_events(&tools, &spec);
+    assert!(log.last().unwrap().starts_with("finished"), "{log:?}");
+    assert!(log.iter().any(|l| l == "progress Hdr"), "{log:?}");
+    assert!(!spec.job_dir().join("interp").exists());
+    let again = run_events(&tools, &spec);
+    assert!(again.last().unwrap().starts_with("finished"), "{again:?}");
     assert!(
-        !keep.job_dir().join("interp").exists(),
-        "no interp without skipped frames"
+        !again
+            .iter()
+            .any(|l| l == "progress Hdr" || l == "progress Encoding"),
+        "{again:?}"
     );
+    // A brighter SDR white changes the pixels: the HDR passes and the encode run again.
+    spec.settings.hdr_sdr_white_nits = 300;
+    let third = run_events(&tools, &spec);
+    assert!(third.last().unwrap().starts_with("finished"), "{third:?}");
+    assert!(third.iter().any(|l| l == "progress Encoding"), "{third:?}");
 }
 
 /// The encoder must apply nothing but RGB to YUV with the BT.2020 matrix, full to limited
 /// range: grey 16-bit PQ (100 nits) comes back as limited-range grey with the same code
-/// value, and a colour follows the BT.2020 non-constant-luminance matrix.
+/// value, and a colour follows the BT.2020 non-constant-luminance matrix. Checked for the
+/// zscale chain (when this FFmpeg has it) and the swscale fallback, plain and squeezed to an
+/// anamorphic stored size (the scale must not touch the matrix or the range), and through
+/// `ffmpeg::encode` with frames fed to its stdin.
 #[test]
 fn hdr_encode_keeps_pq_code_values() {
     let Some(tools) = Tools::locate("") else {
@@ -1512,26 +1589,47 @@ fn hdr_encode_keeps_pq_code_values() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let frames = dir.path().join("hdr");
-    std::fs::create_dir_all(&frames).unwrap();
     let v = upscaler_core::hdr::measure::nits_to_pq(100.0);
     let code = (v * 65535.0).round() as u16;
-    let img = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_fn(64, 64, |x, _| {
-        if x < 32 {
-            image::Rgb([code, code, code])
-        } else {
-            image::Rgb([code, code / 4, code / 4])
+    let mut frame = Vec::new();
+    // Not smaller: x265 in some FFmpeg builds crashes on exit (heap corruption) at 48x64.
+    for _y in 0..128 {
+        for x in 0..256 {
+            let px = if x < 128 {
+                [code, code, code]
+            } else {
+                [code, code / 4, code / 4]
+            };
+            for c in px {
+                frame.extend_from_slice(&c.to_le_bytes());
+            }
         }
-    });
-    for n in 1..=3 {
-        img.save(ffmpeg::frame_file(&frames, n)).unwrap();
     }
-    // Plain, and squeezed to an anamorphic stored size (a later lanczos scale must not touch
-    // the matrix or the range).
+    let feed = |w: &mut dyn std::io::Write| -> anyhow::Result<()> {
+        for _ in 0..3 {
+            w.write_all(&frame)?;
+        }
+        Ok(())
+    };
+    let hdr = upscaler_core::hdr::HdrEncode {
+        mode: HdrMode::Hdr10,
+        peak_nits: 1000,
+        max_cll: 100,
+        max_fall: 100,
+        hdr10plus_json: None,
+    };
+    let mut chains = vec![false];
+    if tools.has_zscale() {
+        chains.push(true);
+    } else {
+        eprintln!("this FFmpeg has no zscale: only the swscale chain is checked");
+    }
     for (anamorphic, width, grey_x, colour_x) in [
-        (None, 64usize, 8usize, 48usize),
-        (Some(((48u32, 64u32), (4u32, 3u32))), 48, 6, 36),
+        (None, 256usize, 32usize, 192usize),
+        (Some(((192u32, 128u32), (4u32, 3u32))), 192, 24, 144),
     ] {
+        let mut outs = Vec::new();
+        // Through encode (the chain this FFmpeg gets).
         let opts = ffmpeg::EncodeOptions {
             in_fps_num: 24,
             in_fps_den: 1,
@@ -1540,74 +1638,86 @@ fn hdr_encode_keeps_pq_code_values() {
             codec: upscaler_core::settings::VideoCodec::H265,
             crf: 4,
             audio_from: None,
-            hdr: Some(upscaler_core::hdr::HdrEncode {
-                mode: HdrMode::Hdr10,
-                peak_nits: 1000,
-                max_cll: 100,
-                max_fall: 100,
-                hdr10plus_json: None,
-            }),
+            hdr: Some(hdr.clone()),
         };
         let out = dir.path().join(format!("grey{width}.mkv"));
-        ffmpeg::encode(
-            &tools,
-            &frames,
-            3,
-            &opts,
-            &out,
-            &AtomicBool::new(false),
-            |_| {},
-        )
-        .unwrap();
-        let raw = std::process::Command::new(&tools.ffmpeg)
-            .args(["-v", "error", "-i"])
-            .arg(&out)
-            .args([
-                "-frames:v",
-                "1",
-                "-pix_fmt",
-                "yuv444p10le",
-                "-f",
-                "rawvideo",
-                "-",
-            ])
-            .output()
-            .unwrap()
-            .stdout;
-        let plane = width * 64;
-        assert_eq!(raw.len(), plane * 3 * 2, "width {width}");
-        let at = |p: usize, x: usize, y: usize| {
-            let i = (p * plane + y * width + x) * 2;
-            u16::from_le_bytes([raw[i], raw[i + 1]]) as f64
+        let input = ffmpeg::VideoInput::Rgb48 {
+            width: 256,
+            height: 128,
+            feed: &feed,
         };
-        let expect_y = 64.0 + 876.0 * v as f64;
-        let (y, cb, cr) = (at(0, grey_x, 32), at(1, grey_x, 32), at(2, grey_x, 32));
-        assert!(
-            (y - expect_y).abs() <= 4.0,
-            "width {width}: Y {y} expected {expect_y}"
-        );
-        assert!(
-            (cb - 512.0).abs() <= 4.0 && (cr - 512.0).abs() <= 4.0,
-            "width {width}: {cb} {cr}"
-        );
-        let (r, g) = (code as f64 / 65535.0, code as f64 / 4.0 / 65535.0);
-        let b = g;
-        let ey = 0.2627 * r + 0.6780 * g + 0.0593 * b;
-        let (wy, wcb, wcr) = (
-            64.0 + 876.0 * ey,
-            512.0 + 896.0 * (b - ey) / 1.8814,
-            512.0 + 896.0 * (r - ey) / 1.4746,
-        );
-        let (y, cb, cr) = (
-            at(0, colour_x, 32),
-            at(1, colour_x, 32),
-            at(2, colour_x, 32),
-        );
-        assert!((y - wy).abs() <= 6.0, "width {width}: Y {y} vs {wy}");
-        assert!(
-            (cb - wcb).abs() <= 6.0 && (cr - wcr).abs() <= 6.0,
-            "width {width}: chroma {cb} {cr} vs {wcb} {wcr}"
-        );
+        ffmpeg::encode(&tools, &input, &opts, &out, &AtomicBool::new(false), |_| {}).unwrap();
+        outs.push((out, "encode"));
+        // Each chain on its own.
+        for &z in &chains {
+            let out = dir.path().join(format!("grey{width}-{z}.mkv"));
+            let mut child = std::process::Command::new(&tools.ffmpeg)
+                .args(["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb48le"])
+                .args(["-s", "256x128", "-framerate", "24", "-i", "pipe:0", "-vf"])
+                .arg(ffmpeg::hdr_filters(HdrMode::Hdr10, anamorphic, z))
+                .args(["-c:v", "libx265", "-x265-params", "crf=4:log-level=error"])
+                .arg(&out)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            feed(&mut child.stdin.take().unwrap()).unwrap();
+            assert!(child.wait().unwrap().success());
+            outs.push((out, if z { "zscale" } else { "swscale" }));
+        }
+        for (out, chain) in outs {
+            let raw = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&out)
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "yuv444p10le",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            let plane = width * 128;
+            assert_eq!(raw.len(), plane * 3 * 2, "{chain} width {width}");
+            let at = |p: usize, x: usize, y: usize| {
+                let i = (p * plane + y * width + x) * 2;
+                u16::from_le_bytes([raw[i], raw[i + 1]]) as f64
+            };
+            let expect_y = 64.0 + 876.0 * v as f64;
+            let (y, cb, cr) = (at(0, grey_x, 64), at(1, grey_x, 64), at(2, grey_x, 64));
+            assert!(
+                (y - expect_y).abs() <= 4.0,
+                "{chain} width {width}: Y {y} expected {expect_y}"
+            );
+            assert!(
+                (cb - 512.0).abs() <= 4.0 && (cr - 512.0).abs() <= 4.0,
+                "{chain} width {width}: {cb} {cr}"
+            );
+            let (r, g) = (code as f64 / 65535.0, code as f64 / 4.0 / 65535.0);
+            let b = g;
+            let ey = 0.2627 * r + 0.6780 * g + 0.0593 * b;
+            let (wy, wcb, wcr) = (
+                64.0 + 876.0 * ey,
+                512.0 + 896.0 * (b - ey) / 1.8814,
+                512.0 + 896.0 * (r - ey) / 1.4746,
+            );
+            let (y, cb, cr) = (
+                at(0, colour_x, 64),
+                at(1, colour_x, 64),
+                at(2, colour_x, 64),
+            );
+            assert!(
+                (y - wy).abs() <= 6.0,
+                "{chain} width {width}: Y {y} vs {wy}"
+            );
+            assert!(
+                (cb - wcb).abs() <= 6.0 && (cr - wcr).abs() <= 6.0,
+                "{chain} width {width}: chroma {cb} {cr} vs {wcb} {wcr}"
+            );
+        }
     }
 }
 
@@ -1617,10 +1727,15 @@ fn hdr10plus_export_carries_dynamic_metadata() {
         eprintln!("ffmpeg not installed, skipping");
         return;
     };
-    // The temp dir (and so the job folder with hdr10plus.json) has a drive letter and
-    // backslashes on Windows: the path must survive ffmpeg's -x265-params parsing.
+    // The job folder (and so hdr10plus.json) has a drive letter, backslashes and a non-ASCII
+    // folder name: the path must survive ffmpeg's -x265-params parsing and x265's fopen.
     let dir = tempfile::tempdir().unwrap();
-    let spec = hdr_spec(&tools, dir.path(), HdrMode::Hdr10Plus, "hdr10plus.mp4");
+    let spec = hdr_spec(
+        &tools,
+        &dir.path().join("å"),
+        HdrMode::Hdr10Plus,
+        "hdr10plus.mp4",
+    );
     let log = run(&tools, &spec);
     assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
     let json = spec.job_dir().join("hdr10plus.json");
@@ -1684,26 +1799,18 @@ fn hdr10plus_round_trip() {
     assert!(st.success());
     let j: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&extracted).unwrap()).unwrap();
-    let m = upscaler_core::hdr::measure::measure_dir(
-        &upscaler_core::hdr::convert::hdr_dir(&spec.job_dir()),
-        spec.job_frames(),
-        &AtomicBool::new(false),
-        |_| {},
-    )
-    .unwrap();
+    let m = measured(&spec);
     let frames = j["SceneInfo"].as_array().unwrap();
     assert_eq!(frames.len(), m.frames.len());
-    let got: Vec<f64> = frames[0]["LuminanceParameters"]["MaxScl"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_f64().unwrap())
-        .collect();
-    for (g, want) in got.iter().zip(m.frames[0].max_scl) {
-        assert!(
-            (g - want as f64 * 10.0).abs() <= 2.0,
-            "{got:?} vs {:?}",
-            m.frames[0]
-        );
+    for (f, want) in frames.iter().zip(&m.frames) {
+        let got: Vec<f64> = f["LuminanceParameters"]["MaxScl"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        for (g, w) in got.iter().zip(want.max_scl) {
+            assert!((g - w as f64 * 10.0).abs() <= 2.0, "{got:?} vs {want:?}");
+        }
     }
 }

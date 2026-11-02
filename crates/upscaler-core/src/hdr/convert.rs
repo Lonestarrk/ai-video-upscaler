@@ -1,84 +1,96 @@
-//! The HDR conversion stage: `out/%06d.png` (SDR) to `hdr/%06d.png` (16-bit PQ or HLG),
-//! parallel over frames, cached by `hdr/settings.txt`.
+//! The HDR stages of the export. No 16-bit frame is ever stored (they were 6.5 MB each at
+//! 1440x1080, ~440 GB for an episode):
+//!
+//! - Pass 1 converts every SDR frame in memory, measures its light levels and records them in
+//!   `hdr/stats.txt`, one line per frame with the size and modification time of the SDR file it
+//!   came from. A line counts only while that file is unchanged, so a resumed or repeated
+//!   export converts only new or remade frames. MaxCLL/MaxFALL and the HDR10+ metadata come
+//!   from these lines.
+//! - Pass 2 converts the frames again (the conversion is deterministic, so the pixels are the
+//!   ones measured) and streams them as raw 16-bit RGB into the encoder's stdin.
+//!
+//! `hdr/settings.txt` holds the mode, peak, SDR white and `HDR_VERSION`; `stats.txt` starts
+//! with the same header and is discarded when it differs.
 
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use image::{ImageBuffer, Rgb};
+use anyhow::{anyhow, bail, Context, Result};
+use image::RgbImage;
 
-use super::itm::Itm;
-use crate::settings::HdrMode;
+use super::itm::{Itm, SDR_WHITE};
+use super::measure::{measure_frame, FrameLight};
+use crate::process::Cancelled;
+use crate::settings::{HdrMode, Settings};
 
-/// Bump when the curve or the encoding changes, so old conversions are redone.
-pub const HDR_VERSION: u32 = 1;
+/// Bump when the curve or the encoding changes, so earlier measurements and videos are redone.
+pub const HDR_VERSION: u32 = 2;
 pub const HDR_DIR: &str = "hdr";
 const SETTINGS_FILE: &str = "settings.txt";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HdrStatus {
-    Missing,
-    Converting,
-    Ready,
-}
+const STATS_FILE: &str = "stats.txt";
+/// Stats lines between flushes to disk.
+const FLUSH_EVERY: u64 = 100;
+/// Memory the conversion workers may use together (frames in flight and their buffers).
+const MEMORY_BUDGET: u64 = 2 << 30;
+/// Bytes per pixel one conversion needs at its peak (8-bit input, the filter's f32 planes,
+/// the 16-bit result and its byte copy for the pipe).
+const BYTES_PER_PIXEL: u64 = 40;
 
 pub fn hdr_dir(job_dir: &Path) -> PathBuf {
     job_dir.join(HDR_DIR)
 }
 
-fn settings_text(mode: HdrMode, peak_nits: u32) -> String {
-    format!(
-        "mode: {}\npeak: {peak_nits}\nversion: {HDR_VERSION}\n",
-        mode.name()
-    )
+/// What the conversion depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HdrParams {
+    pub mode: HdrMode,
+    /// Mastering peak; always 1000 for HLG (its nominal peak).
+    pub peak_nits: u32,
+    pub sdr_white_nits: u32,
 }
 
-fn frame_path(dir: &Path, n: u64) -> PathBuf {
-    dir.join(format!("{n:06}.png"))
-}
+impl HdrParams {
+    /// The settings' HDR output, or `None` when HDR is off.
+    pub fn from_settings(s: &Settings) -> Option<HdrParams> {
+        (s.hdr_mode != HdrMode::Off).then(|| HdrParams {
+            mode: s.hdr_mode,
+            peak_nits: if s.hdr_mode == HdrMode::Hlg {
+                1000
+            } else {
+                s.hdr_peak_nits
+            },
+            sdr_white_nits: s.hdr_sdr_white_nits,
+        })
+    }
 
-/// True when `hdr` is missing or older than its SDR source `out`.
-fn is_stale(out: &Path, hdr: &Path) -> bool {
-    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    match (modified(hdr), modified(out)) {
-        (Some(h), Some(o)) => o > h,
-        (None, _) => true,
-        (Some(_), None) => false,
+    /// The header of `settings.txt` and `stats.txt`.
+    pub fn header(&self) -> String {
+        format!(
+            "mode: {}\npeak: {}\nwhite: {}\nversion: {HDR_VERSION}\n",
+            self.mode.name(),
+            self.peak_nits,
+            self.sdr_white_nits
+        )
+    }
+
+    pub fn itm(&self) -> Itm {
+        Itm::new(self.mode, self.peak_nits, self.sdr_white_nits)
     }
 }
 
-fn all_present(dir: &Path, total: u64) -> bool {
-    (1..=total).all(|n| frame_path(dir, n).is_file())
-}
-
-/// Whether the job folder has converted frames: `Ready` when `settings.txt` exists and all
-/// `n` frames are there, `Converting` when only some are, otherwise `Missing`.
-pub fn hdr_status(job_dir: &Path, n: u64) -> HdrStatus {
-    let dir = hdr_dir(job_dir);
-    if !dir.join(SETTINGS_FILE).is_file() {
-        return HdrStatus::Missing;
-    }
-    if n > 0 && all_present(&dir, n) {
-        HdrStatus::Ready
-    } else {
-        HdrStatus::Converting
-    }
-}
-
-/// What a job's `hdr/` folder was made with, read from its `settings.txt`.
+/// How a job's HDR output was made, read from its `hdr/settings.txt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobHdr {
-    pub mode: HdrMode,
-    pub peak_nits: u32,
+    pub params: HdrParams,
     /// Full-rate frames per `out/` frame (2/3 with "every 2nd/3rd frame").
     pub divisor: u32,
 }
 
-/// The HDR settings of the job in `job_dir`, or `None` when it has no `hdr/` folder (HDR was
-/// off, or the frames were deleted after the export).
-pub fn job_hdr(job_dir: &Path) -> Option<JobHdr> {
-    let text = std::fs::read_to_string(hdr_dir(job_dir).join(SETTINGS_FILE)).ok()?;
+fn parse_header(text: &str) -> Option<HdrParams> {
     let value = |key: &str| {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
@@ -88,335 +100,628 @@ pub fn job_hdr(job_dir: &Path) -> Option<JobHdr> {
     let mode = [HdrMode::Hdr10Plus, HdrMode::Hdr10, HdrMode::Hlg]
         .into_iter()
         .find(|m| m.name() == name)?;
-    let peak_nits = value("peak:")?.parse().ok()?;
+    Some(HdrParams {
+        mode,
+        peak_nits: value("peak:")?.parse().ok()?,
+        sdr_white_nits: value("white:")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SDR_WHITE),
+    })
+}
+
+fn interp_divisor(job_dir: &Path) -> u32 {
     // The interpolation stage's marker says how many full-rate frames one AI frame covers.
-    let divisor = std::fs::read_to_string(job_dir.join("interp").join(SETTINGS_FILE))
+    std::fs::read_to_string(job_dir.join("interp").join(SETTINGS_FILE))
         .ok()
         .and_then(|t| {
             t.lines()
                 .find_map(|l| l.strip_prefix("divisor:"))
                 .and_then(|v| v.trim().parse().ok())
         })
-        .unwrap_or(1);
+        .unwrap_or(1)
+}
+
+/// The HDR settings of the job in `job_dir`, or `None` when it was never exported as HDR.
+pub fn job_hdr(job_dir: &Path) -> Option<JobHdr> {
+    let text = std::fs::read_to_string(hdr_dir(job_dir).join(SETTINGS_FILE)).ok()?;
     Some(JobHdr {
-        mode,
-        peak_nits,
-        divisor,
+        params: parse_header(&text)?,
+        divisor: interp_divisor(job_dir),
     })
 }
 
-/// File name to modification time of the PNGs in `dir`, from one directory read.
-fn mtimes_of(dir: &Path) -> std::collections::HashMap<String, Option<std::time::SystemTime>> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Default::default();
+/// Size and modification time (ns since the epoch) of a file, what a stats line is valid for.
+type Stamp = (u64, u128);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    let t = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((m.len(), t))
+}
+
+fn stats_line(n: u64, s: Stamp, f: &FrameLight) -> String {
+    let mut line = format!("{n} {} {}", s.0, s.1);
+    for v in f
+        .max_scl
+        .iter()
+        .chain([f.avg_max_rgb].iter())
+        .chain(f.percentiles.iter())
+    {
+        // `{}` prints the shortest text that reads back to the same f32.
+        line.push_str(&format!(" {v}"));
+    }
+    line
+}
+
+fn parse_stats_line(line: &str) -> Option<(u64, Stamp, FrameLight)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 16 {
+        return None;
+    }
+    let n = f[0].parse().ok()?;
+    let s = (f[1].parse().ok()?, f[2].parse().ok()?);
+    let v: Vec<f32> = f[3..]
+        .iter()
+        .map(|x| x.parse().ok())
+        .collect::<Option<_>>()?;
+    let mut percentiles = [0.0f32; 9];
+    percentiles.copy_from_slice(&v[4..]);
+    Some((
+        n,
+        s,
+        FrameLight {
+            max_scl: [v[0], v[1], v[2]],
+            avg_max_rgb: v[3],
+            percentiles,
+        },
+    ))
+}
+
+/// The stats lines of `hdr_dir` made with `header` (the last line per frame wins).
+fn read_stats(hdr_dir: &Path, header: &str) -> HashMap<u64, (Stamp, FrameLight)> {
+    let Ok(text) = std::fs::read_to_string(hdr_dir.join(STATS_FILE)) else {
+        return HashMap::new();
     };
-    rd.flatten()
-        .map(|e| {
-            let m = e.metadata().and_then(|m| m.modified()).ok();
-            (e.file_name().to_string_lossy().into_owned(), m)
-        })
+    let Some(body) = text.strip_prefix(header) else {
+        return HashMap::new();
+    };
+    body.lines()
+        .filter_map(parse_stats_line)
+        .map(|(n, s, f)| (n, (s, f)))
         .collect()
 }
 
-/// The state of the `hdr/` frame of every `out/` frame `1..=total`, from one directory read
-/// of `hdr/` (and of `out/` when the stale check applies). A frame is `Ready` when its file
-/// is there and, without interpolation, not older than its SDR source (it is converted
-/// again at the next export); otherwise `Converting`.
-pub fn hdr_statuses(
-    job_dir: &Path,
-    total: u64,
-    divisor: u32,
-) -> std::collections::HashMap<u64, HdrStatus> {
-    let hdr = mtimes_of(&hdr_dir(job_dir));
-    let out = if divisor <= 1 {
-        mtimes_of(&job_dir.join("out"))
-    } else {
-        Default::default()
-    };
-    let name = |n: u64| format!("{n:06}.png");
+/// Whether the HDR version of every `out/` frame `1..=total` has been made (measured) and
+/// still matches its SDR frame. With interpolation the measured frames are the full-rate ones
+/// in `interp/`; once that folder is deleted, a frame counts when the stats were written
+/// after its `out/` frame.
+pub fn frame_statuses(job_dir: &Path, total: u64, job: &JobHdr) -> HashMap<u64, bool> {
+    let dir = hdr_dir(job_dir);
+    let stats = read_stats(&dir, &job.params.header());
+    let stats_time = stamp(&dir.join(STATS_FILE)).map(|s| s.1);
+    let interp = job_dir.join("interp");
     (1..=total)
         .map(|k| {
-            let h = hdr.get(&name(super::hdr10plus::hdr_frame_for_out(k, divisor)));
-            let ready = match h {
-                None => false,
-                Some(h) => match (h, out.get(&name(k)).copied().flatten()) {
-                    (Some(h), Some(o)) if divisor <= 1 => o <= *h,
-                    _ => true,
-                },
-            };
-            (
-                k,
-                if ready {
-                    HdrStatus::Ready
+            let n = super::hdr10plus::hdr_frame_for_out(k, job.divisor);
+            let out = stamp(&crate::ffmpeg::frame_file(&job_dir.join("out"), k));
+            let ready = stats.get(&n).is_some_and(|(s, _)| {
+                if job.divisor <= 1 {
+                    out == Some(*s)
                 } else {
-                    HdrStatus::Converting
-                },
-            )
+                    match stamp(&crate::ffmpeg::frame_file(&interp, n)) {
+                        Some(i) => i == *s,
+                        None => matches!((out, stats_time), (Some(o), Some(t)) if o.1 <= t),
+                    }
+                }
+            });
+            (k, ready)
         })
         .collect()
 }
 
-/// The `hdr/` frame file of `out/` frame `k`.
-pub fn hdr_frame_file(job_dir: &Path, k: u64, divisor: u32) -> PathBuf {
-    frame_path(
-        &hdr_dir(job_dir),
-        super::hdr10plus::hdr_frame_for_out(k, divisor),
+/// `out/` frame `k` of a job converted to HDR the way the export does it and tone mapped back
+/// to SDR for the frame browser.
+pub fn tone_mapped_frame(job_dir: &Path, k: u64, job: &JobHdr) -> Option<RgbImage> {
+    let img = image::open(crate::ffmpeg::frame_file(&job_dir.join("out"), k))
+        .ok()?
+        .to_rgb8();
+    let hdr = job.params.itm().convert(&img);
+    Some(super::preview::to_sdr_preview(
+        &hdr,
+        job.params.mode,
+        job.params.peak_nits,
+    ))
+}
+
+/// Conversion workers and frames in flight for frames of `pixels` pixels.
+fn parallelism(pixels: u64) -> (usize, u64) {
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let workers = (MEMORY_BUDGET / (pixels.max(1) * BYTES_PER_PIXEL)).clamp(1, threads as u64);
+    (workers as usize, workers * 2)
+}
+
+fn read_frame(path: &Path) -> Result<RgbImage> {
+    Ok(image::open(path)
+        .with_context(|| format!("could not read frame {}", path.display()))?
+        .to_rgb8())
+}
+
+/// Pass 1: measures the HDR version of frames `1..=total` of `src_dir` (out/ or interp/),
+/// reusing valid lines of `hdr/stats.txt`. Returns the light levels of every frame in order.
+/// `progress` gets the number of frames done.
+pub fn measure_pass(
+    src_dir: &Path,
+    hdr_dir: &Path,
+    total: u64,
+    params: &HdrParams,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<Vec<FrameLight>> {
+    let header = params.header();
+    std::fs::create_dir_all(hdr_dir)?;
+    let settings = hdr_dir.join(SETTINGS_FILE);
+    if std::fs::read_to_string(&settings).ok().as_deref() != Some(header.as_str()) {
+        let _ = std::fs::remove_file(hdr_dir.join(STATS_FILE));
+        std::fs::write(&settings, &header)?;
+    }
+    let mut known = read_stats(hdr_dir, &header);
+    known.retain(|n, (s, _)| {
+        *n >= 1 && *n <= total && stamp(&crate::ffmpeg::frame_file(src_dir, *n)) == Some(*s)
+    });
+    // Rewrite the file with only the valid lines, then append.
+    let stats = hdr_dir.join(STATS_FILE);
+    let mut text = header.clone();
+    let mut kept: Vec<_> = known.iter().collect();
+    kept.sort_by_key(|(n, _)| **n);
+    for (n, (s, f)) in kept {
+        text.push_str(&stats_line(*n, *s, f));
+        text.push('\n');
+    }
+    let part = hdr_dir.join("stats.part.txt");
+    std::fs::write(&part, text)?;
+    std::fs::rename(&part, &stats)?;
+
+    let todo: Vec<u64> = (1..=total).filter(|n| !known.contains_key(n)).collect();
+    let already = total - todo.len() as u64;
+    progress(already);
+    if !todo.is_empty() {
+        let (w, h) = image::image_dimensions(crate::ffmpeg::frame_file(src_dir, todo[0]))
+            .context("could not read the first frame to convert")?;
+        let (workers, window) = parallelism(w as u64 * h as u64);
+        let itm = params.itm();
+        let pq = params.mode.is_pq();
+        let mut file = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stats)
+                .context("could not open hdr/stats.txt")?,
+        );
+        let mut done = 0;
+        let result = ordered_parallel(
+            todo.len() as u64,
+            workers,
+            window,
+            cancel,
+            |i| {
+                let n = todo[i as usize - 1];
+                let path = crate::ffmpeg::frame_file(src_dir, n);
+                let s = stamp(&path).ok_or_else(|| anyhow!("frame {} missing", path.display()))?;
+                // HLG has no light-level metadata: nothing to measure.
+                let light = if pq {
+                    measure_frame(&itm.convert(&read_frame(&path)?))
+                } else {
+                    FrameLight {
+                        max_scl: [0.0; 3],
+                        avg_max_rgb: 0.0,
+                        percentiles: [0.0; 9],
+                    }
+                };
+                Ok((n, s, light))
+            },
+            |_, (n, s, light)| {
+                writeln!(file, "{}", stats_line(n, s, &light))?;
+                known.insert(n, (s, light));
+                done += 1;
+                if done % FLUSH_EVERY == 0 {
+                    file.flush()?;
+                }
+                progress(already + done);
+                Ok(())
+            },
+        );
+        file.flush()?;
+        result?;
+    }
+    (1..=total)
+        .map(|n| {
+            known
+                .remove(&n)
+                .map(|(_, f)| f)
+                .ok_or_else(|| anyhow!("no light levels for frame {n}"))
+        })
+        .collect()
+}
+
+/// Size of the frames pass 2 streams (all frames of a job have the size of the first).
+pub fn frame_size(src_dir: &Path) -> Result<(u32, u32)> {
+    let first = crate::ffmpeg::frame_file(src_dir, 1);
+    image::image_dimensions(&first).with_context(|| format!("could not read {}", first.display()))
+}
+
+/// Pass 2: converts frames `1..=total` of `src_dir` again, in parallel, and writes them in
+/// order to `w` as raw `rgb48le`. Stops with an error when `cancel` is set or `w` fails.
+pub fn stream_frames(
+    src_dir: &Path,
+    total: u64,
+    params: &HdrParams,
+    cancel: &AtomicBool,
+    w: &mut dyn Write,
+) -> Result<()> {
+    let (fw, fh) = frame_size(src_dir)?;
+    let (workers, window) = parallelism(fw as u64 * fh as u64);
+    let itm = params.itm();
+    ordered_parallel(
+        total,
+        workers,
+        window,
+        cancel,
+        |n| {
+            let img = read_frame(&crate::ffmpeg::frame_file(src_dir, n))?;
+            if img.dimensions() != (fw, fh) {
+                bail!(
+                    "frame {n} is {}x{}, the others {fw}x{fh}",
+                    img.width(),
+                    img.height()
+                );
+            }
+            let hdr = itm.convert(&img);
+            let mut bytes = Vec::with_capacity(hdr.as_raw().len() * 2);
+            for v in hdr.as_raw() {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Ok(bytes)
+        },
+        |_, bytes| {
+            w.write_all(&bytes)
+                .context("the encoder stopped taking frames")
+        },
     )
 }
 
-/// Converts frames `1..=total` of `out_dir` into `hdr_dir`. Does nothing when the folder was
-/// made with the same mode, peak and version and is complete; otherwise clears and redoes it.
-/// `progress` gets the number of frames done; stops with an error when `cancel` is set.
-pub fn convert(
-    out_dir: &Path,
-    hdr_dir: &Path,
-    total: u64,
-    mode: HdrMode,
-    peak_nits: u32,
+/// Runs `make(1..=count)` on `workers` threads and hands the results to `sink` in order on
+/// this thread. At most `window` results wait ahead of the sink, which bounds the memory.
+/// Stops at the first error (of `make` or `sink`) or when `cancel` is set.
+fn ordered_parallel<T: Send>(
+    count: u64,
+    workers: usize,
+    window: u64,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64),
+    make: impl Fn(u64) -> Result<T> + Sync,
+    mut sink: impl FnMut(u64, T) -> Result<()>,
 ) -> Result<()> {
-    let want = settings_text(mode, peak_nits);
-    let have = std::fs::read_to_string(hdr_dir.join(SETTINGS_FILE)).ok();
-    let todo: Vec<u64> = if have.as_deref() == Some(want.as_str()) {
-        // Same settings: only frames that are missing or whose SDR frame was made again
-        // (a rejected frame replaced in out/) since they were converted.
-        (1..=total)
-            .filter(|&n| is_stale(&frame_path(out_dir, n), &frame_path(hdr_dir, n)))
-            .collect()
-    } else {
-        let _ = std::fs::remove_dir_all(hdr_dir);
-        std::fs::create_dir_all(hdr_dir)?;
-        std::fs::write(hdr_dir.join(SETTINGS_FILE), &want)?;
-        (1..=total).collect()
-    };
-    let already = total - todo.len() as u64;
-    if todo.is_empty() {
-        progress(total);
-        return Ok(());
+    struct State<T> {
+        ready: BTreeMap<u64, Result<T>>,
+        /// The next index the sink takes.
+        next: u64,
+        stop: bool,
     }
-
-    let itm = Itm::new(mode, peak_nits);
-    let next = AtomicU64::new(0);
-    let count = todo.len() as u64;
-    let workers = std::thread::available_parallelism()
-        .map_or(2, |n| n.get())
-        .min(todo.len());
-    let (tx, rx) = mpsc::channel::<Result<()>>();
-    let mut result = Ok(());
+    let state = Mutex::new(State {
+        ready: BTreeMap::new(),
+        next: 1,
+        stop: false,
+    });
+    let changed = Condvar::new();
+    let next_job = AtomicU64::new(1);
+    let window = window.max(1);
     std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let (itm, next, todo) = (&itm, &next, &todo);
-            scope.spawn(move || loop {
+        for _ in 0..workers.clamp(1, count.max(1) as usize) {
+            scope.spawn(|| loop {
+                let n = next_job.fetch_add(1, Ordering::Relaxed);
+                if n > count {
+                    return;
+                }
+                {
+                    let mut st = state.lock().unwrap();
+                    while !st.stop && n >= st.next + window {
+                        st = changed.wait(st).unwrap();
+                    }
+                    if st.stop {
+                        return;
+                    }
+                }
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= count {
-                    return;
-                }
-                let n = todo[i as usize];
-                let r = convert_frame(itm, &frame_path(out_dir, n), &frame_path(hdr_dir, n));
-                let failed = r.is_err();
-                let _ = tx.send(r);
-                if failed {
-                    next.store(count, Ordering::Relaxed);
-                    return;
-                }
+                let r = make(n);
+                state.lock().unwrap().ready.insert(n, r);
+                changed.notify_all();
             });
         }
-        drop(tx);
-        let mut done = 0;
-        for r in rx {
-            match r {
-                Ok(()) => {
-                    done += 1;
-                    progress(already + done);
-                }
-                Err(e) if result.is_ok() => result = Err(e),
-                Err(_) => {}
+        let result = (|| {
+            for n in 1..=count {
+                let item = {
+                    let mut st = state.lock().unwrap();
+                    loop {
+                        if let Some(r) = st.ready.remove(&n) {
+                            st.next = n + 1;
+                            break r;
+                        }
+                        if cancel.load(Ordering::Relaxed) {
+                            bail!(Cancelled);
+                        }
+                        st = changed
+                            .wait_timeout(st, Duration::from_millis(100))
+                            .unwrap()
+                            .0;
+                    }
+                };
+                changed.notify_all();
+                sink(n, item?)?;
             }
-        }
-    });
-    result?;
-    if cancel.load(Ordering::Relaxed) {
-        bail!("cancelled");
-    }
-    Ok(())
-}
-
-fn convert_frame(itm: &Itm, src: &Path, dst: &Path) -> Result<()> {
-    let img = image::open(src)
-        .with_context(|| format!("could not read frame {}", src.display()))?
-        .into_rgb16();
-    let (w, h) = img.dimensions();
-    let mut raw = Vec::with_capacity(img.as_raw().len());
-    for px in img.as_raw().chunks_exact(3) {
-        raw.extend_from_slice(&itm.pixel([px[0], px[1], px[2]]));
-    }
-    let out: ImageBuffer<Rgb<u16>, Vec<u16>> =
-        ImageBuffer::from_raw(w, h, raw).context("bad frame buffer")?;
-    // Written under a temporary name so a half-written frame never counts as done.
-    let tmp = dst.with_extension("tmp");
-    out.save_with_format(&tmp, image::ImageFormat::Png)
-        .with_context(|| format!("could not write {}", tmp.display()))?;
-    std::fs::rename(&tmp, dst)?;
-    Ok(())
+            Ok(())
+        })();
+        state.lock().unwrap().stop = true;
+        changed.notify_all();
+        result
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hdr::measure::{measure_frame, pq_to_nits};
-    use image::RgbImage;
+    use image::Rgb;
 
-    fn write_sdr(dir: &Path, n: u64) {
+    fn write_sdr(dir: &Path, n: u64, bright: u8) {
         std::fs::create_dir_all(dir).unwrap();
-        let mut img = RgbImage::new(4, 2);
-        for (i, p) in img.pixels_mut().enumerate() {
-            // pixel 0 white, pixel 1 mid grey (linear ~0.18), the rest dark
-            *p = match i {
-                0 => Rgb([255, 255, 255]),
-                1 => Rgb([118, 118, 118]),
-                _ => Rgb([60, 60, 60]),
-            };
+        let img = RgbImage::from_fn(16, 8, |x, _| match x {
+            0..4 => Rgb([bright, bright, bright]),
+            4..8 => Rgb([118, 118, 118]),
+            _ => Rgb([60, 60, 60]),
+        });
+        img.save(crate::ffmpeg::frame_file(dir, n)).unwrap();
+    }
+
+    fn params(peak: u32) -> HdrParams {
+        HdrParams {
+            mode: HdrMode::Hdr10,
+            peak_nits: peak,
+            sdr_white_nits: 203,
         }
-        img.save(frame_path(dir, n)).unwrap();
     }
 
     fn setup(total: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let (o, h) = (t.path().join("out"), t.path().join("hdr"));
         for n in 1..=total {
-            write_sdr(&o, n);
+            write_sdr(&o, n, 255);
         }
         (t, o, h)
     }
 
-    fn run(o: &Path, h: &Path, total: u64, peak: u32) -> Result<()> {
-        convert(
-            o,
-            h,
-            total,
-            HdrMode::Hdr10,
-            peak,
-            &AtomicBool::new(false),
-            |_| {},
-        )
+    fn measure(o: &Path, h: &Path, total: u64, p: &HdrParams) -> Vec<FrameLight> {
+        measure_pass(o, h, total, p, &AtomicBool::new(false), |_| {}).unwrap()
     }
 
-    #[test]
-    fn converts_to_16bit_pq() {
-        let (_t, o, h) = setup(3);
-        let mut last = 0;
-        convert(
-            &o,
-            &h,
-            3,
-            HdrMode::Hdr10,
-            1000,
-            &AtomicBool::new(false),
-            |d| last = d,
-        )
-        .unwrap();
-        assert_eq!(last, 3);
-        for n in 1..=3 {
-            let img = image::open(frame_path(&h, n)).unwrap();
-            assert!(matches!(img, image::DynamicImage::ImageRgb16(_)), "16-bit");
-            let img = img.into_rgb16();
-            let light = measure_frame(&img);
-            assert!(light.max_scl[1] >= 203.0, "white {:?}", light.max_scl);
-            let g = pq_to_nits(img.get_pixel(1, 0).0[1] as f32 / 65535.0);
-            let sdr = (118.0f32 / 255.0).powf(2.4) * 203.0;
-            assert!((g - sdr).abs() / sdr < 0.25, "{g} vs {sdr}");
-        }
-    }
-
-    fn mtimes(h: &Path, total: u64) -> Vec<std::time::SystemTime> {
-        (1..=total)
-            .map(|n| {
-                std::fs::metadata(frame_path(h, n))
-                    .unwrap()
-                    .modified()
-                    .unwrap()
-            })
+    /// Frame numbers the last pass converted, from the order of the stats lines after the
+    /// header: lines appended by a pass come after the kept ones.
+    fn lines(h: &Path) -> Vec<u64> {
+        std::fs::read_to_string(h.join(STATS_FILE))
+            .unwrap()
+            .lines()
+            .filter_map(parse_stats_line)
+            .map(|(n, _, _)| n)
             .collect()
     }
 
     #[test]
-    fn cached_when_settings_match() {
-        let (t, o, h) = setup(3);
-        assert_eq!(hdr_status(t.path(), 3), HdrStatus::Missing);
-        run(&o, &h, 3, 1000).unwrap();
-        assert_eq!(hdr_status(t.path(), 3), HdrStatus::Ready);
-        let before = mtimes(&h, 3);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        run(&o, &h, 3, 1000).unwrap();
-        assert_eq!(before, mtimes(&h, 3));
+    fn hlg_and_settings_use_fixed_peak_and_white() {
+        let mut s = Settings::default();
+        s.hdr_mode = HdrMode::Hlg;
+        s.hdr_peak_nits = 1500;
+        s.hdr_sdr_white_nits = 300;
+        let p = HdrParams::from_settings(&s).unwrap();
+        assert_eq!((p.peak_nits, p.sdr_white_nits), (1000, 300));
+        s.hdr_mode = HdrMode::Hdr10;
+        assert_eq!(HdrParams::from_settings(&s).unwrap().peak_nits, 1500);
+        s.hdr_mode = HdrMode::Off;
+        assert_eq!(HdrParams::from_settings(&s), None);
+        assert_eq!(parse_header(&p.header()), Some(p));
     }
 
     #[test]
-    fn job_hdr_and_frame_status() {
+    fn measures_without_storing_frames() {
         let (t, o, h) = setup(3);
-        assert_eq!(job_hdr(t.path()), None);
-        run(&o, &h, 3, 1000).unwrap();
-        let j = job_hdr(t.path()).unwrap();
-        assert_eq!((j.mode, j.peak_nits, j.divisor), (HdrMode::Hdr10, 1000, 1));
-        assert_eq!(hdr_statuses(t.path(), 3, 1)[&2], HdrStatus::Ready);
-        std::fs::remove_file(frame_path(&h, 2)).unwrap();
-        assert_eq!(hdr_statuses(t.path(), 3, 1)[&2], HdrStatus::Converting);
-        assert_eq!(hdr_statuses(t.path(), 3, 1)[&3], HdrStatus::Ready);
+        let mut last = 0;
+        let m = measure_pass(&o, &h, 3, &params(1000), &AtomicBool::new(false), |d| {
+            last = d
+        })
+        .unwrap();
+        assert_eq!(last, 3);
+        assert_eq!(m.len(), 3);
+        // White expands to the peak, the brightest channel reaches ~1000 nits.
+        assert!(m[0].max_scl[1] > 900.0, "{:?}", m[0]);
+        // Nothing but the two text files in hdr/.
+        let mut names: Vec<String> = std::fs::read_dir(&h)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["settings.txt", "stats.txt"]);
+        let job = job_hdr(t.path()).unwrap();
+        assert_eq!(job.params, params(1000));
+        assert_eq!(job.divisor, 1);
+    }
+
+    #[test]
+    fn stats_round_trip_exactly() {
+        let f = FrameLight {
+            max_scl: [999.123_4, 0.000_123, 203.0],
+            avg_max_rgb: 12.345_678,
+            percentiles: [0.0, 0.1, 0.2, 1.0, 2.5, 7.0, 13.333_333, 50.0, 1000.0],
+        };
+        let (n, s, back) = parse_stats_line(&stats_line(7, (123, 456), &f)).unwrap();
+        assert_eq!((n, s), (7, (123, 456)));
+        assert_eq!(back, f);
+        assert!(parse_stats_line("7 123 45").is_none());
+    }
+
+    #[test]
+    fn resumes_and_redoes_only_changed_frames() {
+        let (t, o, h) = setup(4);
+        let first = measure(&o, &h, 4, &params(1000));
+        assert_eq!(lines(&h), [1, 2, 3, 4]);
+        // Same settings: nothing converted again, same values.
+        assert_eq!(measure(&o, &h, 4, &params(1000)), first);
+        assert_eq!(lines(&h), [1, 2, 3, 4]);
+        // A remade SDR frame (rejected and made again): only it is converted again.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        RgbImage::from_pixel(4, 2, Rgb([9, 9, 9]))
-            .save(frame_path(&o, 3))
+        write_sdr(&o, 2, 200);
+        let again = measure(&o, &h, 4, &params(1000));
+        assert_eq!(lines(&h), [1, 3, 4, 2]);
+        assert!(again[1].max_scl[1] < first[1].max_scl[1]);
+        let job = job_hdr(t.path()).unwrap();
+        assert!(frame_statuses(t.path(), 4, &job).values().all(|r| *r));
+        // A frame newer than its line is not ready in the browser.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_sdr(&o, 3, 250);
+        let st = frame_statuses(t.path(), 4, &job);
+        assert!(!st[&3] && st[&4]);
+        // A half-written last line (a crash) is ignored.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(h.join(STATS_FILE))
             .unwrap();
-        assert_eq!(hdr_statuses(t.path(), 3, 1)[&3], HdrStatus::Converting);
-        assert_eq!(hdr_statuses(t.path(), 3, 3)[&3], HdrStatus::Converting);
-        // With interpolation out/2 is hdr/4 (divisor 3) and a missing hdr/2 does not matter.
-        assert_eq!(hdr_statuses(t.path(), 3, 3)[&2], HdrStatus::Converting);
-        std::fs::create_dir_all(t.path().join("interp")).unwrap();
+        write!(f, "4 12 3").unwrap();
+        drop(f);
+        measure(&o, &h, 4, &params(1000));
+        assert_eq!(lines(&h), [1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn changed_settings_measure_again() {
+        let (_t, o, h) = setup(2);
+        let a = measure(&o, &h, 2, &params(1000));
+        let b = measure(&o, &h, 2, &params(1500));
+        assert!(b[0].max_scl[1] > a[0].max_scl[1] * 1.3, "{a:?} {b:?}");
+        let c = measure(
+            &o,
+            &h,
+            2,
+            &HdrParams {
+                sdr_white_nits: 300,
+                ..params(1000)
+            },
+        );
+        // Mid grey sits higher with a brighter SDR white.
+        assert!(
+            c[0].percentiles[4] > a[0].percentiles[4] * 1.3,
+            "{a:?} {c:?}"
+        );
+    }
+
+    #[test]
+    fn interpolated_frames_status_after_interp_is_deleted() {
+        let (t, o, h) = setup(2);
+        // Full-rate frames 1..=4 in interp/ for out/ frames 1, 2 (divisor 2).
+        let interp = t.path().join("interp");
+        for n in 1..=4 {
+            write_sdr(&interp, n, 255);
+        }
         std::fs::write(
-            t.path().join("interp").join(SETTINGS_FILE),
-            "fps: 24/1\ndivisor: 3\nframes: 9\nversion: 1\n",
+            interp.join(SETTINGS_FILE),
+            "fps: 24/1\ndivisor: 2\nframes: 4\nversion: 1\n",
         )
         .unwrap();
-        assert_eq!(job_hdr(t.path()).unwrap().divisor, 3);
-    }
-
-    #[test]
-    fn replaced_sdr_frame_is_reconverted() {
-        let (_t, o, h) = setup(3);
-        run(&o, &h, 3, 1000).unwrap();
-        let before = mtimes(&h, 3);
-        let old2 = std::fs::read(frame_path(&h, 2)).unwrap();
+        measure(&interp, &h, 4, &params(1000));
+        let job = job_hdr(t.path()).unwrap();
+        assert_eq!(job.divisor, 2);
+        assert!(frame_statuses(t.path(), 2, &job).values().all(|r| *r));
+        std::fs::remove_dir_all(&interp).unwrap();
+        assert!(frame_statuses(t.path(), 2, &job).values().all(|r| *r));
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // A different picture in out/2 (as when a rejected frame is made again).
-        RgbImage::from_pixel(4, 2, Rgb([20, 20, 20]))
-            .save(frame_path(&o, 2))
-            .unwrap();
-        run(&o, &h, 3, 1000).unwrap();
-        let after = mtimes(&h, 3);
-        assert_eq!(before[0], after[0]);
-        assert_eq!(before[2], after[2]);
-        assert_ne!(before[1], after[1]);
-        assert_ne!(old2, std::fs::read(frame_path(&h, 2)).unwrap());
+        write_sdr(&o, 2, 200);
+        let st = frame_statuses(t.path(), 2, &job);
+        assert!(st[&1] && !st[&2], "{st:?}");
     }
 
     #[test]
-    fn changed_peak_reconverts() {
-        let (_t, o, h) = setup(2);
-        run(&o, &h, 2, 1000).unwrap();
-        let a = measure_frame(&image::open(frame_path(&h, 1)).unwrap().into_rgb16());
-        run(&o, &h, 2, 4000).unwrap();
-        let b = measure_frame(&image::open(frame_path(&h, 1)).unwrap().into_rgb16());
-        assert!(b.max_scl[1] > a.max_scl[1] * 2.0, "{a:?} {b:?}");
+    fn stream_matches_the_measured_frames() {
+        let (t, o, h) = setup(3);
+        let p = params(1000);
+        let m = measure(&o, &h, 3, &p);
+        let mut bytes = Vec::new();
+        stream_frames(&o, 3, &p, &AtomicBool::new(false), &mut bytes).unwrap();
+        assert_eq!(bytes.len(), 3 * 16 * 8 * 6);
+        for (i, chunk) in bytes.chunks_exact(16 * 8 * 6).enumerate() {
+            let raw: Vec<u16> = chunk
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            let img = super::super::itm::Frame16::from_raw(16, 8, raw).unwrap();
+            assert_eq!(measure_frame(&img), m[i]);
+        }
+        // The browser's picture is the same conversion, tone mapped.
+        let job = job_hdr(t.path()).unwrap();
+        assert!(tone_mapped_frame(t.path(), 1, &job).is_some());
     }
 
     #[test]
-    fn cancel_stops() {
-        let (_t, o, h) = setup(3);
-        let cancel = AtomicBool::new(true);
-        assert!(convert(&o, &h, 3, HdrMode::Hdr10, 1000, &cancel, |_| {}).is_err());
+    fn ordered_parallel_keeps_order_and_bounds_the_window() {
+        let ahead = AtomicU64::new(0);
+        let taken = AtomicU64::new(0);
+        let mut seen = Vec::new();
+        ordered_parallel(
+            200,
+            8,
+            4,
+            &AtomicBool::new(false),
+            |n| {
+                // Never more than `window` results beyond what the sink took.
+                let t = taken.load(Ordering::SeqCst);
+                ahead.fetch_max(n.saturating_sub(t), Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_micros((n * 7919 % 13) * 50));
+                Ok(n * 10)
+            },
+            |n, v| {
+                assert_eq!(v, n * 10);
+                seen.push(n);
+                taken.store(n, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, (1..=200).collect::<Vec<_>>());
+        assert!(
+            ahead.load(Ordering::SeqCst) <= 5,
+            "{}",
+            ahead.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_stops_on_error_and_cancel() {
+        let r = ordered_parallel(
+            50,
+            4,
+            8,
+            &AtomicBool::new(false),
+            |n| if n == 20 { bail!("bad frame") } else { Ok(n) },
+            |_, _| Ok(()),
+        );
+        assert!(r.unwrap_err().to_string().contains("bad frame"));
+        let r = ordered_parallel(50, 4, 8, &AtomicBool::new(false), Ok, |n, _| {
+            if n == 3 {
+                bail!("pipe closed")
+            }
+            Ok(())
+        });
+        assert!(r.is_err());
+        let r = ordered_parallel(50, 4, 8, &AtomicBool::new(true), Ok, |_, _| Ok(()));
+        assert!(crate::process::is_cancelled(&r.unwrap_err()));
     }
 }

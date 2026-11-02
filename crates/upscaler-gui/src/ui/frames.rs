@@ -13,7 +13,6 @@ use super::style::{BAD, GOOD, WARN};
 use crate::app::UpscalerApp;
 use crate::i18n::tr;
 use crate::worker::{self, Event, HdrInfo};
-use upscaler_core::hdr::convert::HdrStatus;
 
 const PAGE: usize = 24;
 const COLUMNS: usize = 4;
@@ -29,7 +28,7 @@ pub enum Filter {
     Manual,
     /// Not finished yet.
     Waiting,
-    /// No finished HDR frame (only while the job keeps its HDR frames).
+    /// No HDR version made by an export yet (only for jobs exported as HDR).
     HdrMissing,
 }
 
@@ -73,9 +72,7 @@ impl Filter {
             ),
             Filter::Manual => f.pending_reject || r.is_some_and(|r| r.manual),
             Filter::Waiting => !f.done || f.pending_reject,
-            Filter::HdrMissing => {
-                hdr.is_some_and(|h| h.status.get(&f.n) != Some(&HdrStatus::Ready))
-            }
+            Filter::HdrMissing => hdr.is_some_and(|h| !h.is_ready(f.n)),
         }
     }
 }
@@ -94,6 +91,8 @@ pub struct FrameBrowser {
     selected: Option<u64>,
     big: Option<BigView>,
     hdr: Option<HdrInfo>,
+    /// An export of the shown job is running (missing HDR versions are being made).
+    exporting: bool,
     note: String,
     history: Option<History>,
 }
@@ -134,6 +133,7 @@ impl Default for FrameBrowser {
             selected: None,
             big: None,
             hdr: None,
+            exporting: false,
             note: String::new(),
             history: None,
         }
@@ -195,8 +195,7 @@ impl FrameBrowser {
                 if let (Some(sel), Some(BigView(n, ..))) = (self.selected, &self.big) {
                     let old = self.frames.iter().find(|f| f.n == sel).map(stamp);
                     let new = frames.iter().find(|f| f.n == sel).map(stamp);
-                    let hdr_of =
-                        |h: &Option<HdrInfo>| h.as_ref().and_then(|h| h.status.get(&sel).copied());
+                    let hdr_of = |h: &Option<HdrInfo>| h.as_ref().map(|h| h.is_ready(sel));
                     if *n == sel && (old != new || hdr_of(&self.hdr) != hdr_of(&hdr)) {
                         self.big = None;
                     }
@@ -292,6 +291,10 @@ pub fn show(ctx: &egui::Context, app: &mut UpscalerApp) {
         }
     }
     let b = &mut app.frame_browser;
+    b.exporting = app
+        .export
+        .as_ref()
+        .is_some_and(|x| b.dir.as_ref() == Some(&x.spec.job_dir()));
     let interval = if app.export.is_some() { 2 } else { 5 };
     if !b.loading
         && b.refreshed
@@ -658,17 +661,27 @@ fn tile(
                 ui.label(egui::RichText::new(format!("#{}", f.n)).strong());
                 ui.label(egui::RichText::new(text).small().color(color));
                 if let Some(h) = &b.hdr {
-                    let (badge, color, hint) = match h.status.get(&f.n) {
-                        Some(HdrStatus::Ready) => (
+                    let (badge, color, hint) = if h.is_ready(f.n) {
+                        (
                             "HDR",
                             GOOD,
                             tr("HDR-versionen är klar", "The HDR version is ready"),
-                        ),
-                        _ => (
+                        )
+                    } else if b.exporting {
+                        (
                             "HDR …",
                             WARN,
                             tr("HDR-versionen görs", "The HDR version is being made"),
-                        ),
+                        )
+                    } else {
+                        (
+                            tr("HDR saknas", "HDR missing"),
+                            WARN,
+                            tr(
+                                "HDR-versionen saknas. Den görs nästa gång du exporterar.",
+                                "The HDR version is missing. It is made the next time you export.",
+                            ),
+                        )
                     };
                     ui.label(egui::RichText::new(badge).small().color(color))
                         .on_hover_text(hint);
@@ -780,10 +793,7 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
         ui.label(egui::RichText::new(p).small().color(WARN));
     }
     let avail = ui.available_width();
-    let hdr_ready = b
-        .hdr
-        .as_ref()
-        .map(|h| h.status.get(&n) == Some(&HdrStatus::Ready));
+    let hdr_ready = b.hdr.as_ref().map(|h| h.is_ready(n));
     let columns = if hdr_ready.is_some() { 3.0 } else { 2.0 };
     let img_w = (avail - 12.0 * columns) / columns;
     ui.horizontal(|ui| {
@@ -826,15 +836,6 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
                         }
                         ui.add(egui::Image::new((t.id(), size)).corner_radius(3.0));
                     }
-                    None if !ready => {
-                        ui.add_sized(
-                            [img_w, 120.0],
-                            egui::Label::new(tr(
-                                "HDR-versionen är inte klar",
-                                "The HDR version is not ready",
-                            )),
-                        );
-                    }
                     None if loaded => {
                         ui.add_sized(
                             [img_w, 120.0],
@@ -847,6 +848,18 @@ fn detail(ui: &mut egui::Ui, b: &mut FrameBrowser, bus: &crate::worker::Bus, n: 
                     None => {
                         ui.add_sized([img_w, 120.0], egui::Spinner::new());
                     }
+                }
+                if !ready {
+                    // The picture is converted here on the fly; the export has not yet made
+                    // (measured) this frame's HDR version.
+                    ui.label(
+                        egui::RichText::new(tr(
+                            "Inte med i någon HDR-export ännu",
+                            "Not in an HDR export yet",
+                        ))
+                        .small()
+                        .color(WARN),
+                    );
                 }
                 ui.label(
                     egui::RichText::new(tr(

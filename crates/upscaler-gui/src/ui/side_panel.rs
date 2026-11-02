@@ -278,7 +278,8 @@ fn output(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     });
 }
 
-/// HDR rows of the output grid: mode, peak brightness, keep/delete the HDR frames.
+/// HDR rows of the output grid: mode, peak brightness, SDR white, keep/delete the in-between
+/// frames.
 fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
     ui.label("HDR");
     let mode = &mut app.settings.hdr_mode;
@@ -324,15 +325,40 @@ fn hdr_rows(ui: &mut egui::Ui, app: &mut UpscalerApp) {
             });
     }
     ui.end_row();
-    ui.label("");
-    ui.checkbox(
-        &mut app.settings.hdr_delete_frames_after,
-        tr(
-            "Ta bort HDR-bildrutor efter lyckad export",
-            "Delete HDR frames after a successful export",
-        ),
-    );
+    ui.label(tr("SDR-vitt", "SDR white"));
+    egui::ComboBox::from_id_salt("hdr_sdr_white")
+        .selected_text(format!("{} nits", app.settings.hdr_sdr_white_nits))
+        .show_ui(ui, |ui| {
+            for n in [203u32, 300, 400] {
+                ui.selectable_value(&mut app.settings.hdr_sdr_white_nits, n, format!("{n} nits"));
+            }
+        })
+        .response
+        .on_hover_text(tr(
+            "Där vanligt vitt hamnar i HDR-bilden. Högre ger en ljusare bild överlag, \
+             bra för projektorer och mörkare skärmar. 203 är standard (BT.2408).",
+            "Where ordinary white lands in the HDR picture. Higher makes the whole picture \
+             brighter, good for projectors and dimmer displays. 203 is the standard (BT.2408).",
+        ));
     ui.end_row();
+    // Only "every 2nd/3rd frame" makes in-between frames for HDR.
+    if app.settings.ai_rate.divisor() > 1 {
+        ui.label("");
+        ui.checkbox(
+            &mut app.settings.hdr_delete_interp_after,
+            tr(
+                "Ta bort mellanbildrutor efter lyckad export",
+                "Delete in-between frames after a successful export",
+            ),
+        )
+        .on_hover_text(tr(
+            "Mellanbildrutorna (interp\\ i jobbmappen) behövs bara för att koda videon. \
+             Behålls de slipper en ny export räkna fram dem igen.",
+            "The in-between frames (interp\\ in the job folder) are only needed to encode \
+             the video. Kept, a new export does not have to make them again.",
+        ));
+        ui.end_row();
+    }
 }
 
 /// Frame shapes the user can give the source instead of its flag.

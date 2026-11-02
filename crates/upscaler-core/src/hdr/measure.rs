@@ -1,10 +1,8 @@
 //! SMPTE ST 2084 (PQ) transfer functions and light-level measurement of PQ-coded 16-bit
 //! frames: per-channel maxima, frame average of maxRGB, percentiles, MaxCLL and MaxFALL.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-use anyhow::{bail, Context, Result};
 use image::{ImageBuffer, Rgb};
 
 const M1: f64 = 2610.0 / 16384.0;
@@ -48,8 +46,19 @@ pub struct Measurement {
     pub frames: Vec<FrameLight>,
 }
 
+/// Nits of every 16-bit PQ code, computed once.
+fn nits_table() -> &'static [f32] {
+    static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=65535u32)
+            .map(|c| pq_to_nits(c as f32 / 65535.0))
+            .collect()
+    })
+}
+
 pub fn measure_frame(img: &ImageBuffer<Rgb<u16>, Vec<u16>>) -> FrameLight {
-    let to_nits = |c: usize| pq_to_nits(c as f32 / 65535.0);
+    let table = nits_table();
+    let to_nits = |c: usize| table[c];
     // Codes are 16-bit, so a histogram of maxRGB codes gives exact percentiles cheaply.
     let mut hist = vec![0u32; 65536];
     let mut ch_max = [0u16; 3];
@@ -87,37 +96,19 @@ pub fn measure_frame(img: &ImageBuffer<Rgb<u16>, Vec<u16>>) -> FrameLight {
     }
 }
 
-/// Measures frames `000001.png ..= <total>.png` in `dir`. `progress` gets the number of
-/// frames done. Stops early with an error when `cancel` is set.
-pub fn measure_dir(
-    dir: &Path,
-    total: u64,
-    cancel: &AtomicBool,
-    mut progress: impl FnMut(u64),
-) -> Result<Measurement> {
-    let mut frames = Vec::with_capacity(total as usize);
-    for i in 1..=total {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
+impl Measurement {
+    /// MaxCLL and MaxFALL of a clip from its frames' light levels (CTA-861.3: MaxCLL is the
+    /// brightest maxRGB of any pixel, MaxFALL the highest frame average of maxRGB).
+    pub fn from_frames(frames: Vec<FrameLight>) -> Measurement {
+        let max_cll = frames.iter().flat_map(|f| f.max_scl).fold(0.0f32, f32::max);
+        let max_fall = frames.iter().map(|f| f.avg_max_rgb).fold(0.0f32, f32::max);
+        Measurement {
+            max_cll: max_cll.round() as u32,
+            max_fall: max_fall.round() as u32,
+            frames,
         }
-        let path = dir.join(format!("{i:06}.png"));
-        let img = image::open(&path)
-            .with_context(|| format!("could not read HDR frame {}", path.display()))?
-            .into_rgb16();
-        frames.push(measure_frame(&img));
-        progress(i);
     }
-    // CTA-861.3: MaxCLL is the brightest maxRGB of any pixel, MaxFALL the highest frame
-    // average of maxRGB.
-    let max_cll = frames.iter().flat_map(|f| f.max_scl).fold(0.0f32, f32::max);
-    let max_fall = frames.iter().map(|f| f.avg_max_rgb).fold(0.0f32, f32::max);
-    Ok(Measurement {
-        max_cll: max_cll.round() as u32,
-        max_fall: max_fall.round() as u32,
-        frames,
-    })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,16 +143,12 @@ mod tests {
         }
         assert!((f.avg_max_rgb - 203.0).abs() / 203.0 < 0.01);
 
-        let dir = tempfile::tempdir().unwrap();
-        for (i, n) in [203.0f32, 1000.0].iter().enumerate() {
-            uniform(code(*n), 8, 8)
-                .save(dir.path().join(format!("{:06}.png", i + 1)))
-                .unwrap();
-        }
-        let cancel = AtomicBool::new(false);
-        let mut last = 0;
-        let m = measure_dir(dir.path(), 2, &cancel, |n| last = n).unwrap();
-        assert_eq!(last, 2);
+        let m = Measurement::from_frames(
+            [203.0f32, 1000.0]
+                .iter()
+                .map(|n| measure_frame(&uniform(code(*n), 8, 8)))
+                .collect(),
+        );
         assert_eq!(m.frames.len(), 2);
         assert!(
             (m.max_cll as f32 - 1000.0).abs() / 1000.0 < 0.01,
@@ -176,26 +163,34 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_of_a_mixed_frame() {
+        // 10 x 10 pixels: 50 at 10 nits, 40 at 100 nits, 10 at 1000 nits.
+        let img = ImageBuffer::from_fn(10, 10, |x, y| {
+            let n = match y * 10 + x {
+                0..50 => 10.0,
+                50..90 => 100.0,
+                _ => 1000.0,
+            };
+            Rgb([code(n); 3])
+        });
+        let f = measure_frame(&img);
+        let near = |a: f32, b: f32| (a - b).abs() / b < 0.01;
+        let want = [10.0, 10.0, 10.0, 10.0, 10.0, 100.0, 100.0, 1000.0, 1000.0];
+        for (got, want) in f.percentiles.iter().zip(want) {
+            assert!(near(*got, want), "{:?}", f.percentiles);
+        }
+        assert!(near(
+            f.avg_max_rgb,
+            (50.0 * 10.0 + 40.0 * 100.0 + 10.0 * 1000.0) / 100.0
+        ));
+    }
+
+    #[test]
     fn dark_frame_is_sane() {
         let f = measure_frame(&uniform(code(0.5), 8, 8));
         assert!(f.avg_max_rgb.is_finite() && f.avg_max_rgb >= 0.0);
         assert!(f.max_scl.iter().all(|v| v.is_finite()));
         assert!(f.percentiles.iter().all(|v| v.is_finite()));
-        let dir = tempfile::tempdir().unwrap();
-        uniform(code(0.5), 8, 8)
-            .save(dir.path().join("000001.png"))
-            .unwrap();
-        let m = measure_dir(dir.path(), 1, &AtomicBool::new(false), |_| {}).unwrap();
-        assert!(m.max_fall <= 1);
-    }
-
-    #[test]
-    fn missing_frame_and_cancel_are_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(measure_dir(dir.path(), 1, &AtomicBool::new(false), |_| {}).is_err());
-        uniform(100, 2, 2)
-            .save(dir.path().join("000001.png"))
-            .unwrap();
-        assert!(measure_dir(dir.path(), 1, &AtomicBool::new(true), |_| {}).is_err());
+        assert!(Measurement::from_frames(vec![f]).max_fall <= 1);
     }
 }

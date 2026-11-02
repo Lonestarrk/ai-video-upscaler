@@ -1,5 +1,5 @@
-//! HDR export: PQ math, frame measurement, inverse tone mapping and the conversion stage,
-//! and the encoder parameters.
+//! HDR export: PQ math, frame measurement, inverse tone mapping, the two conversion passes
+//! (measure, then stream into the encoder) and the encoder parameters.
 
 pub mod convert;
 pub mod hdr10plus;
@@ -23,12 +23,27 @@ pub struct HdrEncode {
     pub hdr10plus_json: Option<PathBuf>,
 }
 
-/// The value of ffmpeg's `-x265-params` for HDR output at `crf`.
+/// HDR is encoded this many CRF steps below the user's CRF (16 gives 14). PQ spends its code
+/// values on a much wider range than SDR, so the same CRF leaves too few bits for smooth
+/// highlights and dark textures (planet test: blocky flash at CRF 16, clean at 14 with
+/// aq-mode 3, still well under the SDR H.264 file's bitrate).
+pub const HDR_CRF_OFFSET: u8 = 2;
+
+/// The CRF x265 gets for HDR when the user chose `crf`.
+pub fn hdr_crf(crf: u8) -> u8 {
+    crf.saturating_sub(HDR_CRF_OFFSET)
+}
+
+/// The value of ffmpeg's `-x265-params` for HDR output at the user's `crf` (encoded at
+/// `hdr_crf(crf)`, with aq-mode 3, which keeps texture in dark flat areas).
 ///
 /// PQ modes carry the BT.2020 mastering display with the peak as its maximum luminance (in
 /// 0.0001 nit units) and the measured MaxCLL/MaxFALL; HLG carries neither.
 pub fn x265_params(h: &HdrEncode, crf: u8) -> String {
-    let mut p = format!("crf={crf}:repeat-headers=1:colorprim=bt2020:colormatrix=bt2020nc");
+    let mut p = format!(
+        "crf={}:aq-mode=3:repeat-headers=1:colorprim=bt2020:colormatrix=bt2020nc",
+        hdr_crf(crf)
+    );
     if h.mode.is_pq() {
         p.push_str(&format!(
             ":hdr10=1:hdr10-opt=1:transfer=smpte2084\
@@ -98,6 +113,9 @@ mod tests {
         assert!(p.contains("hdr10=1") && p.contains("transfer=smpte2084"));
         assert!(p.contains("colorprim=bt2020") && p.contains("colormatrix=bt2020nc"));
         assert!(!p.contains("dhdr10-info"));
+        // Two steps below the user's CRF, and aq-mode 3.
+        assert!(p.starts_with("crf=16:aq-mode=3:"), "{p}");
+        assert_eq!(hdr_crf(1), 0);
     }
 
     #[test]

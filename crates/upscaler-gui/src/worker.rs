@@ -12,16 +12,23 @@ use upscaler_core::audio::ai::{Device, LocalAi};
 use upscaler_core::audio::pack::{self, PackStatus};
 use upscaler_core::audio::source::{self, SourceAudio};
 use upscaler_core::ffmpeg::{self, Tools, VideoInfo};
-use upscaler_core::hdr::convert::{self as hdr_convert, HdrStatus, JobHdr as HdrJob};
+use upscaler_core::hdr::convert::{self as hdr_convert, JobHdr as HdrJob};
 use upscaler_core::job::{self, ExportEvent, ExportSpec};
 use upscaler_core::provider::codex::{self, LoginState};
 use upscaler_core::settings::Settings;
 
-/// How a job's `hdr/` folder was made and which of its frames are ready, per `out/` frame.
+/// How a job's HDR output was made and, per `out/` frame, whether its HDR version has been
+/// made (measured by the export) and still matches the SDR frame.
 #[derive(Clone, Debug)]
 pub struct HdrInfo {
     pub job: HdrJob,
-    pub status: std::collections::HashMap<u64, HdrStatus>,
+    pub ready: std::collections::HashMap<u64, bool>,
+}
+
+impl HdrInfo {
+    pub fn is_ready(&self, n: u64) -> bool {
+        self.ready.get(&n).copied().unwrap_or(false)
+    }
 }
 
 pub enum Event {
@@ -77,7 +84,7 @@ pub enum Event {
         jobs: Vec<job::JobSummary>,
         dir: Option<PathBuf>,
         frames: Vec<job::FrameStatus>,
-        /// The job's HDR frames, when it still has them.
+        /// The job's HDR status, when it was exported as HDR.
         hdr: Option<HdrInfo>,
     },
     FrameThumb {
@@ -351,11 +358,11 @@ pub fn frame_statuses(bus: Bus, work_dir: PathBuf, dir: Option<PathBuf>) {
             .as_ref()
             .map(|j| job::job_frames(&j.dir, j.total))
             .unwrap_or_default();
-        // HDR status only exists while the job keeps its HDR frames.
+        // Only jobs that were exported as HDR have HDR status.
         let hdr = chosen.as_ref().and_then(|j| {
             let job = hdr_convert::job_hdr(&j.dir)?;
-            let status = hdr_convert::hdr_statuses(&j.dir, j.total, job.divisor);
-            Some(HdrInfo { job, status })
+            let ready = hdr_convert::frame_statuses(&j.dir, j.total, &job);
+            Some(HdrInfo { job, ready })
         });
         bus.send(Event::FrameStatuses {
             jobs,
@@ -392,11 +399,10 @@ pub fn frame_pair(bus: Bus, dir: PathBuf, n: u64) {
                 .ok()
                 .map(|i| to_color_image(&upscaler_core::frame::limit_size(&i.to_rgb8(), 2048)))
         };
-        // Load the 16-bit HDR frame and tone map it here, never on the UI thread.
+        // Convert the SDR frame to HDR as the export does and tone map it back, here and never
+        // on the UI thread (no HDR frames are stored).
         let hdr = hdr_convert::job_hdr(&dir).and_then(|j| {
-            let file = hdr_convert::hdr_frame_file(&dir, n, j.divisor);
-            let img = image::open(file).ok()?.into_rgb16();
-            let sdr = upscaler_core::hdr::preview::to_sdr_preview(&img, j.mode, j.peak_nits);
+            let sdr = hdr_convert::tone_mapped_frame(&dir, n, &j)?;
             Some(to_color_image(&upscaler_core::frame::limit_size(
                 &sdr, 2048,
             )))

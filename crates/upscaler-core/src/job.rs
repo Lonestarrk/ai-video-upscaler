@@ -26,7 +26,7 @@ use image::RgbImage;
 use crate::audio::ai::{AudioAi, Device, LocalAi, PACK_MISSING};
 use crate::audio::job::{self as audio_job, AudioEvent, AudioSpec};
 use crate::cache;
-use crate::ffmpeg::{self, EncodeOptions, Range, Tools, VideoInfo};
+use crate::ffmpeg::{self, EncodeOptions, Range, Tools, VideoInfo, VideoInput};
 use crate::frame;
 use crate::process::{self, Cancelled};
 use crate::provider;
@@ -380,12 +380,23 @@ fn prepare_audio(
     }))
 }
 
-/// What the encoded intermediate video depends on: the encode options and every finished
-/// frame (size and modification time), so a frame made again means a new encode.
-fn video_key(opts: &EncodeOptions, total: u64, frames: impl Iterator<Item = PathBuf>) -> String {
+/// What the encoded intermediate video depends on: the encode options, `extra` (the HDR
+/// settings and how the encoder converts them) and every finished frame (size and
+/// modification time), so a frame made again means a new encode.
+///
+/// Everything HDR adds (the interpolated frames, the measured light levels, the HDR10+
+/// metadata) is computed deterministically from exactly these, so the key is checked before
+/// any HDR work: reusing `video.mkv` costs nothing.
+fn video_key(
+    opts: &EncodeOptions,
+    extra: &str,
+    total: u64,
+    frames: impl Iterator<Item = PathBuf>,
+) -> String {
     // The HDR curve and the interpolation stage change pixels without changing `opts`.
     let mut parts = vec![
         format!("{opts:?}"),
+        extra.to_string(),
         total.to_string(),
         format!(
             "hdr v{} interp v{INTERP_VERSION}",
@@ -461,6 +472,102 @@ version: {INTERP_VERSION}
     )?;
     std::fs::write(&marker, want)?;
     Ok(n)
+}
+
+/// What the HDR encode needs from the first pass.
+struct HdrWork {
+    encode: crate::hdr::HdrEncode,
+    params: crate::hdr::convert::HdrParams,
+    /// The SDR frames that are converted (`out/`, or the full-rate `interp/`) and their number.
+    src: PathBuf,
+    frames: u64,
+}
+
+/// HDR pass 1: interpolates the SDR frames to the full rate when frames were skipped, then
+/// measures every frame's HDR version (`hdr::convert::measure_pass`) and writes the HDR10+
+/// metadata. One progress bar (`Stage::Hdr`) over both.
+#[allow(clippy::too_many_arguments)]
+fn hdr_first_pass(
+    tools: &Tools,
+    spec: &ExportSpec,
+    params: &crate::hdr::convert::HdrParams,
+    dir: &Path,
+    out_dir: &Path,
+    total: u64,
+    cut: &[bool],
+    cancel: &AtomicBool,
+    emit: &(dyn Fn(ExportEvent) + Sync),
+) -> Result<HdrWork> {
+    use crate::settings::HdrMode;
+    let s = &spec.settings;
+    let divisor = spec.divisor();
+    let interp_on = divisor > 1;
+    let weight = if interp_on {
+        spec.end - spec.start
+    } else {
+        total
+    }
+    .max(1);
+    let units = (interp_on as u64 + 1) * weight;
+    let report = |base: u64, f: u64| {
+        emit(ExportEvent::Progress {
+            stage: Stage::Hdr,
+            done: base + f.min(weight),
+            total: units,
+        })
+    };
+    report(0, 0);
+    let (src, frames, base) = if interp_on {
+        let interp = dir.join(INTERP_DIR);
+        let n = interpolate_sdr(tools, spec, out_dir, &interp, total, cancel, |f| {
+            report(0, f)
+        });
+        check(cancel)?;
+        (interp, n?, weight)
+    } else {
+        (out_dir.to_path_buf(), total, 0)
+    };
+    let lights = crate::hdr::convert::measure_pass(
+        &src,
+        &crate::hdr::convert::hdr_dir(dir),
+        frames,
+        params,
+        cancel,
+        |f| report(base, f),
+    );
+    check(cancel)?;
+    let m = crate::hdr::measure::Measurement::from_frames(lights?);
+    // HLG carries no light levels.
+    let mut hdr10plus_json = None;
+    let (max_cll, max_fall) = if params.mode.is_pq() {
+        if params.mode == HdrMode::Hdr10Plus {
+            // Scene ids follow the export's cut list, mapped to the encoded frames.
+            let cuts = crate::hdr::hdr10plus::encoded_cuts(
+                cut,
+                s.skip_duplicates || s.sequential(),
+                divisor,
+                m.frames.len(),
+            );
+            let path = dir.join("hdr10plus.json");
+            crate::hdr::hdr10plus::write_json(&m, &cuts, params.peak_nits, &path)?;
+            hdr10plus_json = Some(path);
+        }
+        (m.max_cll, m.max_fall)
+    } else {
+        (0, 0)
+    };
+    Ok(HdrWork {
+        encode: crate::hdr::HdrEncode {
+            mode: params.mode,
+            peak_nits: params.peak_nits,
+            max_cll,
+            max_fall,
+            hdr10plus_json,
+        },
+        params: *params,
+        src,
+        frames,
+    })
 }
 
 /// The intermediate video (no audio) and its marker in the job folder.
@@ -595,119 +702,35 @@ fn export(
     upscale_all(&plan, s, provider.as_ref(), cancel, emit)?;
     check(cancel)?;
 
-    // 3b. SDR to HDR (cached in `hdr/` by mode and peak, never touches `out/`), then the light
-    // levels the encoder writes into the stream, measured from the HDR frames. With skipped
-    // frames the SDR frames are motion-interpolated first (`interp/`, 8-bit, as for SDR) and
-    // the HDR stage works at the full rate: interpolating HDR itself would be 8-bit PQ.
+    // 3b. HDR (`hdr::convert`): nothing 16-bit is stored. The first pass converts and
+    // measures every frame in memory (cached per frame in `hdr/stats.txt`), the encoder then
+    // gets the frames converted again through a pipe. With skipped frames the SDR frames are
+    // motion-interpolated first (`interp/`, 8-bit, as for SDR) and the HDR stages work at the
+    // full rate: interpolating HDR itself would be 8-bit PQ.
     let info = &spec.info;
     let divisor = spec.divisor();
-    let hdr_frames = crate::hdr::convert::hdr_dir(&dir);
+    let hdr_params = crate::hdr::convert::HdrParams::from_settings(s);
     let interp_frames = dir.join(INTERP_DIR);
-    let hdr_on = s.hdr_mode != crate::settings::HdrMode::Off;
-    let interp_on = hdr_on && divisor > 1;
-    let mut hdr: Option<crate::hdr::HdrEncode> = None;
-    // Frames the encoder reads (full rate when HDR interpolated).
-    let mut encode_total = total;
-    if hdr_on {
-        let pq = s.hdr_mode.is_pq();
-        // One monotonic bar over interpolation, conversion and measurement.
-        let weight = if interp_on {
-            spec.end - spec.start
-        } else {
-            total
-        }
-        .max(1);
-        let units = (interp_on as u64 + 1 + pq as u64) * weight;
-        let report = |base: u64, f: u64| {
-            emit(ExportEvent::Progress {
-                stage: Stage::Hdr,
-                done: base + f.min(weight),
-                total: units,
-            })
-        };
-        report(0, 0);
-        let mut base = 0;
-        let mut src: &Path = &out_dir;
-        if interp_on {
-            let n = interpolate_sdr(tools, spec, &out_dir, &interp_frames, total, cancel, |f| {
-                report(0, f)
-            });
-            check(cancel)?;
-            encode_total = n?;
-            src = &interp_frames;
-            base = weight;
-        }
-        let r = crate::hdr::convert::convert(
-            src,
-            &hdr_frames,
-            encode_total,
-            s.hdr_mode,
-            s.hdr_peak_nits,
-            cancel,
-            |f| report(base, f),
-        );
-        if let Err(e) = r {
-            check(cancel)?;
-            return Err(e);
-        }
-        check(cancel)?;
-        base += weight;
-        // HLG carries no static light levels.
-        let mut hdr10plus_json = None;
-        let (max_cll, max_fall) = if pq {
-            let m = crate::hdr::measure::measure_dir(&hdr_frames, encode_total, cancel, |f| {
-                report(base, f)
-            });
-            check(cancel)?;
-            let m = m?;
-            if s.hdr_mode == crate::settings::HdrMode::Hdr10Plus {
-                // Scene ids follow the export's cut list, mapped to the encoded frames.
-                let cuts = crate::hdr::hdr10plus::encoded_cuts(
-                    &cut,
-                    s.skip_duplicates || s.sequential(),
-                    divisor,
-                    m.frames.len(),
-                );
-                let path = dir.join("hdr10plus.json");
-                crate::hdr::hdr10plus::write_json(&m, &cuts, s.hdr_peak_nits, &path)?;
-                hdr10plus_json = Some(path);
-            }
-            (m.max_cll, m.max_fall)
-        } else {
-            (0, 0)
-        };
-        hdr = Some(crate::hdr::HdrEncode {
-            mode: s.hdr_mode,
-            peak_nits: s.hdr_peak_nits,
-            max_cll,
-            max_fall,
-            hdr10plus_json,
-        });
-    }
-    let encode_dir = if hdr.is_some() { &hdr_frames } else { &out_dir };
-    // The HDR and interpolated frames are only intermediates: gone once the output exists.
+    let first_pass = |p: &crate::hdr::convert::HdrParams| {
+        hdr_first_pass(tools, spec, p, &dir, &out_dir, total, &cut, cancel, emit)
+    };
+    // The interpolated frames are only an intermediate: gone once the output exists.
     let finish = |output: PathBuf| -> PathBuf {
-        if hdr.is_some() && s.hdr_delete_frames_after {
-            for d in [&hdr_frames, &interp_frames] {
-                if d.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(d) {
-                        log::warn!("could not delete {}: {e}", d.display());
-                    }
-                }
+        if hdr_params.is_some() && s.hdr_delete_interp_after && interp_frames.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&interp_frames) {
+                log::warn!("could not delete {}: {e}", interp_frames.display());
             }
         }
         output
     };
 
     // 4. Encode
-    let out_frames_total = if hdr.is_some() {
-        encode_total
-    } else if divisor > 1 {
+    let out_frames_total = if divisor > 1 {
         spec.end - spec.start
     } else {
         total
     };
-    let (in_fps_num, in_fps_den, interpolate_to) = if hdr.is_some() {
+    let (in_fps_num, in_fps_den, interpolate_to) = if hdr_params.is_some() {
         // Already at the full rate.
         (info.fps_num, info.fps_den as u64, None)
     } else {
@@ -731,7 +754,7 @@ fn export(
                 (spec.end - spec.start) as f64 / info.fps(),
             )
         }),
-        hdr: hdr.clone(),
+        hdr: None,
     };
     let progress = |f: u64| {
         emit(ExportEvent::Progress {
@@ -740,33 +763,57 @@ fn export(
             total: out_frames_total,
         })
     };
+    // SDR reads `out/`; HDR gets the second pass's frames on stdin.
+    let run_encode = |work: Option<&HdrWork>, opts: &EncodeOptions, out: &Path| -> Result<()> {
+        let Some(w) = work else {
+            return ffmpeg::encode(
+                tools,
+                &VideoInput::Frames(&out_dir),
+                opts,
+                out,
+                cancel,
+                progress,
+            );
+        };
+        let (width, height) = crate::hdr::convert::frame_size(&w.src)?;
+        let feed = |pipe: &mut dyn std::io::Write| {
+            crate::hdr::convert::stream_frames(&w.src, w.frames, &w.params, cancel, pipe)
+        };
+        let input = VideoInput::Rgb48 {
+            width,
+            height,
+            feed: &feed,
+        };
+        ffmpeg::encode(tools, &input, opts, out, cancel, progress)
+    };
     let Some(audio) = audio else {
         if let Some(d) = spec.output.parent() {
             std::fs::create_dir_all(d)?;
         }
-        ffmpeg::encode(
-            tools,
-            encode_dir,
-            total,
-            &opts,
-            &spec.output,
-            cancel,
-            progress,
-        )?;
+        let work = hdr_params.as_ref().map(first_pass).transpose()?;
+        let opts = EncodeOptions {
+            hdr: work.as_ref().map(|w| w.encode.clone()),
+            ..opts
+        };
+        run_encode(work.as_ref(), &opts, &spec.output)?;
         return Ok(finish(spec.output.clone()));
     };
 
     // 4b. With new audio: the video without audio to an intermediate MKV (kept, so changing
-    // only the audio settings re-runs the audio and the mux, not the frames or the encode),
-    // then the audio job, then the mux.
+    // only the audio settings re-runs the audio and the mux, not the frames, the HDR passes
+    // or the encode), then the audio job, then the mux.
     let opts = EncodeOptions {
         audio_from: None,
         ..opts
     };
     let video = dir.join(VIDEO_FILE);
     let done = dir.join(VIDEO_DONE);
+    let extra = hdr_params.as_ref().map_or(String::new(), |p| {
+        format!("{}zscale: {}\n", p.header(), tools.has_zscale())
+    });
     let key = video_key(
         &opts,
+        &extra,
         total,
         (1..=total)
             .filter(|n| dup_of[*n as usize].is_none())
@@ -777,13 +824,17 @@ fn export(
         log::info!("export: reusing {}", video.display());
     } else {
         let _ = std::fs::remove_file(&done);
+        let work = hdr_params.as_ref().map(first_pass).transpose()?;
+        let opts = EncodeOptions {
+            hdr: work.as_ref().map(|w| w.encode.clone()),
+            ..opts
+        };
         let part = dir.join("video.part.mkv");
-        ffmpeg::encode(tools, encode_dir, total, &opts, &part, cancel, progress)?;
+        run_encode(work.as_ref(), &opts, &part)?;
         std::fs::rename(&part, &video).context("could not keep the encoded video")?;
         std::fs::write(&done, &key)?;
     }
     check(cancel)?;
-
     emit(ExportEvent::Progress {
         stage: Stage::Audio,
         done: 0,

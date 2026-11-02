@@ -418,10 +418,17 @@ pub struct Settings {
     pub video_codec: VideoCodec,
     pub crf: u8,
     pub hdr_mode: HdrMode,
-    /// Peak brightness (nits) the inverse tone map expands the top range to.
+    /// Peak brightness (nits) the inverse tone map expands the top range to (HDR10/HDR10+;
+    /// HLG always uses its nominal 1000 nits).
     pub hdr_peak_nits: u32,
-    /// Remove the 16-bit HDR frames once the video is encoded.
-    pub hdr_delete_frames_after: bool,
+    /// Where SDR white lands in the HDR picture, in nits (203 = BT.2408). Higher makes the
+    /// whole picture brighter, for projectors and dim displays; the peak stays.
+    pub hdr_sdr_white_nits: u32,
+    /// Remove the full-rate in-between frames (`interp/`, made for HDR with "every 2nd/3rd
+    /// frame") once the video is encoded. Read from the old name too, the setting that
+    /// removed the 16-bit HDR frames before they were streamed.
+    #[serde(alias = "hdr_delete_frames_after")]
+    pub hdr_delete_interp_after: bool,
 
     // Audio
     pub audio_mode: AudioMode,
@@ -488,7 +495,8 @@ impl Default for Settings {
             crf: 16,
             hdr_mode: HdrMode::Off,
             hdr_peak_nits: 1000,
-            hdr_delete_frames_after: true,
+            hdr_sdr_white_nits: 203,
+            hdr_delete_interp_after: true,
             audio_mode: AudioMode::Original,
             surround_engine: SurroundEngine::LocalAi,
             lfe_level: LfeLevel::Normal,
@@ -651,7 +659,8 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.hdr_mode, HdrMode::Off);
         assert_eq!(s.hdr_peak_nits, 1000);
-        assert!(s.hdr_delete_frames_after);
+        assert_eq!(s.hdr_sdr_white_nits, 203);
+        assert!(s.hdr_delete_interp_after);
         assert!(!HdrMode::Off.is_pq());
         assert!(HdrMode::Hdr10.is_pq());
         assert!(HdrMode::Hdr10Plus.is_pq());

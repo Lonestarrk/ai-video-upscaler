@@ -644,8 +644,100 @@ pub struct EncodeOptions {
     pub crf: u8,
     /// Audio: the source file and the range to cut from it.
     pub audio_from: Option<(PathBuf, f64, f64)>,
-    /// HDR output: the input is then 16-bit RGB PNG already in BT.2020 PQ/HLG code values.
+    /// HDR output: the input then holds 16-bit RGB already in BT.2020 PQ/HLG code values.
     pub hdr: Option<crate::hdr::HdrEncode>,
+}
+
+/// Writes raw frames to the encoder's stdin; may be called again when the encode is retried.
+pub type FrameFeed<'a> = &'a (dyn Fn(&mut dyn std::io::Write) -> Result<()> + Sync);
+
+/// The pictures `encode` reads.
+pub enum VideoInput<'a> {
+    /// `dir/000001.png`, `dir/000002.png`, …
+    Frames(&'a Path),
+    /// Raw `rgb48le` frames of this size, written by `feed` (HDR, converted on the fly).
+    Rgb48 {
+        width: u32,
+        height: u32,
+        feed: FrameFeed<'a>,
+    },
+}
+
+/// The video filters of HDR output. The input already holds BT.2020 PQ/HLG code values: the
+/// only conversion is RGB to YUV 4:2:0 10-bit with the BT.2020 non-constant-luminance matrix,
+/// full to limited range (plus the squeeze back to the stored size for anamorphic output).
+/// zscale does it exactly, with error-diffusion dither to 10 bits; swscale (when the FFmpeg
+/// build has no zimg) has a +0.39 % gain error on Y and blockier highlights. Motion
+/// interpolation is never done here (it is 8-bit only): the job interpolates the SDR frames.
+pub fn hdr_filters(
+    mode: crate::settings::HdrMode,
+    anamorphic: Option<((u32, u32), (u32, u32))>,
+    zscale: bool,
+) -> String {
+    let mut f = Vec::new();
+    if zscale {
+        let t = crate::hdr::transfer_name(mode);
+        let size = anamorphic.map_or(String::new(), |((w, h), _)| {
+            format!("w={w}:h={h}:f=lanczos:")
+        });
+        f.push(format!(
+            "zscale={size}rin=full:pin=2020:tin={t}:min=gbr\
+             :r=limited:p=2020:t={t}:m=2020_ncl:dither=error_diffusion"
+        ));
+        f.push("format=yuv420p10le".to_string());
+        if let Some((_, (n, d))) = anamorphic {
+            f.push(format!("setsar={n}/{d}"));
+        }
+    } else {
+        // Done first, explicitly, and pinned to 16-bit 4:4:4, so no later scale or format
+        // negotiation decides the matrix or drops precision.
+        f.push(
+            "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int,\
+             format=yuv444p16le"
+                .to_string(),
+        );
+        if let Some(((w, h), (n, d))) = anamorphic {
+            f.push(format!("scale={w}:{h}:flags=lanczos,setsar={n}/{d}"));
+        }
+        f.push("format=yuv420p10le".to_string());
+    }
+    f.join(",")
+}
+
+impl Tools {
+    /// Whether this FFmpeg has the zscale filter (zimg); asked once per FFmpeg binary.
+    pub fn has_zscale(&self) -> bool {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(Default::default);
+        if let Some(v) = seen.lock().unwrap().get(&self.ffmpeg) {
+            return *v;
+        }
+        let mut cmd = self.ffmpeg_cmd();
+        cmd.arg("-filters");
+        let found = process::run(
+            cmd,
+            None,
+            &AtomicBool::new(false),
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .map(|o| {
+            o.stdout_text()
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some("zscale"))
+        })
+        .unwrap_or(false);
+        if !found {
+            log::warn!(
+                "{} has no zscale filter (zimg): HDR is converted to YUV with swscale, \
+                 which is slightly less exact",
+                self.ffmpeg.display()
+            );
+        }
+        seen.lock().unwrap().insert(self.ffmpeg.clone(), found);
+        found
+    }
 }
 
 /// Motion-interpolates `src_dir/%06d.png` (at `in_fps`) to `to_fps` and writes the full-rate
@@ -678,12 +770,11 @@ pub fn interpolate_frames(
     Ok(count_frames(out_dir))
 }
 
-/// Encodes `frames_dir/%06d.png` to `out`, with audio copied from the source when it fits the
-/// container and re-encoded to AAC when it does not.
+/// Encodes `input` to `out`, with audio copied from the source when it fits the container and
+/// re-encoded to AAC when it does not.
 pub fn encode(
     tools: &Tools,
-    frames_dir: &Path,
-    frames: u64,
+    input: &VideoInput,
     opts: &EncodeOptions,
     out: &Path,
     cancel: &AtomicBool,
@@ -714,10 +805,18 @@ pub fn encode(
             // into the range), as `mux` does.
             cmd.arg("-copyts");
         }
-        cmd.arg("-framerate")
-            .arg(format!("{}/{}", opts.in_fps_num, opts.in_fps_den))
-            .args(["-start_number", "1", "-i"])
-            .arg(frames_dir.join("%06d.png"));
+        let rate = format!("{}/{}", opts.in_fps_num, opts.in_fps_den);
+        match input {
+            VideoInput::Frames(dir) => {
+                cmd.args(["-framerate", &rate, "-start_number", "1", "-i"])
+                    .arg(dir.join("%06d.png"));
+            }
+            VideoInput::Rgb48 { width, height, .. } => {
+                cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb48le", "-s"])
+                    .arg(format!("{width}x{height}"))
+                    .args(["-framerate", &rate, "-i", "pipe:0"]);
+            }
+        }
         match (audio, &opts.audio_from) {
             (Some(cut), _) => {
                 cmd.arg("-i").arg(cut);
@@ -736,28 +835,24 @@ pub fn encode(
                 cmd.args(["-map", "0:v:0"]);
             }
         }
-        let mut filters: Vec<String> = Vec::new();
-        if opts.hdr.is_some() {
-            // The frames already hold BT.2020 PQ/HLG code values: the only conversion is RGB
-            // to YUV with the BT.2020 non-constant-luminance matrix, full to limited range.
-            // Done first, explicitly, and pinned to 16-bit 4:4:4, so no later scale or format
-            // negotiation decides the matrix or drops precision. Motion interpolation is not
-            // done here (it is 8-bit only): the job interpolates the SDR frames beforehand.
-            filters.push(
-                "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int,                 format=yuv444p16le"
-                    .to_string(),
-            );
-        } else if let Some((n, d)) = opts.interpolate_to {
-            filters.push(format!(
-                "minterpolate=fps={n}/{d}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
-            ));
-        }
-        if let Some(((w, h), (n, d))) = opts.anamorphic {
-            filters.push(format!("scale={w}:{h}:flags=lanczos,setsar={n}/{d}"));
-        }
         if let Some(h) = &opts.hdr {
-            filters.push("format=yuv420p10le".to_string());
-            cmd.arg("-vf").arg(filters.join(","));
+            let mut h = h.clone();
+            // x265 opens the HDR10+ JSON with a narrow fopen: a non-ASCII path (a job folder
+            // under "Användare", "å", …) fails, and x265 then aborts. ffmpeg runs in the JSON's
+            // folder instead and x265 gets the bare (ASCII) file name; every other path given
+            // to ffmpeg here is absolute.
+            if let Some(json) = &h.hdr10plus_json {
+                if let (false, Some(dir), Some(name)) = (
+                    json.to_string_lossy().is_ascii(),
+                    json.parent(),
+                    json.file_name(),
+                ) {
+                    cmd.current_dir(dir);
+                    h.hdr10plus_json = Some(PathBuf::from(name));
+                }
+            }
+            cmd.arg("-vf")
+                .arg(hdr_filters(h.mode, opts.anamorphic, tools.has_zscale()));
             // HDR is always H.265 (H.264 has no usable HDR path here).
             cmd.args(["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"]);
             cmd.args(["-pix_fmt", "yuv420p10le"]);
@@ -772,8 +867,17 @@ pub fn encode(
                 "tv",
             ]);
             cmd.arg("-x265-params")
-                .arg(crate::hdr::x265_params(h, opts.crf));
+                .arg(crate::hdr::x265_params(&h, opts.crf));
         } else {
+            let mut filters: Vec<String> = Vec::new();
+            if let Some((n, d)) = opts.interpolate_to {
+                filters.push(format!(
+                    "minterpolate=fps={n}/{d}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+                ));
+            }
+            if let Some(((w, h), (n, d))) = opts.anamorphic {
+                filters.push(format!("scale={w}:{h}:flags=lanczos,setsar={n}/{d}"));
+            }
             if !filters.is_empty() {
                 cmd.arg("-vf").arg(filters.join(","));
             }
@@ -799,13 +903,16 @@ pub fn encode(
             .arg(out);
         cmd
     };
-    let _ = frames;
+    let feed = match input {
+        VideoInput::Rgb48 { feed, .. } => Some(*feed),
+        VideoInput::Frames(_) => None,
+    };
     let result = match &copied {
-        None => run_with_progress(build(None), cancel, &mut progress),
-        Some(cut) => match run_with_progress(build(Some(cut)), cancel, &mut progress) {
+        None => run_ffmpeg(build(None), cancel, &mut progress, feed),
+        Some(cut) => match run_ffmpeg(build(Some(cut)), cancel, &mut progress, feed) {
             Err(e) if !process::is_cancelled(&e) => {
                 log::info!("audio copy failed ({e}), re-encoding audio to AAC");
-                run_with_progress(build(None), cancel, &mut progress)
+                run_ffmpeg(build(None), cancel, &mut progress, feed)
             }
             r => r,
         },
@@ -997,14 +1104,32 @@ pub fn mux(
 
 /// Runs an ffmpeg command that has `-progress pipe:1`, reporting `frame=` values.
 fn run_with_progress(
+    cmd: std::process::Command,
+    cancel: &AtomicBool,
+    progress: impl FnMut(u64),
+) -> Result<()> {
+    run_ffmpeg(cmd, cancel, progress, None)
+}
+
+/// `run_with_progress` with `feed` (when given) writing ffmpeg's stdin on a thread of its own.
+/// A failing feed stops ffmpeg and is the error; when ffmpeg stops first (it failed, or
+/// `-shortest` ended the output), the feed's write fails and ffmpeg's own result counts.
+/// Cancelling kills ffmpeg, which closes the pipe.
+fn run_ffmpeg(
     mut cmd: std::process::Command,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
+    feed: Option<FrameFeed>,
 ) -> Result<()> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if feed.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     let mut child = crate::process::spawn(&mut cmd).context("could not start ffmpeg")?;
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
     let err_thread = std::thread::spawn(move || {
@@ -1023,38 +1148,97 @@ fn run_with_progress(
             }
         }
     });
-    let status = loop {
+    std::thread::scope(|scope| {
+        let mut writer = match (feed, stdin) {
+            (Some(feed), Some(mut pipe)) => Some(scope.spawn(move || {
+                let r = feed(&mut pipe);
+                // Closing the pipe ends ffmpeg's input.
+                drop(pipe);
+                r
+            })),
+            _ => None,
+        };
+        let join = |h: std::thread::ScopedJoinHandle<'_, Result<()>>| {
+            h.join()
+                .unwrap_or_else(|_| Err(anyhow!("the frame feed panicked")))
+        };
+        let mut feed_error = None;
+        let status = loop {
+            while let Ok(f) = rx.try_recv() {
+                progress(f);
+            }
+            if writer.as_ref().is_some_and(|h| h.is_finished()) {
+                if let Err(e) = join(writer.take().unwrap()) {
+                    let _ = child.kill();
+                    feed_error = Some(e);
+                }
+            }
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(process::Cancelled);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let _ = out_thread.join();
         while let Ok(f) = rx.try_recv() {
             progress(f);
         }
-        if let Some(s) = child.try_wait()? {
-            break s;
-        }
+        let err = err_thread.join().unwrap_or_default();
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!(process::Cancelled);
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    };
-    let _ = out_thread.join();
-    while let Ok(f) = rx.try_recv() {
-        progress(f);
-    }
-    let err = err_thread.join().unwrap_or_default();
-    if !status.success() {
-        let tail: Vec<&str> = err.lines().rev().take(6).collect();
-        bail!(
-            "ffmpeg failed: {}",
-            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-        );
-    }
-    Ok(())
+        let tail = {
+            let t: Vec<&str> = err.lines().rev().take(6).collect();
+            t.into_iter().rev().collect::<Vec<_>>().join("\n")
+        };
+        if let Some(e) = feed_error {
+            // A broken pipe because ffmpeg failed on its own says less than ffmpeg does.
+            return Err(if tail.trim().is_empty() {
+                e.context("could not feed the encoder")
+            } else {
+                e.context(format!("ffmpeg failed: {tail}"))
+            });
+        }
+        if !status.success() {
+            bail!("ffmpeg failed ({status}): {tail}");
+        }
+        if let Some(Err(e)) = writer.map(join) {
+            // ffmpeg finished on its own before taking every frame (-shortest).
+            log::info!("ffmpeg stopped reading frames early: {e:#}");
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_filter_chains() {
+        use crate::settings::HdrMode;
+        let z = hdr_filters(HdrMode::Hdr10, Some(((720, 480), (32, 27))), true);
+        assert_eq!(
+            z,
+            "zscale=w=720:h=480:f=lanczos:rin=full:pin=2020:tin=smpte2084:min=gbr\
+             :r=limited:p=2020:t=smpte2084:m=2020_ncl:dither=error_diffusion,\
+             format=yuv420p10le,setsar=32/27"
+        );
+        let hlg = hdr_filters(HdrMode::Hlg, None, true);
+        assert!(hlg.contains("tin=arib-std-b67") && hlg.contains(":t=arib-std-b67"));
+        assert!(!hlg.contains("setsar") && !hlg.contains("w="));
+        let s = hdr_filters(HdrMode::Hdr10, Some(((720, 480), (32, 27))), false);
+        assert_eq!(
+            s,
+            "scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd+full_chroma_int,\
+             format=yuv444p16le,scale=720:480:flags=lanczos,setsar=32/27,format=yuv420p10le"
+        );
+        assert!(!z.contains(' ') && !s.contains(' '));
+    }
 
     #[test]
     fn ratios() {
