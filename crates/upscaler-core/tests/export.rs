@@ -1721,6 +1721,107 @@ fn hdr_encode_keeps_pq_code_values() {
     }
 }
 
+/// HDR with Original audio that ends before the range does: ffmpeg stops reading frames at
+/// `-shortest` and exits successfully while the frame feed still writes. That is a finished
+/// export (as long as the audio), not a failure followed by an AAC retry.
+#[test]
+fn hdr_export_with_shorter_audio_ends_with_the_audio() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("short_audio.mkv");
+    // 4 s of picture, 1 s of audio; the range is the first 2 s.
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=320x180:rate=24:duration=4")
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "ac3"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let spec = ExportSpec {
+        info: ffmpeg::probe(&tools, &src).unwrap(),
+        start: 0,
+        end: 48,
+        output: dir.path().join("short.mp4"),
+        settings: hdr_settings(&dir.path().join("work"), HdrMode::Hdr10),
+    };
+    let log = run(&tools, &spec);
+    assert_eq!(log.last().map(String::as_str), Some("finished"), "{log:?}");
+    let out = std::process::Command::new(&tools.ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration"])
+        .args(["-of", "default=nw=1"])
+        .arg(&spec.output)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    let duration: f64 = entry(&text, "duration").unwrap().parse().unwrap();
+    assert!((duration - 1.0).abs() < 0.15, "duration {duration}");
+    let a = stream_entries(&tools, &spec.output, "a:0", "stream=codec_name");
+    assert_eq!(
+        entry(&a, "codec_name").as_deref(),
+        Some("ac3"),
+        "copied, not re-encoded"
+    );
+}
+
+/// A frame that cannot be made (the conversion fails) fails the encode, also when ffmpeg exits
+/// cleanly on the closed pipe, and is not retried with AAC audio.
+#[test]
+fn hdr_feed_error_fails_without_audio_retry() {
+    let Some(tools) = Tools::locate("") else {
+        eprintln!("ffmpeg not installed, skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("in.mp4");
+    make_video(&tools, &src);
+    let frame = vec![0u8; 256 * 128 * 6];
+    for fail_after in [1usize, 3] {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let feed = |w: &mut dyn std::io::Write| -> anyhow::Result<()> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..fail_after {
+                w.write_all(&frame)?;
+            }
+            anyhow::bail!("frame {} could not be read", fail_after + 1)
+        };
+        let opts = ffmpeg::EncodeOptions {
+            in_fps_num: 24,
+            in_fps_den: 1,
+            interpolate_to: None,
+            anamorphic: None,
+            codec: upscaler_core::settings::VideoCodec::H265,
+            crf: 20,
+            audio_from: Some((src.clone(), 0.0, 1.0)),
+            hdr: Some(upscaler_core::hdr::HdrEncode {
+                mode: HdrMode::Hdr10,
+                peak_nits: 1000,
+                max_cll: 100,
+                max_fall: 100,
+                hdr10plus_json: None,
+            }),
+        };
+        let input = ffmpeg::VideoInput::Rgb48 {
+            width: 256,
+            height: 128,
+            feed: &feed,
+        };
+        let out = dir.path().join(format!("fail{fail_after}.mp4"));
+        let r = ffmpeg::encode(&tools, &input, &opts, &out, &AtomicBool::new(false), |_| {});
+        let e = format!("{:#}", r.expect_err("a failed frame must fail the encode"));
+        assert!(e.contains("could not be read"), "{e}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retried: {e}"
+        );
+    }
+}
+
 #[test]
 fn hdr10plus_export_carries_dynamic_metadata() {
     let Some(tools) = Tools::locate("") else {

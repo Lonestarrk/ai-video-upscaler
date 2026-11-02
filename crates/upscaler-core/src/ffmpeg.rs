@@ -910,7 +910,8 @@ pub fn encode(
     let result = match &copied {
         None => run_ffmpeg(build(None), cancel, &mut progress, feed),
         Some(cut) => match run_ffmpeg(build(Some(cut)), cancel, &mut progress, feed) {
-            Err(e) if !process::is_cancelled(&e) => {
+            // Only ffmpeg's own failure (the copied audio does not fit) is worth a retry.
+            Err(e) if !process::is_cancelled(&e) && e.downcast_ref::<FeedFailed>().is_none() => {
                 log::info!("audio copy failed ({e}), re-encoding audio to AAC");
                 run_ffmpeg(build(None), cancel, &mut progress, feed)
             }
@@ -1162,16 +1163,28 @@ fn run_ffmpeg(
             h.join()
                 .unwrap_or_else(|_| Err(anyhow!("the frame feed panicked")))
         };
+        // A feed that fails on its own (a frame could not be made) stops ffmpeg; a closed pipe
+        // only means ffmpeg stopped reading, and ffmpeg's own exit says why.
         let mut feed_error = None;
+        let mut pipe_closed = None;
+        let mut take_writer =
+            |writer: &mut Option<std::thread::ScopedJoinHandle<'_, Result<()>>>,
+             child: &mut std::process::Child| {
+                if let Some(Err(e)) = writer.take().map(join) {
+                    if is_broken_pipe(&e) {
+                        pipe_closed = Some(e);
+                    } else {
+                        let _ = child.kill();
+                        feed_error = Some(e);
+                    }
+                }
+            };
         let status = loop {
             while let Ok(f) = rx.try_recv() {
                 progress(f);
             }
             if writer.as_ref().is_some_and(|h| h.is_finished()) {
-                if let Err(e) = join(writer.take().unwrap()) {
-                    let _ = child.kill();
-                    feed_error = Some(e);
-                }
+                take_writer(&mut writer, &mut child);
             }
             if let Some(s) = child.try_wait()? {
                 break s;
@@ -1183,6 +1196,8 @@ fn run_ffmpeg(
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
+        // ffmpeg is gone, so a feed still writing ends now (its pipe is closed).
+        take_writer(&mut writer, &mut child);
         let _ = out_thread.join();
         while let Ok(f) = rx.try_recv() {
             progress(f);
@@ -1191,26 +1206,40 @@ fn run_ffmpeg(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!(process::Cancelled);
         }
-        let tail = {
-            let t: Vec<&str> = err.lines().rev().take(6).collect();
-            t.into_iter().rev().collect::<Vec<_>>().join("\n")
-        };
+        // A frame that could not be made fails the encode even when ffmpeg ended cleanly on
+        // the closed pipe: the video would be short.
         if let Some(e) = feed_error {
-            // A broken pipe because ffmpeg failed on its own says less than ffmpeg does.
-            return Err(if tail.trim().is_empty() {
-                e.context("could not feed the encoder")
-            } else {
-                e.context(format!("ffmpeg failed: {tail}"))
-            });
+            return Err(e.context(FeedFailed));
         }
         if !status.success() {
+            let t: Vec<&str> = err.lines().rev().take(6).collect();
+            let tail = t.into_iter().rev().collect::<Vec<_>>().join("\n");
             bail!("ffmpeg failed ({status}): {tail}");
         }
-        if let Some(Err(e)) = writer.map(join) {
+        if let Some(e) = pipe_closed {
             // ffmpeg finished on its own before taking every frame (-shortest).
-            log::info!("ffmpeg stopped reading frames early: {e:#}");
+            log::info!("ffmpeg stopped reading frames early (-shortest): {e:#}");
         }
         Ok(())
+    })
+}
+
+/// The frame feed failed on its own (not because ffmpeg closed the pipe): the encode fails,
+/// and retrying it (with other audio) would fail the same way.
+#[derive(Debug)]
+pub struct FeedFailed;
+
+impl std::fmt::Display for FeedFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not make the frames for the encoder")
+    }
+}
+
+/// Whether `e` comes from writing to a pipe whose reader has gone.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
     })
 }
 
