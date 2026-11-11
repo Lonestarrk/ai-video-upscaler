@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+</head>
+<body>
+<title>Inuti Claude</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: a die shot on a dark silicon ground, zoomable canvas on the left, a spec-sheet panel on the right (below on phones). */
+:root {
+  --bg: #0f1517;
+  --surface: #151d20;
+  --surface-2: #1b2529;
+  --line: #2a373c;
+  --fg: #e1e8ea;
+  --muted: #93a4ab;
+  --accent: #d8b24a;
+  --accent-ink: #1a1508;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  color-scheme: dark;
+}
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.55; overflow: hidden; }
+.app { height: 100%; display: flex; flex-direction: column; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 10px 12px; gap: 10px; box-sizing: border-box; }
+.bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: 12px; min-width: 0; flex-wrap: wrap; }
+.brand h1 { font-family: var(--font-display); font-weight: 600; font-size: 22px; letter-spacing: .01em; margin: 0; }
+.brand h1 span { color: var(--accent); }
+.brand p { margin: 0; color: var(--muted); font-size: 13px; }
+.tools { display: flex; gap: 8px; flex-wrap: wrap; }
+button { font: inherit; font-size: 13px; color: var(--fg); background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.stage { flex: 1; min-height: 0; display: flex; gap: 12px; }
+.viewport { position: relative; flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg); touch-action: none; }
+canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+canvas.dragging { cursor: grabbing; }
+.hud { position: absolute; top: 10px; right: 10px; display: flex; gap: 6px; align-items: center; }
+.hud .zoom { font-family: var(--font-mono); font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--bg) 82%, transparent); padding: 4px 8px; border-radius: 5px; border: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.hud button { width: 30px; height: 30px; padding: 0; font-size: 16px; line-height: 1; }
+.hint { position: absolute; left: 10px; top: 10px; font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--bg) 82%, transparent); padding: 4px 8px; border-radius: 5px; border: 1px solid var(--line); max-width: calc(100% - 200px); }
+.tip { position: absolute; pointer-events: none; font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
+.tourbar { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 10px; background: color-mix(in srgb, var(--surface) 94%, transparent); border: 1px solid var(--accent); border-radius: 8px; padding: 8px 10px; }
+.tourbar .step { font-family: var(--font-mono); font-size: 12px; color: var(--accent); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tourbar .cap { flex: 1; min-width: 0; font-size: 14px; }
+.panel { width: 380px; flex: none; overflow-y: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 18px 20px 24px; box-sizing: border-box; }
+.crumbs { display: flex; flex-wrap: wrap; gap: 2px 4px; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+.crumbs button { background: none; border: none; padding: 0 2px; color: var(--muted); font-size: 12px; border-radius: 3px; }
+.crumbs button:hover { color: var(--fg); }
+.crumbs .sep { opacity: .5; }
+.eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; display: flex; align-items: center; gap: 8px; }
+.dot { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.panel h2 { font-family: var(--font-display); font-weight: 600; font-size: 28px; line-height: 1.1; margin: 6px 0 4px; text-wrap: balance; }
+.panel .sub { color: var(--muted); margin: 0 0 14px; }
+.panel .note { border-left: 2px solid var(--accent); padding-left: 10px; margin: 0 0 12px; }
+.panel p { margin: 0 0 10px; }
+.cpu { background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin: 14px 0; font-size: 14px; }
+.cpu b { display: block; font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); font-weight: 500; margin-bottom: 2px; }
+dl.facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 14px 0; font-size: 13px; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; min-width: 0; }
+.panel h3 { font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 500; margin: 20px 0 8px; }
+.kids { display: flex; flex-direction: column; gap: 4px; }
+.kids button { display: flex; align-items: center; gap: 8px; text-align: left; background: var(--surface-2); }
+.kids button span.n { color: var(--muted); margin-left: auto; font-family: var(--font-mono); font-size: 11px; }
+.scale { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin-top: 6px; }
+.leafmark { color: var(--muted); font-size: 13px; font-style: italic; }
+@media (max-width: 760px) {
+  .stage { flex-direction: column; }
+  .viewport { flex: 1 1 55%; }
+  .panel { width: auto; flex: 1 1 45%; padding: 14px 14px 20px; }
+  .panel h2 { font-size: 23px; }
+  .brand p { display: none; }
+  .hint { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<div class="app">
+  <header class="bar">
+    <div class="brand">
+      <h1>Inuti <span>Claude</span></h1>
+      <p>En zoombar karta över en språkmodell, från helheten ner till en enda transistor.</p>
+    </div>
+    <div class="tools">
+      <button id="tourBtn" class="primary" type="button">Guidad tur</button>
+      <button id="upBtn" type="button">Zooma ut ett steg</button>
+      <button id="homeBtn" type="button">Helheten</button>
+    </div>
+  </header>
+  <main class="stage">
+    <div class="viewport" id="vp">
+      <canvas id="cv" aria-label="Zoombar karta över Claudes delar"></canvas>
+      <div class="hint">Scrolla eller nyp för att zooma · dra för att flytta · klicka på en del för att gå in i den</div>
+      <div class="hud">
+        <span class="zoom" id="zoomLbl">×1</span>
+        <button id="zin" type="button" aria-label="Zooma in">+</button>
+        <button id="zout" type="button" aria-label="Zooma ut">−</button>
+      </div>
+      <div class="tip" id="tip" hidden></div>
+      <div class="tourbar" id="tourbar" hidden>
+        <button id="tPrev" type="button" aria-label="Föregående steg">‹</button>
+        <span class="step" id="tStep">1/1</span>
+        <span class="cap" id="tCap"></span>
+        <button id="tNext" type="button" class="primary">Nästa ›</button>
+        <button id="tEnd" type="button" aria-label="Avsluta turen">✕</button>
+      </div>
+    </div>
+    <aside class="panel" id="panel" aria-live="polite"></aside>
+  </main>
+</div>
+
+<script>
+"use strict";
+/* ================= palette ================= */
+const BG = "#0f1517";
+const CATS = {
+  root:  ["#a9b6bd", "Hela modellen"],
+  ctx:   ["#cdb98c", "Indata"],
+  tok:   ["#d89d5e", "Tokenisering"],
+  emb:   ["#cc8463", "Inbäddning"],
+  stack: ["#7f9db2", "Transformer"],
+  res:   ["#d8b24a", "Residualström"],
+  feat:  ["#e3c766", "Tolkning"],
+  attn:  ["#4fb3aa", "Uppmärksamhet"],
+  mlp:   ["#c77a9b", "MLP"],
+  norm:  ["#8e9aa6", "Normalisering"],
+  out:   ["#9d8bd2", "Utdata"],
+  samp:  ["#b9a0e3", "Sampling"],
+  cache: ["#6896db", "Minne"],
+  train: ["#9fbb66", "Träning"],
+  math:  ["#62b6d2", "Matematik"],
+  num:   ["#d6ab5e", "Tal och bitar"],
+  hw:    ["#a6b0ba", "Hårdvara"],
+  gate:  ["#93c0a4", "Logik"],
+  xtor:  ["#a3aab0", "Transistor"],
+  diff:  ["#7fb069", "Transistor"],
+  poly:  ["#d3655b", "Transistor"],
+  oxide: ["#cfc7a8", "Transistor"],
+  chan:  ["#e0bb4e", "Transistor"],
+};
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const mixc = (a, b, t) => { const A = hex(a), B = hex(b); return "rgb(" + A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(",") + ")"; };
+const PAL = {};
+for (const k in CATS) {
+  const c = CATS[k][0];
+  PAL[k] = { c, f0: mixc(BG, c, 0.11), f1: mixc(BG, c, 0.19), b: mixc(BG, c, 0.72), t: mixc(c, "#ffffff", 0.25), dim: mixc(BG, c, 0.45) };
+}
+const FC = '"IBM Plex Sans Condensed", "Arial Narrow", sans-serif';
+const FM = '"IBM Plex Mono", ui-monospace, monospace';
+const FS = '"IBM Plex Sans", system-ui, sans-serif';
+
+/* ================= model of the map ================= */
+let SEED = 1;
+function N(name, cat, sub, body, o = {}) { return Object.assign({ name, cat, sub, body, kids: [], links: null }, o); }
+function K(n, r, o = {}) { return Object.assign({ n, r, seed: SEED++ }, o); }
+function grid(n, cols, rows, area, make, g = 0.1, bottomUp = false) {
+  const out = [], cw = area[2] / cols, ch = area[3] / rows;
+  for (let i = 0; i < n; i++) {
+    const c = i % cols, r0 = Math.floor(i / cols), r = bottomUp ? rows - 1 - r0 : r0;
+    out.push(make(i, [area[0] + c * cw + cw * g / 2, area[1] + r * ch + ch * g / 2, cw * (1 - g), ch * (1 - g)]));
+  }
+  return out;
+}
+
+/* ---- transistor level ---- */
+const tSource = N("Source", "diff", "Där elektronerna kommer in", [
+  "Ett dopat område i kislet som är kopplat till ena sidan av strömbrytaren. Härifrån flyttar sig elektronerna över till drain när kanalen är öppen."]);
+const tDrain = N("Drain", "diff", "Där elektronerna lämnar", [
+  "Motsvarande område på andra sidan. Spänningsskillnaden mellan source och drain driver strömmen när transistorn leder."]);
+const tGate = N("Gate (styret)", "poly", "Den del som slår av och på", [
+  "En elektrod ovanför kanalen. Lägger man spänning här dras laddningar till ytan under den och en ledande bana bildas. Ingen spänning: banan försvinner och strömmen stängs av.",
+  "Det är hela tricket bakom all digital elektronik, AI inräknad: en spänning styr en annan ström."]);
+const tOxide = N("Gateoxid", "oxide", "Isolerande skikt, några atomlager tjockt", [
+  "Ett mycket tunt isolerande lager mellan styret och kislet. Det låter styret påverka kanalen med sitt elektriska fält utan att någon ström läcker igenom."]);
+const tChan = N("Kanal", "chan", "Här bildas den ledande banan", [
+  "Området i kislet precis under styret. När styret har spänning blir det ledande och transistorn är 'på' (en 1:a). Annars är det isolerande (en 0:a)."]);
+const Transistor = N("Transistor (MOSFET)", "xtor", "En elektriskt styrd strömbrytare", [
+  "Botten på kartan. Spänning på styret skapar en ledande kanal mellan source och drain och strömmen går. Utan spänning är den avstängd. På och av blir 1 och 0.",
+  "Det finns ingen särskild 'AI-transistor'. Det är exakt samma komponent som i din dators processor, bara ordnad för att multiplicera tal väldigt många gånger parallellt.",
+  "Ritningen är ett förenklat tvärsnitt av en plan transistor. Moderna chip använder 3D-varianter (FinFET och gate-all-around) men principen är densamma."], {
+  cpu: "Samma transistor som i en vanlig CPU. Här möts AI och vanlig dator helt.",
+  facts: [["Storlek", "detaljer på några nanometer"], ["NVIDIA H100", "80 miljarder transistorer"], ["NVIDIA B200", "208 miljarder transistorer"], ["Kopplar", "miljarder gånger per sekund"]],
+  draw: "substrate",
+});
+Transistor.kids = [K(tGate, [0.30, 0.02, 0.40, 0.26]), K(tOxide, [0.30, 0.31, 0.40, 0.09]), K(tSource, [0.0, 0.46, 0.27, 0.44]), K(tChan, [0.30, 0.46, 0.40, 0.18]), K(tDrain, [0.73, 0.46, 0.27, 0.44])];
+
+/* ---- logic gate ---- */
+const Truth = N("Sanningstabell", "gate", "NAND: 0 bara när båda ingångarna är 1", [
+  "A=0 B=0 → 1, A=0 B=1 → 1, A=1 B=0 → 1, A=1 B=1 → 0."], { draw: "table" });
+const Gate = N("Logikgrind (NAND)", "gate", "Fyra transistorer som gör logik", [
+  "Det minsta logiska byggblocket. NAND ger 0 bara när båda ingångarna är 1. Alla andra funktioner, AND, XOR, adderare och hela multiplikatorer, kan byggas av enbart NAND-grindar.",
+  "En CMOS-NAND har fyra transistorer: två PMOS parallellt mot matningsspänningen och två NMOS i serie mot jord. Klicka på en av dem för att se transistorn."], {
+  cpu: "Identisk med grindarna i en CPU.",
+  facts: [["Transistorer", "4"], ["Funktion", "Y = ¬(A ∧ B)"]],
+});
+Gate.kids = [
+  K(Transistor, [0, 0, 0.3, 0.45], { label: "PMOS 1" }), K(Transistor, [0.34, 0, 0.3, 0.45], { label: "PMOS 2" }),
+  K(Transistor, [0, 0.55, 0.3, 0.45], { label: "NMOS 1" }), K(Transistor, [0.34, 0.55, 0.3, 0.45], { label: "NMOS 2" }),
+  K(Truth, [0.70, 0, 0.30, 1])];
+
+/* ---- MAC unit ---- */
+const Multiplier = N("Multiplikator", "gate", "a · b med grindar", [
+  "Multiplicerar två tal genom att bilda delprodukter bit för bit (med AND) och summera dem i ett träd av adderare. För flyttal multipliceras mantissorna och exponenterna adderas."]);
+Multiplier.kids = grid(16, 4, 4, [0, 0, 1, 1], (i, r) => K(Gate, r, { label: "Grind " + (i + 1) }));
+const Adder = N("Adderare", "gate", "Lägger till delsumman", [
+  "Summerar två tal bit för bit med minnessiffra (carry). En heladderare är några XOR-, AND- och OR-grindar, som i sin tur kan byggas av NAND."]);
+Adder.kids = grid(8, 2, 4, [0, 0, 1, 1], (i, r) => K(Gate, r, { label: "Grind " + (i + 1) }));
+const Register = N("Ackumulatorregister", "gate", "Håller delsumman", [
+  "Sparar summan mellan varven: summa ← summa + a·b. Byggt av vippor, som är grindar kopplade i en slinga så att de minns en bit."], { draw: "sym", sym: "Σ" });
+const MAC = N("MAC-enhet", "hw", "Multiplicera och addera: a · b + c", [
+  "Hårdvarublocket som gör allt jobb i en AI: ta två tal, multiplicera dem och lägg till en löpande summa.",
+  "Ett AI-chip har tiotusentals sådana som arbetar i takt, ofta i ett rutnät (en systolisk matris) där tal pumpas igenom från två håll och delsummor vandrar vidare till grannen."], {
+  cpu: "Samma FMA-instruktion (fused multiply-add) som CPU:ns flyttalsenhet har, men i tusentals exemplar.",
+  facts: [["Operation", "c ← c + a·b"], ["Per klockcykel", "1 per enhet"]],
+  links: [[0, 1], [1, 2]],
+});
+MAC.kids = [K(Multiplier, [0, 0, 0.46, 1]), K(Adder, [0.51, 0, 0.27, 1]), K(Register, [0.83, 0, 0.17, 1])];
+
+/* ---- bits and memory ---- */
+const Capacitor = N("Kondensator", "num", "Håller en liten laddning", [
+  "Laddad betyder 1, urladdad betyder 0. Laddningen läcker sakta, så minnet måste läsas och skrivas om (uppdateras) många gånger per sekund. Det är det D:et i DRAM står för: dynamiskt."], { draw: "cap" });
+const Bit = N("En bit", "num", "0 eller 1, lagrad i en minnescell", [
+  "Det minsta som går att lagra. I acceleratorns minne (HBM, en sorts DRAM) är en bit en laddning i en liten kondensator, med en transistor som grind för att läsa och skriva den.",
+  "Det är alltså samma sorts minnescell som i datorns RAM."], {
+  cpu: "Precis som RAM i en vanlig dator: en transistor och en kondensator per bit.",
+  facts: [["DRAM-cell", "1 transistor + 1 kondensator"]],
+});
+Bit.kids = [K(Transistor, [0, 0, 0.5, 1], { label: "Åtkomsttransistor" }), K(Capacitor, [0.55, 0, 0.45, 1])];
+
+const WBITS = { s: [1], e: [0, 1, 1, 1, 1, 0, 0, 1], m: [0, 1, 0, 1, 1, 1, 0] };
+const SignG = N("Teckenbit", "num", "1 = negativt tal", ["En bit som säger om talet är positivt eller negativt. Här 1: vikten är negativ."]);
+SignG.kids = [K(Bit, [0, 0, 1, 1], { label: "Teckenbit", glyph: "1" })];
+const ExpG = N("Exponent (8 bitar)", "num", "Talets storleksordning", [
+  "Säger var decimalkommat hamnar, som tiopotensen i 2,13 · 10⁻², fast i basen 2. Här 01111001 = 121, och 121 − 127 = −6, alltså × 2⁻⁶."]);
+ExpG.kids = grid(8, 8, 1, [0, 0, 1, 1], (i, r) => K(Bit, r, { label: "Exponentbit " + (7 - i), glyph: String(WBITS.e[i]) }), 0.12);
+const ManG = N("Mantissa (7 bitar)", "num", "Talets siffror", [
+  "De signifikanta siffrorna. Med en underförstådd etta framför blir 1,0101110 i binärt ungefär 1,36. Och 1,36 × 2⁻⁶ ≈ 0,0213."]);
+ManG.kids = grid(7, 7, 1, [0, 0, 1, 1], (i, r) => K(Bit, r, { label: "Mantissabit " + (6 - i), glyph: String(WBITS.m[i]) }), 0.12);
+const WMem = N("Var vikten bor", "cache", "I HBM-minnet bredvid beräkningschipet", [
+  "Alla vikter ligger i acceleratorns högbandbreddsminne. För varje nytt token måste i princip alla vikter läsas därifrån, så minnets hastighet sätter ofta taket för hur fort Claude skriver."]);
+const Weight = N("En vikt (parameter)", "num", "Ett enda inlärt tal, här −0,0213", [
+  "Ett tal. Claude har miljarder sådana, och tillsammans är de allt modellen kan. Det finns inga regler eller faktarader någonstans, bara de här talen.",
+  "Under träningen justeras varje vikt en liten aning, miljontals gånger, åt det håll som gör förutsägelserna bättre.",
+  "Vikter lagras ofta i 16-bitarsformatet bfloat16: 1 teckenbit, 8 exponentbitar och 7 mantissabitar. Vid körning komprimeras de ibland till 8 eller 4 bitar. Vilket format Claude använder är inte offentligt; exemplet visar bfloat16."], {
+  cpu: "Ett ord i minnet. Samma bitar, samma minne som i en vanlig dator.",
+  facts: [["Exempelvärde", "−0,0213"], ["bfloat16", "1 10111100 1 0101110"], ["Bitar", "16 (2 byte)"]],
+});
+Weight.kids = [K(SignG, [0, 0, 0.09, 0.56]), K(ExpG, [0.12, 0, 0.47, 0.56]), K(ManG, [0.62, 0, 0.38, 0.56]), K(WMem, [0, 0.66, 1, 0.34])];
+
+/* ---- dot product and matrix multiply ---- */
+const InVec = N("Indatavektor", "math", "Tokenens tal just nu", [
+  "Tokenens aktuella vektor efter normalisering. Samma vektor multipliceras mot varje rad vikter i matrisen."], { draw: "vector" });
+const SumOut = N("Utdata", "math", "Ett enda tal", [
+  "Resultatet av skalärprodukten: ett tal i nästa vektor. En matrismultiplikation producerar tusentals sådana på en gång."], { draw: "sym", sym: "y" });
+const Dot = N("Skalärprodukt", "math", "y = w₁x₁ + w₂x₂ + … + wₙxₙ", [
+  "Den minsta meningsfulla beräkningen: multiplicera varje indatatal med sin vikt och summera. Det är precis vad en artificiell 'neuron' gör.",
+  "Vikterna (w) är det modellen har lärt sig. Indata (x) är tokenens nuvarande vektor. I verkligheten är n tusentals tal långt; här visas 8.",
+  "I hårdvaran görs summan av MAC-enheter som tar en multiplikation och en addition per klockslag."], {
+  cpu: "En loop av FMA-instruktioner: c = c + w·x, om och om igen.",
+  facts: [["Längd i stora modeller", "tusentals termer"], ["Operationer", "1 multiplikation + 1 addition per term"]],
+});
+Dot.kids = [
+  K(InVec, [0, 0, 1, 0.2]),
+  ...grid(8, 8, 1, [0, 0.26, 1, 0.24], (i, r) => K(Weight, r, { label: "w" + (i + 1) }), 0.1),
+  ...grid(4, 4, 1, [0, 0.56, 0.82, 0.44], (i, r) => K(MAC, r, { label: "MAC " + (i + 1) }), 0.1),
+  K(SumOut, [0.85, 0.56, 0.15, 0.44])];
+
+const Matmul = N("Matrismultiplikation", "math", "Den verkliga arbetshästen", [
+  "Nästan all beräkning i Claude är matrismultiplikation: tokenvektorer gånger en viktmatris. Varje ruta här är en skalärprodukt mellan indata och en rad vikter, och ger ett tal i utdata.",
+  "En enda matris i en stor modell kan ha tiotals miljoner vikter. Det är därför AI körs på GPU:er och TPU:er: de är byggda för att göra tusentals multiplikationer samtidigt."], {
+  cpu: "En SIMD- eller vektorenhet: samma operation på väldigt många tal samtidigt.",
+  facts: [["Exempel", "8 192 × 8 192 matris"], ["Vikter i den", "≈ 67 miljoner"], ["Multiplikationer per token", "≈ 67 miljoner"]],
+});
+Matmul.kids = grid(36, 6, 6, [0, 0, 1, 1], (i, r) => K(Dot, r, { label: "Skalärprodukt " + (i + 1) }), 0.12);
+
+/* ---- hardware ---- */
+const TensorCore = N("Tensorkärna", "hw", "Ett block med MAC-enheter i rutnät", [
+  "En hårdkopplad enhet som multiplicerar små matrisblock i ett svep: många MAC-enheter i ett rutnät som tar emot tal från sidan och ovanifrån samtidigt.",
+  "I Googles TPU heter motsvarigheten MXU och är en systolisk matris med 128 × 128 MAC-enheter (256 × 256 i nyare generationer). Här visas 16."], {
+  cpu: "En specialiserad exekveringsenhet, som en FPU, fast för hela matrisblock.",
+  facts: [["TPU MXU", "128×128 = 16 384 MAC"]],
+});
+TensorCore.kids = grid(16, 4, 4, [0, 0, 1, 1], (i, r) => K(MAC, r, { label: "MAC " + (i + 1) }), 0.12);
+const HBM = N("HBM-minne", "cache", "Staplade minneschip bredvid processorn", [
+  "High Bandwidth Memory: DRAM-chip staplade på höjden, kopplade till beräkningschipet med tusentals ledningar. Här ligger vikterna och KV-cachen.",
+  "Ett modernt AI-chip har ungefär 80–200 GB HBM med flera terabyte per sekund i bandbredd."], {
+  cpu: "Datorns RAM, men flyttat direkt intill processorn och gjort mycket bredare.",
+  facts: [["Kapacitet", "≈ 80–200 GB per chip"], ["Bandbredd", "flera TB/s"]],
+});
+HBM.kids = grid(16, 2, 8, [0, 0, 1, 1], (i, r) => K(Bit, r, { label: "Bit " + (i + 1), glyph: String((i * 7 + 3) % 3 ? 1 : 0) }), 0.14);
+const Links = N("Chip-till-chip-länkar", "hw", "Snabba förbindelser mellan chip", [
+  "Modellen är för stor för ett chip. Vikterna delas därför upp, och chippen skickar delresultat till varandra flera gånger för varje token via snabba länkar."]);
+const Chip = N("AI-acceleratorchip", "hw", "Ett chip byggt för matrismultiplikation", [
+  "Tensorkärnor i mitten, staplat minne (HBM) runt om och snabba länkar till andra chip.",
+  "När Claude skriver text är flaskhalsen ofta inte räknandet utan att hämta alla vikter från minnet för varje token. Därför behandlas många användares förfrågningar samtidigt: vikterna läses en gång och används för allas tokens."], {
+  cpu: "Som en processor med hundratals kärnor, där varje kärna bara kan en sak: multiplicera matriser.",
+  facts: [["Transistorer", "≈ 100–200 miljarder"]],
+});
+Chip.kids = [
+  K(HBM, [0, 0, 0.11, 0.47], { label: "HBM 1" }), K(HBM, [0, 0.53, 0.11, 0.47], { label: "HBM 2" }),
+  K(HBM, [0.89, 0, 0.11, 0.47], { label: "HBM 3" }), K(HBM, [0.89, 0.53, 0.11, 0.47], { label: "HBM 4" }),
+  ...grid(12, 4, 3, [0.15, 0, 0.70, 0.80], (i, r) => K(TensorCore, r, { label: "Tensorkärna " + (i + 1) }), 0.1),
+  K(Links, [0.15, 0.85, 0.70, 0.15])];
+const Hardware = N("Hårdvaran", "hw", "Där talen faktiskt räknas", [
+  "Claude körs i datacenter på tusentals AI-acceleratorer. Anthropic har berättat att de använder flera sorters chip: Googles TPU:er, Amazons Trainium och NVIDIAs GPU:er.",
+  "Allt på resten av kartan är matematik. Det här är var den matematiken blir elektricitet. Zooma in i ett chip, en tensorkärna och en MAC-enhet så hamnar du till slut på samma transistorer som du når via vikterna."], {
+  cpu: "Det här är bokstavligen chip, och de liknar en CPU mer än man tror.",
+  facts: [["Antal chip per modellkopia", "många, inte offentligt"]],
+});
+Hardware.kids = grid(8, 4, 2, [0, 0, 1, 1], (i, r) => K(Chip, r, { label: "Accelerator " + (i + 1) }), 0.1);
+
+/* ---- normalisation and residual ---- */
+const Norm = N("Normalisering", "norm", "Håller talen i rätt skala", [
+  "Skalar om vektorn så att dess storlek hålls stabil: dela med kvadratroten ur medelvärdet av talens kvadrater (RMSNorm) och multiplicera med inlärda vikter.",
+  "Utan det skulle talen växa eller krympa okontrollerat genom alla lager. RMSNorm är vanligast i moderna modeller; exakt variant i Claude är inte offentlig."], {
+  cpu: "En spänningsregulator: håller signalnivån inom rätt område.", draw: "sym", sym: "‖x‖",
+  facts: [["Formel", "x / √(medel(x²)) · g"]],
+});
+const Add = N("Residual-addition", "res", "x_ny = x + resultat", [
+  "Blockets resultat läggs till residualströmmen i stället för att ersätta den. Det gör att väldigt djupa nät går att träna: information och gradienter kan flöda rakt igenom alla lager."], {
+  cpu: "En adderare som skriver tillbaka till registret.", draw: "sym", sym: "+",
+});
+const Residual = N("Residualströmmen", "res", "Huvudbussen som allt läser från och skriver till", [
+  "En vektor per token, i stora modeller tusentals tal lång, som går genom hela stacken. Varje uppmärksamhets- och MLP-block läser från den, räknar och adderar sitt resultat tillbaka.",
+  "Inget skrivs över. Därför kan något som räknades fram i lager 2 fortfarande användas i lager 40.",
+  "Interpretabilitetsforskare beskriver strömmen som en gemensam arbetsyta där begrepp ligger som riktningar."], {
+  cpu: "Databussen: den gemensamma ledningen alla enheter läser från och skriver till.", draw: "bus",
+  facts: [["Bredd", "tusentals tal per token"], ["Antal vektorer", "en per token i kontexten"]],
+});
+
+/* ---- attention ---- */
+const Scores = N("Poängmatris", "attn", "Vem tittar på vem", [
+  "Varje rad är ett token som tittar, varje kolumn ett token det tittar på. Poängen är q·k / √d: hur väl frågan matchar nyckeln. Ljusare ruta betyder högre poäng.",
+  "Den övre högra triangeln är tom. Det är den kausala masken: ett token får inte se tokens som kommer efter det."], { draw: "heat" });
+const ASoft = N("Softmax", "attn", "Poäng blir andelar som summerar till 1", [
+  "softmax(xᵢ) = eˣⁱ / Σ eˣʲ. Varje rad i poängmatrisen görs om till andelar mellan 0 och 1. Höga poäng förstärks, låga trycks ner mot noll."], { draw: "bars0" });
+const WSum = N("Viktad summa av V", "attn", "Hämta informationen", [
+  "Utdata = Σ andelⱼ · vⱼ. Huvudet blandar värdevektorerna enligt andelarna. Resultatet är den information huvudet hämtar till sin position, till exempel 'subjektet i meningen är Lisa'."], { draw: "sym", sym: "Σ" });
+const Head = N("Uppmärksamhetshuvud", "attn", "En enskild sök-och-hämta-enhet", [
+  "Huvudet gör tre projektioner av varje token: en fråga Q, en nyckel K och ett värde V. Var och en är en matrismultiplikation till en kortare vektor, ofta 128 tal.",
+  "Frågan jämförs med alla tidigare nycklar, poängen görs om till andelar med softmax och används för att blanda värdena. Hela huvudet i en rad: softmax(QKᵀ / √d) · V.",
+  "Olika huvuden lär sig olika jobb. Forskare har till exempel hittat 'induktionshuvuden' som letar upp var ett mönster förekom tidigare och kopierar det som kom efter."], {
+  cpu: "En associativ minnessökning: sök på innehåll i stället för adress och få en viktad blandning av träffarna.",
+  facts: [["Formel", "softmax(QKᵀ/√d)·V"], ["Typisk huvudbredd", "128"]],
+  links: [[0, 3], [1, 3], [3, 4], [2, 5], [4, 5]],
+});
+Head.kids = [
+  K(Matmul, [0, 0, 0.30, 0.22], { label: "Q-projektion", note: "Frågan: vad letar den här positionen efter?" }),
+  K(Matmul, [0.35, 0, 0.30, 0.22], { label: "K-projektion", note: "Nyckeln: vad har den här positionen att erbjuda?" }),
+  K(Matmul, [0.70, 0, 0.30, 0.22], { label: "V-projektion", note: "Värdet: vad lämnas vidare om positionen väljs?" }),
+  K(Scores, [0, 0.29, 0.64, 0.42]), K(ASoft, [0, 0.77, 0.64, 0.23]), K(WSum, [0.70, 0.29, 0.30, 0.71])];
+const Mask = N("Kausal mask", "attn", "Ingen får titta framåt", [
+  "Under träningen ser modellen hela texten på en gång. Masken sätter poängen för alla senare positioner till −∞, så att varje token bara kan använda det som står före. Det är därför modellen kan skriva från vänster till höger."], { draw: "tri" });
+const OutProj = N("Sammanfogning och utprojektion", "attn", "Huvudenas resultat blandas", [
+  "Alla huvudens resultat ställs efter varandra och multipliceras med en sista matris (W_O) som blandar dem och ger en vektor i residualströmmens storlek."], { draw: "sym", sym: "W_O" });
+const Attention = N("Uppmärksamhet", "attn", "Tokens hämtar information från varandra", [
+  "Här får varje token hämta information från tidigare tokens. Det är den enda delen av modellen där positioner pratar med varandra.",
+  "Arbetet görs i många parallella huvuden som specialiserar sig: ett följer grammatiken, ett letar upp namn, ett kopierar mönster. Här ritas 16.",
+  "Många moderna modeller låter flera frågehuvuden dela samma K och V (grouped-query attention) för att spara minne. Claudes exakta upplägg är inte offentligt."], {
+  cpu: "Som en innehållsadresserad cache (CAM): sök på innehåll i stället för adress.",
+  facts: [["Huvuden per lager", "tiotals"], ["Kostnad", "växer med kontextens längd"]],
+});
+Attention.kids = [
+  ...grid(16, 8, 2, [0, 0, 0.80, 1], (i, r) => K(Head, r, { label: "Huvud " + (i + 1) }), 0.1),
+  K(Mask, [0.83, 0, 0.17, 0.46]), K(OutProj, [0.83, 0.54, 0.17, 0.46])];
+
+/* ---- MLP ---- */
+const Act = N("Aktiveringsfunktion", "mlp", "Den icke-linjära knycken", [
+  "Den enda icke-linjära delen. Utan den skulle alla lager tillsammans kollapsa till en enda matrismultiplikation, och modellen skulle bara kunna lära sig raka samband.",
+  "GELU och SwiGLU är vanliga. SwiGLU multiplicerar två projektioner där den ena först passerar en mjuk grind, x · sigmoid(x), som visas i kurvan."], {
+  cpu: "En tröskel: släpp igenom eller inte, fast mjukt.", draw: "curve",
+});
+const Neurons = N("Dolda neuroner", "mlp", "Mellanlagret, tiotusentals tal per token", [
+  "Varje tal här är en 'neuron': en skalärprodukt mellan tokenvektorn och en rad vikter, följd av aktiveringen.",
+  "Enskilda neuroner betyder sällan bara en sak. En och samma neuron kan reagera på både akademiska citat, koreanska och HTTP-begäranden. Det kallas polysemanti, och är skälet till att forskningen letar efter features i stället."]);
+Neurons.kids = grid(24, 4, 6, [0, 0, 1, 1], (i, r) => K(Dot, r, { label: "Neuron " + (i + 1) }), 0.14);
+const MLP = N("MLP", "mlp", "Varje token bearbetas för sig", [
+  "En tvåstegsomvandling: vektorn projiceras upp till en ungefär fyra gånger bredare mellanrepresentation, passerar aktiveringsfunktionen och projiceras ner igen.",
+  "Det mesta av modellens parametrar sitter här. Forskning tyder på att MLP-lagren delvis fungerar som ett minne för fakta: 'Eiffeltornet ligger i …' → 'Paris'.",
+  "Vissa modeller byter MLP:n mot många 'experter' där bara några används per token (mixture of experts). Om Claude gör det är inte offentligt."], {
+  cpu: "ALU:n: där själva räknandet på varje datavärde sker.",
+  facts: [["Uppskalning", "≈ 4× bredare"], ["Andel av parametrarna", "ungefär två tredjedelar"]],
+  links: [[0, 1], [1, 2], [2, 3]],
+});
+MLP.kids = [
+  K(Matmul, [0, 0, 0.28, 1], { label: "Upp-projektion", note: "Vektorn blir ungefär fyra gånger bredare." }),
+  K(Act, [0.31, 0, 0.14, 1]), K(Neurons, [0.48, 0, 0.22, 1]),
+  K(Matmul, [0.73, 0, 0.27, 1], { label: "Ner-projektion", note: "Tillbaka till residualströmmens bredd, redo att adderas." })];
+
+/* ---- layer and stack ---- */
+const Layer = N("Transformerlager", "stack", "Uppmärksamhet + MLP, med tillägg till strömmen", [
+  "Ett lager har två delar. Uppmärksamheten flyttar information mellan positioner. MLP:n bearbetar varje position för sig.",
+  "Före varje del normaliseras vektorn. Efter varje del adderas resultatet tillbaka till residualströmmen. Alla lager ser ut så här, men vart och ett har sina egna vikter."], {
+  cpu: "Ett pipelinesteg: hämta (normalisera), räkna (uppmärksamhet eller MLP), skriv tillbaka (addera).",
+  links: [[1, 2], [2, 3], [4, 5], [5, 6]],
+});
+Layer.kids = [
+  K(Residual, [0, 0, 0.05, 1], { label: "Residualströmmen (lokalt)" }),
+  K(Norm, [0.08, 0, 0.08, 0.44]), K(Attention, [0.19, 0, 0.66, 0.44]), K(Add, [0.88, 0, 0.12, 0.44]),
+  K(Norm, [0.08, 0.56, 0.08, 0.44]), K(MLP, [0.19, 0.56, 0.66, 0.44]), K(Add, [0.88, 0.56, 0.12, 0.44])];
+
+const fGG = N("Golden Gate-bron", "feat", "En feature man kan vrida upp", [
+  "2024 kartlade Anthropic miljontals features i Claude 3 Sonnet. En av dem aktiverades av Golden Gate-bron, oavsett om den nämndes på engelska, japanska eller visades på bild.",
+  "När forskarna förstärkte den artificiellt började modellen nämna bron i nästan alla svar, och påstod till och med att den själv var bron. Det visade att featuren faktiskt styr beteendet."]);
+const fRhyme = N("Planerar rim i förväg", "feat", "Tänker framåt innan det skriver", [
+  "2025 spårade Anthropic interna beräkningar i Claude 3.5 Haiku. När modellen skrev en rimmande versrad valde den rimordet ('rabbit') innan raden började, och byggde sedan raden fram mot det.",
+  "Modellen skriver ett token i taget, men den planerar alltså längre än så."]);
+const fHop = N("Flerstegsresonemang", "feat", "Dallas → Texas → Austin", [
+  "Frågan 'Huvudstaden i delstaten där Dallas ligger?' löses i två steg inne i modellen: först aktiveras en feature för Texas, och den används sedan för att få fram Austin. Det går att se, och att ändra: byter man Texas mot Kalifornien blir svaret Sacramento."]);
+const fLang = N("Delade begrepp mellan språk", "feat", "Samma begrepp på svenska och engelska", [
+  "Begrepp som 'liten' eller 'motsatsen till' har till stor del samma features oavsett språk, med språkspecifika delar mest vid in- och utgången. Därför kan något modellen lärt sig på ett språk användas på ett annat."]);
+const fSup = N("Superposition", "feat", "Fler begrepp än dimensioner", [
+  "Modellen behöver representera fler begrepp än residualströmmen har tal. Den löser det genom att låta begrepp dela dimensioner, nästan vinkelräta mot varandra. Det kallas superposition och gör enskilda neuroner svårtolkade."]);
+const Features = N("Features och kretsar", "feat", "Vad talen betyder", [
+  "Anthropics interpretabilitetsforskning försöker läsa av vad som händer inuti. Begrepp visar sig ligga som riktningar i residualströmmen, så kallade features.",
+  "Kretsar är features i olika lager som kopplar till varandra och tillsammans utför ett delsteg i ett resonemang. Det här är det närmaste man kommer att se Claude 'tänka'."], {
+  cpu: "Som att förstå vad mikrokoden gör, inte bara se ledningarna på chippet.",
+  facts: [["Features i Claude 3 Sonnet", "miljontals hittade (2024)"], ["Kretsar spårade i", "Claude 3.5 Haiku (2025)"]],
+});
+Features.kids = grid(5, 5, 1, [0, 0, 1, 1], (i, r) => K([fGG, fRhyme, fHop, fLang, fSup][i], r), 0.06);
+
+const Stack = N("Transformer-stacken", "stack", "Dussintals likadana lager på rad", [
+  "Här sker nästan allt arbete. Varje tokenvektor passerar lager efter lager, nerifrån och upp. Lagren skriver inte över varandra; vart och ett läser från och adderar till residualströmmen.",
+  "Tidiga lager hanterar ofta ytliga saker som stavning och grammatik, mellanlagren abstrakta begrepp och de sena lagren vad som ska sägas härnäst.",
+  "Här ritas 32 lager. Det verkliga antalet i Claude är inte offentligt; stora modeller har ofta mellan 60 och 120."], {
+  cpu: "Kärnor kopplade i serie: samma krets upprepad, där varje steg förfinar resultatet från det förra.",
+  facts: [["Lager (ritade)", "32"], ["Lager (verkligt)", "inte offentligt"]],
+});
+Stack.kids = [
+  K(Residual, [0, 0, 0.06, 1]),
+  ...grid(32, 4, 8, [0.09, 0, 0.91, 0.80], (i, r) => K(Layer, r, { label: "Lager " + (i + 1) }), 0.08, true),
+  K(Features, [0.09, 0.84, 0.91, 0.16])];
+
+/* ---- input side ---- */
+const leaf = (name, cat, sub, body, o) => N(name, cat, sub, body, o);
+const Context = N("Kontextfönstret", "ctx", "Allt Claude ser just nu", [
+  "Modellen har inget minne mellan anrop utöver det som står här. Systeminstruktioner, hela konversationen, bifogade filer, verktygssvar och svaret hittills läggs i en enda lång rad av tokens.",
+  "Allt Claude 'vet' om just ditt samtal finns i den här texten. Det andra den vet finns inbakat i vikterna."], {
+  cpu: "Arbetsminnet som programmet läser från. Det som inte ligger här finns inte för modellen.",
+  facts: [["Storlek", "hundratusentals tokens"], ["Standard för många Claude-modeller", "200 000 tokens"]],
+});
+Context.kids = [
+  K(leaf("Systemprompt", "ctx", "Instruktioner före samtalet", ["Text som sätts in först: vem modellen är, vilka verktyg den har, vilket datum det är. Den läses precis som all annan text."]), [0, 0, 1, 0.22]),
+  K(leaf("Konversationen hittills", "ctx", "Alla tidigare meddelanden", ["Varje tidigare fråga och svar skickas med igen vid varje nytt svar. Det är så modellen 'minns' samtalet."]), [0, 0.26, 1, 0.22]),
+  K(leaf("Ditt meddelande", "ctx", "\"Hur fungerar en AI?\"", ["Det du just skrev. Det blir de sista tokens före svaret."]), [0, 0.52, 1, 0.22]),
+  K(leaf("Svaret hittills", "ctx", "Växer ett token i taget", ["Varje token Claude skriver läggs till här och blir indata för nästa steg."]), [0, 0.78, 1, 0.22])];
+
+const Vocab = leaf("Ordförrådet", "tok", "En fast lista med alla tokens", [
+  "Alla tokens modellen känner till, bestämt innan träningen. Moderna modeller har ofta runt 100 000–200 000 poster. Allt som går att skriva, även emoji och kod, kan uttryckas med dem, i värsta fall byte för byte.",
+  "Listan byggs ofta med byte-pair encoding: de vanligaste teckenparen i en stor textmängd slås ihop, steg för steg, tills ordförrådet är fullt."]);
+const Token = N("Token", "tok", "Den minsta enheten modellen läser", [
+  "Ett token är ett ord, en orddel eller ett tecken. Efter tokeniseraren finns inga bokstäver kvar, bara ID-nummer. Det enda som skickas vidare är heltalet.",
+  "Delningen och ID-numren i exemplet är påhittade för att illustrera. Svenska ord delas oftare än engelska i flera bitar, eftersom ordförrådet mest byggts på engelsk text."], { draw: "token" });
+const Tokenizer = N("Tokeniseraren", "tok", "Text blir heltal", [
+  "Modellen räknar inte med bokstäver utan med tokens: vanliga ord, orddelar och skiljetecken. Tokeniseraren delar texten i bitar och ger varje bit sitt nummer i ordförrådet.",
+  "Därför kan språkmodeller ha svårt att räkna bokstäver i ett ord: de ser aldrig bokstäverna, bara bitarna."], {
+  cpu: "Instruktionsavkodaren: översätter det du skriver till det format beräkningsenheterna förstår.",
+});
+const TOKS = [["Hur", 9210], [" fung", 31877], ["erar", 4417], [" en", 662], [" AI", 15592], ["?", 30]];
+Tokenizer.kids = [K(Vocab, [0, 0, 1, 0.26]), ...grid(6, 3, 2, [0, 0.33, 1, 0.67], (i, r) => K(Token, r, { label: "Token “" + TOKS[i][0].replace(" ", "␣") + "”", glyph: TOKS[i][0], id: TOKS[i][1] }), 0.1)];
+
+const EmbTable = leaf("Inbäddningstabellen", "emb", "En rad tal per token", [
+  "En matris med en rad per token i ordförrådet. Raden för token-ID 31 877 blir startvektorn för ' fung'.",
+  "Raderna är inlärda så att tokens med liknande betydelse hamnar nära varandra: 'hund' nära 'katt', långt från 'skruvmejsel'."], { draw: "matrix" });
+const PosInfo = leaf("Positionsinformation", "emb", "Var i texten står ordet?", [
+  "Uppmärksamheten ser alla tokens som en mängd, så ordningen måste byggas in. Moderna modeller roterar ofta Q- och K-vektorerna med en vinkel som beror på positionen (RoPE), så att uppmärksamheten känner av avstånd mellan tokens. Exakt metod i Claude är inte offentlig."], { draw: "wave" });
+const Embedding = N("Inbäddning", "emb", "Heltal blir en vektor", [
+  "Varje token-ID slår upp en rad i en stor tabell: en lista med tusentals tal. Det är här ett ID blir en punkt i ett rum med tusentals dimensioner.",
+  "Den vektorn är tokenens startläge i residualströmmen, och lagren ovanför förfinar den."], {
+  cpu: "En uppslagstabell: adress in, ett långt dataord ut.",
+  facts: [["Tabellens storlek", "ordförråd × bredd"]],
+});
+Embedding.kids = [K(EmbTable, [0, 0, 1, 0.58]), K(PosInfo, [0, 0.66, 1, 0.34])];
+
+const Loop = leaf("Autoregressiv slinga", "samp", "Ett varv per token", [
+  "Det valda tokenet läggs till i texten och hela kedjan körs igen för nästa. Ett svar på 500 tokens är 500 varv genom hela modellen.",
+  "Tack vare KV-cachen behöver varje varv bara räkna på det nya tokenet, men alla vikter används ändå varje gång."], {
+  cpu: "Klockan: varje varv är en cykel som producerar ett token.", draw: "loop",
+});
+
+/* ---- output side ---- */
+const Logits = leaf("Logits", "out", "En råpoäng per möjligt token", [
+  "Ett tal för varje token i ordförrådet, ofta runt hundratusen tal. De kan vara negativa. Högre betyder att tokenet passar bättre som nästa."], { draw: "matrix", mx: [14, 2] });
+const Probs = leaf("Sannolikheter", "out", "Softmax över hela ordförrådet", [
+  "Softmax gör logits till sannolikheter som summerar till 1. Exemplet visar några tänkbara första tokens i ett svar på 'Hur fungerar en AI?'. Siffrorna är påhittade."], { draw: "bars" });
+const Output = N("Utdatahuvudet", "out", "Vektor blir en poäng per token", [
+  "Efter sista lagret normaliseras vektorn för den sista positionen och multipliceras med en matris som har en rad per token i ordförrådet (unembedding).",
+  "Ut kommer en sannolikhet för varje möjligt nästa token. Det är allt modellen faktiskt producerar: en fördelning, inte ett ord."], {
+  cpu: "Utgångssteget som översätter internt format tillbaka till något omvärlden förstår.",
+  links: [[0, 1], [1, 2], [2, 3]],
+});
+Output.kids = [K(Norm, [0, 0, 0.14, 1], { label: "Slutnormalisering" }), K(Matmul, [0.18, 0, 0.28, 1], { label: "Unembedding", note: "En rad vikter per token i ordförrådet." }), K(Logits, [0.50, 0, 0.14, 1]), K(Probs, [0.68, 0, 0.32, 1])];
+
+const Sampling = N("Sampling", "samp", "Ett token väljs", [
+  "Ur sannolikhetsfördelningen dras ett token. Därför kan samma fråga ge olika svar.",
+  "Temperaturen styr hur mycket chansning som tillåts, och top-p klipper bort den osannolika svansen innan dragningen."], {
+  cpu: "En slumpgenerator med viktade sannolikheter.", links: [[0, 1], [1, 2]],
+});
+Sampling.kids = [
+  K(leaf("Temperatur", "samp", "Hur djärvt valet blir", ["Logits delas med temperaturen före softmax. Låg temperatur gör fördelningen spetsig så det mest sannolika väljs nästan alltid. Hög gör den platt och ger mer variation."], { draw: "sym", sym: "T" }), [0, 0, 0.3, 1]),
+  K(leaf("Top-p", "samp", "Klipp bort svansen", ["Behåll bara de mest sannolika tokens tills deras sannolikheter tillsammans når p, till exempel 0,95. Resten kan inte väljas."], { draw: "sym", sym: "p" }), [0.35, 0, 0.3, 1]),
+  K(Token, [0.70, 0, 0.30, 1], { label: "Valt token “␣En”", glyph: " En", id: 1556 })];
+
+const KV = N("KV-cachen", "cache", "Sparade nycklar och värden", [
+  "När Claude skriver token nummer 501 behöver det inte räkna om K och V för de 500 tidigare. De sparas per lager och huvud, och varje nytt token räknar bara ut sina egna.",
+  "Därför kräver långa kontexter mycket minne, och därför gör prompt caching upprepade långa prompter snabbare och billigare: cachen för början av texten kan återanvändas."], {
+  cpu: "Cacheminnet: räkna inte om det du redan har räknat.",
+  facts: [["Växer med", "kontextlängd × lager × huvuden"]],
+});
+KV.kids = [K(leaf("K-cache", "cache", "Nycklar för alla tidigare tokens", ["En rad per tidigare token: det som frågor jämförs mot."], { draw: "matrix", mx: [8, 16] }), [0, 0, 0.48, 1]),
+  K(leaf("V-cache", "cache", "Värden för alla tidigare tokens", ["En rad per tidigare token: det som hämtas när ett token får uppmärksamhet."], { draw: "matrix", mx: [8, 16] }), [0.52, 0, 0.48, 1])];
+
+const Training = N("Träningen", "train", "Hur vikterna fick sina värden", [
+  "Allt annat på kartan är struktur. Det som gör Claude till Claude är värdena på vikterna, och de kommer från träning i flera steg.",
+  "När träningen är klar ändras vikterna inte längre. Claude lär sig inget av ett samtal; det enda som ändras är texten i kontextfönstret."], {
+  cpu: "Tillverkningen och mikrokoden: chippet ritas en gång, men vad det gör bestäms av vad som skrivs in.",
+});
+Training.kids = grid(4, 4, 1, [0, 0, 1, 1], (i, r) => K([
+  leaf("Förträning", "train", "Förutsäg nästa token, om och om igen", ["Modellen får enorma mängder text och tränas på en enda uppgift: gissa nästa token. Varje fel ger en signal som justerar vikterna. Det tar månader på tusentals chip och ger en modell som kan språk, fakta och mönster, men som ännu inte är en assistent."]),
+  leaf("Finjustering", "train", "Från textförutsägare till assistent", ["Modellen tränas vidare på samtal och med förstärkningsinlärning: svar bedöms, av människor eller av andra modeller, och vikterna knuffas mot de bättre svaren. Här lär den sig att vara hjälpsam, följa instruktioner och använda verktyg."]),
+  leaf("Konstitutionell AI", "train", "Principer i stället för bara exempel", ["Anthropics metod där modellen kritiserar och förbättrar sina egna svar utifrån en skriven uppsättning principer, en 'konstitution'. AI-bedömningar utifrån principerna används sedan i förstärkningsinlärningen."]),
+  leaf("Gradientnedstigning", "train", "Motorn i all träning", ["Förlusten, alltså hur fel förutsägelsen var, deriveras bakåt genom alla lager (backpropagation). Då får varje vikt veta åt vilket håll den ska ändras, och flyttas ett litet steg dit. Upprepa biljoner gånger."], { draw: "sym", sym: "∇" })][i], r), 0.06);
+
+const Root = N("Claude", "root", "En stor språkmodell, sedd som ett chip", [
+  "Claude är en stor språkmodell byggd på transformer-arkitekturen. Inuti finns inga regler och ingen databas med svar, utan ett enormt nät av tal (vikter) som gör om text till en sannolikhet för nästa bit text.",
+  "Varje gång Claude skriver ett token körs hela kedjan en gång: text → tokens → vektorer → många lager → sannolikheter → ett valt token. Sedan börjar det om med det nya tokenet tillagt.",
+  "Anthropic har inte publicerat Claudes exakta storlek eller uppbyggnad. Kartan visar den öppet kända transformerdesignen som sådana modeller bygger på, och antalet lager, huvuden och rutor är förenklat."], {
+  cpu: "Hela processorchippet: ingång, en lång pipeline av beräkningsenheter, cacheminne och en klocka. Klockslaget här är ett token.",
+  facts: [["Grundprincip", "förutsäg nästa token"], ["Arkitektur", "transformer"], ["Parametrar", "inte offentligt"], ["Djupast på kartan", "en transistor"]],
+  links: [[0, 1], [1, 2], [2, 4], [4, 5], [5, 6], [7, 4]],
+});
+Root.kids = [
+  K(Context, [0, 0, 0.16, 0.24]), K(Tokenizer, [0, 0.27, 0.16, 0.24]), K(Embedding, [0, 0.54, 0.16, 0.22]), K(Loop, [0, 0.79, 0.16, 0.21]),
+  K(Stack, [0.20, 0, 0.46, 1]),
+  K(Output, [0.70, 0, 0.30, 0.25]), K(Sampling, [0.70, 0.29, 0.30, 0.16]), K(KV, [0.70, 0.49, 0.30, 0.14]),
+  K(Training, [0.70, 0.67, 0.30, 0.15]), K(Hardware, [0.70, 0.85, 0.30, 0.15])];
+const ROOTE = { n: Root, r: [0, 0, 1, 1], seed: 0 };
+const ROOT_RECT = [0, 0, 1.6, 1];
+
+/* ================= geometry ================= */
+function inner(x, y, w, h) {
+  const m = Math.min(w, h), px = m * 0.05, head = Math.min(h * 0.14, m * 0.22), pb = m * 0.05;
+  return { x: x + px, y: y + head, w: w - 2 * px, h: h - head - pb, head, px, m };
+}
+const childRect = (L, r) => [L.x + r[0] * L.w, L.y + r[1] * L.h, r[2] * L.w, r[3] * L.h];
+function entryAt(path) { let e = ROOTE; for (const i of path) e = e.n.kids[i]; return e; }
+function worldRect(path) {
+  let r = ROOT_RECT, e = ROOTE;
+  for (const i of path) { const L = inner(...r); e = e.n.kids[i]; r = childRect(L, e.r); }
+  return r;
+}
+const titleOf = e => e.label || e.n.name;
+
+/* ================= canvas ================= */
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d"), vp = document.getElementById("vp");
+let VW = 0, VH = 0, dpr = 1;
+const cam = { x: 0.8, y: 0.5, k: 1 };
+let kRoot = 1, dirty = true, hoverPath = null, selPath = [];
+const DETAIL = 165;
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function resize() {
+  const r = vp.getBoundingClientRect();
+  const first = VW === 0;
+  VW = r.width; VH = r.height; dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(VW * dpr); cv.height = Math.round(VH * dpr);
+  kRoot = fitView(ROOT_RECT).k;
+  if (first) Object.assign(cam, fitView(ROOT_RECT));
+  dirty = true;
+}
+function fitView(r) {
+  const k = Math.min(VW * 0.92 / r[2], VH * 0.9 / r[3]);
+  return { x: r[0] + r[2] / 2, y: r[1] + r[3] / 2, k };
+}
+const sx = wx => (wx - cam.x) * cam.k + VW / 2;
+const sy = wy => (wy - cam.y) * cam.k + VH / 2;
+const toScreen = r => [sx(r[0]), sy(r[1]), r[2] * cam.k, r[3] * cam.k];
+
+function hsh(a, b, c) {
+  let x = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263) + Math.imul(c | 0, 1274126177)) | 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177); x ^= x >>> 16;
+  return (x >>> 0) / 4294967295;
+}
+
+function fitText(text, maxW, fs, font, weight = 600) {
+  ctx.font = `${weight} ${fs}px ${font}`;
+  const w = ctx.measureText(text).width;
+  if (w > maxW) { fs = fs * maxW / w; ctx.font = `${weight} ${fs}px ${font}`; }
+  return fs;
+}
+function wrapText(text, x, y, maxW, fs, lh, maxY, font, color) {
+  ctx.font = `400 ${fs}px ${font}`; ctx.fillStyle = color; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  const words = text.split(" "); let line = "";
+  for (let i = 0; i < words.length; i++) {
+    const test = line ? line + " " + words[i] : words[i];
+    if (ctx.measureText(test).width > maxW && line) {
+      if (y + lh > maxY) { ctx.fillText(line + " …", x, y); return y + lh; }
+      ctx.fillText(line, x, y); y += lh; line = words[i];
+    } else line = test;
+  }
+  if (line && y <= maxY) ctx.fillText(line, x, y);
+  return y + lh;
+}
+
+/* ---- custom drawings, all inside the content box L ---- */
+const DRAW = {
+  sym(L, e, p) {
+    const s = e.n.sym; const fs = fitText(s, L.w * 0.8, Math.min(L.h * 0.6, L.w * 0.7), FM, 500);
+    if (fs < 4) return;
+    ctx.fillStyle = p.dim; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(s, L.x + L.w / 2, L.y + L.h / 2);
+  },
+  matrix(L, e, p) {
+    const [rows, cols] = e.n.mx || [10, 16];
+    const cw = L.w / cols, ch = L.h / rows;
+    if (cw < 1.5 || ch < 1.5) { ctx.fillStyle = p.dim; ctx.globalAlpha = 0.5; ctx.fillRect(L.x, L.y, L.w, L.h); ctx.globalAlpha = 1; return; }
+    ctx.fillStyle = p.c;
+    for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) {
+      ctx.globalAlpha = 0.08 + 0.7 * hsh(i, j, e.seed) ** 2;
+      ctx.fillRect(L.x + j * cw + cw * 0.08, L.y + i * ch + ch * 0.08, cw * 0.84, ch * 0.84);
+    }
+    ctx.globalAlpha = 1;
+  },
+  heat(L, e, p) { tri(L, e, p, false); },
+  tri(L, e, p) { tri(L, e, p, true); },
+  bars0(L, e, p) {
+    const v = [0.42, 0.21, 0.14, 0.09, 0.07, 0.04, 0.03];
+    const bw = L.w / v.length;
+    ctx.fillStyle = p.c;
+    v.forEach((x, i) => { const h = L.h * x / 0.42; ctx.globalAlpha = 0.75; ctx.fillRect(L.x + i * bw + bw * 0.15, L.y + L.h - h, bw * 0.7, h); });
+    ctx.globalAlpha = 1;
+  },
+  bars(L, e, p) {
+    const v = [["␣En", 0.31], ["␣Det", 0.18], ["␣AI", 0.11], ["⏎", 0.08], ["␣Kort", 0.06], ["␣Man", 0.04], ["…", 0.22]];
+    const rh = L.h / v.length, lab = L.w * 0.32;
+    const fs = Math.min(rh * 0.55, 15);
+    v.forEach(([t, x], i) => {
+      const y = L.y + i * rh;
+      ctx.fillStyle = p.c; ctx.globalAlpha = i === 6 ? 0.25 : 0.8;
+      ctx.fillRect(L.x + lab, y + rh * 0.18, (L.w - lab) * x / 0.31 * 0.82, rh * 0.64);
+      ctx.globalAlpha = 1;
+      if (fs >= 6) {
+        ctx.font = `400 ${fs}px ${FM}`; ctx.fillStyle = p.t; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        ctx.fillText(t, L.x + lab - fs * 0.5, y + rh / 2);
+        ctx.textAlign = "left"; ctx.fillStyle = p.t;
+        const bx = L.x + lab + (L.w - lab) * x / 0.31 * 0.82;
+        if (i !== 6) ctx.fillText(String(x).replace(".", ","), Math.min(bx + fs * 0.4, L.x + L.w - fs * 2.4), y + rh / 2);
+      }
+    });
+  },
+  curve(L, e, p) {
+    const f = x => x / (1 + Math.exp(-x));
+    const X = x => L.x + (x + 4) / 8 * L.w, Y = y => L.y + L.h * 0.85 - y / 4.2 * L.h * 0.8;
+    ctx.strokeStyle = p.dim; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L.x, Y(0)); ctx.lineTo(L.x + L.w, Y(0)); ctx.moveTo(X(0), L.y); ctx.lineTo(X(0), L.y + L.h); ctx.stroke();
+    ctx.strokeStyle = p.c; ctx.lineWidth = Math.max(1, Math.min(3, L.m * 0.012));
+    ctx.beginPath();
+    for (let i = 0; i <= 60; i++) { const x = -4 + i / 60 * 8; i ? ctx.lineTo(X(x), Y(f(x))) : ctx.moveTo(X(x), Y(f(x))); }
+    ctx.stroke();
+  },
+  loop(L, e, p) {
+    const cx = L.x + L.w / 2, cy = L.y + L.h / 2, r = Math.min(L.w, L.h) * 0.36;
+    if (r < 4) return;
+    ctx.strokeStyle = p.c; ctx.lineWidth = Math.max(1, r * 0.08);
+    ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI * 0.35, Math.PI * 1.45); ctx.stroke();
+    const a = Math.PI * 1.45, ax = cx + r * Math.cos(a), ay = cy + r * Math.sin(a), s = r * 0.3;
+    ctx.fillStyle = p.c; ctx.beginPath();
+    ctx.moveTo(ax + s * 0.9, ay - s * 0.1); ctx.lineTo(ax - s * 0.35, ay - s * 0.75); ctx.lineTo(ax - s * 0.25, ay + s * 0.6); ctx.fill();
+    const fs = r * 0.32;
+    if (fs > 7) { ctx.font = `500 ${fs}px ${FM}`; ctx.fillStyle = p.t; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("n → n+1", cx, cy); }
+  },
+  token(L, e, p) {
+    const g = (e.glyph || "").replace(/ /g, "␣");
+    let fs = fitText(g, L.w * 0.86, L.h * 0.42, FM, 500);
+    if (fs < 4) return;
+    ctx.fillStyle = p.t; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(g, L.x + L.w / 2, L.y + L.h * 0.42);
+    const f2 = Math.min(L.h * 0.16, L.w * 0.12);
+    if (f2 > 6 && e.id) { ctx.font = `400 ${f2}px ${FM}`; ctx.fillStyle = p.dim; ctx.fillText("ID " + e.id.toLocaleString("sv-SE"), L.x + L.w / 2, L.y + L.h * 0.82); }
+  },
+  vector(L, e, p) {
+    const vals = ["0,12", "−0,87", "0,03", "1,41", "−0,25", "0,66", "−1,02", "0,09"];
+    const cw = L.w / vals.length;
+    vals.forEach((v, i) => {
+      ctx.fillStyle = p.c; ctx.globalAlpha = 0.18; ctx.fillRect(L.x + i * cw + cw * 0.06, L.y, cw * 0.88, L.h); ctx.globalAlpha = 1;
+      const fs = Math.min(L.h * 0.45, cw * 0.26);
+      if (fs >= 6) { ctx.font = `400 ${fs}px ${FM}`; ctx.fillStyle = p.t; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(v, L.x + i * cw + cw / 2, L.y + L.h / 2); }
+    });
+  },
+  table(L, e, p) {
+    const rows = [["A", "B", "Y"], ["0", "0", "1"], ["0", "1", "1"], ["1", "0", "1"], ["1", "1", "0"]];
+    const rh = L.h / 5, cw = L.w / 3, fs = Math.min(rh * 0.5, cw * 0.45);
+    if (fs < 5) return;
+    ctx.font = `500 ${fs}px ${FM}`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    rows.forEach((r, i) => r.forEach((c, j) => { ctx.fillStyle = i === 0 ? p.dim : (j === 2 ? p.t : p.b); ctx.fillText(c, L.x + j * cw + cw / 2, L.y + i * rh + rh / 2); }));
+    ctx.strokeStyle = p.dim; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(L.x, L.y + rh); ctx.lineTo(L.x + L.w, L.y + rh); ctx.stroke();
+  },
+  bus(L, e, p) {
+    ctx.strokeStyle = p.c; ctx.globalAlpha = 0.55;
+    const n = 4;
+    for (let i = 0; i < n; i++) {
+      const x = L.x + (i + 0.5) / n * L.w; ctx.lineWidth = Math.max(0.5, L.w / n * 0.25);
+      ctx.beginPath(); ctx.moveTo(x, L.y); ctx.lineTo(x, L.y + L.h); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  },
+  wave(L, e, p) {
+    ctx.lineWidth = Math.max(0.7, L.m * 0.01);
+    for (let k = 0; k < 4; k++) {
+      ctx.strokeStyle = p.c; ctx.globalAlpha = 0.85 - k * 0.18; ctx.beginPath();
+      for (let i = 0; i <= 80; i++) { const t = i / 80, x = L.x + t * L.w, y = L.y + L.h / 2 + Math.sin(t * Math.PI * 2 * (1 + k * 1.7)) * L.h * 0.38; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  },
+  cap(L, e, p) {
+    const cx = L.x + L.w / 2, cy = L.y + L.h / 2, w = Math.min(L.w, L.h) * 0.5;
+    ctx.strokeStyle = p.c; ctx.lineWidth = Math.max(1, w * 0.07);
+    ctx.beginPath();
+    ctx.moveTo(cx - w / 2, cy - w * 0.12); ctx.lineTo(cx + w / 2, cy - w * 0.12);
+    ctx.moveTo(cx - w / 2, cy + w * 0.12); ctx.lineTo(cx + w / 2, cy + w * 0.12);
+    ctx.moveTo(cx, cy - w * 0.12); ctx.lineTo(cx, cy - w * 0.7);
+    ctx.moveTo(cx, cy + w * 0.12); ctx.lineTo(cx, cy + w * 0.7);
+    ctx.stroke();
+  },
+  substrate(L, e, p) {
+    ctx.fillStyle = mixc(BG, "#7c8790", 0.28);
+    ctx.fillRect(L.x, L.y + L.h * 0.43, L.w, L.h * 0.57);
+    const fs = Math.min(L.h * 0.05, L.w * 0.04);
+    if (fs > 7) { ctx.font = `400 ${fs}px ${FM}`; ctx.fillStyle = p.b; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic"; ctx.fillText("kiselsubstrat", L.x + fs * 0.6, L.y + L.h - fs * 0.6); }
+  },
+};
+function tri(L, e, p, maskOnly) {
+  const n = 8, s = Math.min(L.w, L.h) / n, ox = L.x + (L.w - s * n) / 2, oy = L.y + (L.h - s * n) / 2;
+  if (s < 1) return;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    if (j > i) { ctx.fillStyle = BG; ctx.globalAlpha = 1; }
+    else { ctx.fillStyle = p.c; ctx.globalAlpha = maskOnly ? 0.55 : 0.1 + 0.85 * (j === i ? 0.7 : hsh(i, j, e.seed) ** 2); }
+    ctx.fillRect(ox + j * s + s * 0.06, oy + i * s + s * 0.06, s * 0.88, s * 0.88);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawLinks(n, L) {
+  const col = PAL.res.c, a = Math.max(3, Math.min(9, L.m * 0.02));
+  ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = Math.max(1, Math.min(2.2, L.m * 0.004)); ctx.globalAlpha = 0.85;
+  for (const [i, j] of n.links) {
+    const A = childRect(L, n.kids[i].r), B = childRect(L, n.kids[j].r);
+    let x1, y1, x2, y2, dir;
+    if (B[0] >= A[0] + A[2] - 0.5 || B[0] + B[2] <= A[0] + 0.5) {
+      const right = B[0] >= A[0] + A[2] - 0.5;
+      const lo = Math.max(A[1], B[1]), hi = Math.min(A[1] + A[3], B[1] + B[3]);
+      const y = lo < hi ? (lo + hi) / 2 : null;
+      x1 = right ? A[0] + A[2] : A[0]; x2 = right ? B[0] : B[0] + B[2];
+      y1 = y ?? A[1] + A[3] / 2; y2 = y ?? B[1] + B[3] / 2; dir = right ? [1, 0] : [-1, 0];
+      ctx.beginPath(); ctx.moveTo(x1, y1);
+      if (y1 !== y2) { const mx = (x1 + x2) / 2; ctx.lineTo(mx, y1); ctx.lineTo(mx, y2); }
+      ctx.lineTo(x2 - dir[0] * a, y2); ctx.stroke();
+    } else {
+      const down = B[1] >= A[1] + A[3] - 0.5;
+      const lo = Math.max(A[0], B[0]), hi = Math.min(A[0] + A[2], B[0] + B[2]);
+      const x = lo < hi ? (lo + hi) / 2 : null;
+      y1 = down ? A[1] + A[3] : A[1]; y2 = down ? B[1] : B[1] + B[3];
+      x1 = x ?? A[0] + A[2] / 2; x2 = x ?? B[0] + B[2] / 2; dir = down ? [0, 1] : [0, -1];
+      ctx.beginPath(); ctx.moveTo(x1, y1);
+      if (x1 !== x2) { const my = (y1 + y2) / 2; ctx.lineTo(x1, my); ctx.lineTo(x2, my); }
+      ctx.lineTo(x2, y2 - dir[1] * a); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - dir[0] * a - dir[1] * a * 0.6, y2 - dir[1] * a - dir[0] * a * 0.6);
+    ctx.lineTo(x2 - dir[0] * a + dir[1] * a * 0.6, y2 - dir[1] * a + dir[0] * a * 0.6);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawNode(e, x, y, w, h, depth, labelOK) {
+  if (x > VW || y > VH || x + w < 0 || y + h < 0 || w < 1.2 || h < 1.2) return;
+  const n = e.n, p = PAL[n.cat], m = Math.min(w, h);
+  ctx.fillStyle = depth % 2 ? p.f1 : p.f0; ctx.fillRect(x, y, w, h);
+  if (m > 4) { ctx.strokeStyle = p.b; ctx.lineWidth = Math.max(0.5, Math.min(1.4, m * 0.006)); ctx.strokeRect(x, y, w, h); }
+  const L = inner(x, y, w, h), detail = m >= DETAIL, hasKids = n.kids.length > 0;
+  if (n.draw && m > 10) DRAW[n.draw](L, e, p);
+  if (hasKids) {
+    for (const k of n.kids) { const r = childRect(L, k.r); drawNode(k, r[0], r[1], r[2], r[3], depth + 1, labelOK && detail); }
+    if (detail && n.links) drawLinks(n, L);
+  }
+  if (!labelOK) return;
+  const title = titleOf(e);
+  if (detail) {
+    const fs = fitText(title, L.w * 0.72, L.head * 0.5, FC);
+    if (fs >= 5) {
+      ctx.fillStyle = p.t; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+      ctx.fillText(title, x + L.px, y + L.head * 0.68);
+      const tag = CATS[n.cat][1].toUpperCase();
+      const f2 = fs * 0.55;
+      if (f2 >= 6) {
+        ctx.font = `500 ${f2}px ${FM}`;
+        const tw = ctx.measureText(tag).width, titleW = (ctx.font = `600 ${fs}px ${FC}`, ctx.measureText(title).width);
+        if (titleW + tw + f2 * 4 < L.w) { ctx.font = `500 ${f2}px ${FM}`; ctx.fillStyle = p.dim; ctx.textAlign = "right"; ctx.fillText(tag, x + w - L.px, y + L.head * 0.68); }
+      }
+    }
+    if (!hasKids && !n.draw) {
+      const fs2 = Math.min(L.w / 34, L.h / 9);
+      if (fs2 >= 7) {
+        let yy = L.y + fs2 * 1.4;
+        yy = wrapText(n.sub, L.x, yy, L.w, fs2 * 1.1, fs2 * 1.5, L.y + L.h, FS, p.t) + fs2 * 0.6;
+        for (const para of n.body) { if (yy > L.y + L.h) break; yy = wrapText(para, L.x, yy, L.w, fs2, fs2 * 1.45, L.y + L.h - fs2, FS, mixc(p.c, "#e1e8ea", 0.6)) + fs2 * 0.5; }
+      }
+    }
+    return;
+  }
+  // overview label, centred
+  if (e.glyph && !n.draw) {
+    const fs = fitText(e.glyph.replace(/ /g, "␣"), w * 0.8, Math.min(h * 0.6, 34), FM, 500);
+    if (fs >= 5) { ctx.fillStyle = "rgba(15,21,23,.72)"; ctx.fillRect(x + w / 2 - fs * 0.5, y + h / 2 - fs * 0.55, fs, fs * 1.1); ctx.fillStyle = p.t; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(e.glyph, x + w / 2, y + h / 2); }
+    return;
+  }
+  if (n.draw === "token") return;
+  const fs = fitText(title, w * 0.86, Math.min(h * 0.24, 22), FC);
+  if (fs < 6.5) return;
+  const tw = ctx.measureText(title).width;
+  const ly = n.draw ? y + Math.min(h * 0.16, fs * 1.2) + 2 : y + h / 2;
+  ctx.fillStyle = "rgba(15,21,23,.78)";
+  ctx.fillRect(x + w / 2 - tw / 2 - fs * 0.3, ly - fs * 0.7, tw + fs * 0.6, fs * 1.4);
+  ctx.fillStyle = p.t; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(title, x + w / 2, ly);
+}
+
+function outline(path, color, lw) {
+  if (!path) return;
+  const [x, y, w, h] = toScreen(worldRect(path));
+  if (w < 3) return;
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.strokeRect(x - 1, y - 1, w + 2, h + 2);
+}
+
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, VW, VH);
+  const r = toScreen(ROOT_RECT);
+  drawNode(ROOTE, r[0], r[1], r[2], r[3], 0, true);
+  if (hoverPath && !samePath(hoverPath, selPath)) outline(hoverPath, "rgba(225,232,234,.75)", 1.5);
+  if (selPath.length) outline(selPath, PAL.res.c, 2);
+  const z = cam.k / kRoot;
+  document.getElementById("zoomLbl").textContent = "×" + (z < 10 ? z.toFixed(1).replace(".", ",") : Math.round(z).toLocaleString("sv-SE"));
+}
+function frame() { if (dirty) { dirty = false; render(); } requestAnimationFrame(frame); }
+
+/* ================= hit testing ================= */
+function hit(px, py) {
+  let e = ROOTE, path = [], r = toScreen(ROOT_RECT);
+  if (px < r[0] || py < r[1] || px > r[0] + r[2] || py > r[1] + r[3]) return null;
+  for (;;) {
+    const m = Math.min(r[2], r[3]);
+    if (m < DETAIL || !e.n.kids.length) break;
+    const L = inner(...r);
+    let found = -1, fr = null;
+    e.n.kids.forEach((k, i) => { const c = childRect(L, k.r); if (px >= c[0] && px <= c[0] + c[2] && py >= c[1] && py <= c[1] + c[3]) { found = i; fr = c; } });
+    if (found < 0) break;
+    path.push(found); e = e.n.kids[found]; r = fr;
+  }
+  return path;
+}
+const samePath = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
+
+/* ================= camera animation (smooth zoom, van Wijk & Nuij) ================= */
+let anim = null;
+function interpZoom(p0, p1) {
+  const w0 = p0[2], ux0 = 0, uy0 = 0, dx = (p1[0] - p0[0]) / w0, dy = (p1[1] - p0[1]) / w0, w1 = p1[2] / w0;
+  const rho = Math.SQRT2, rho2 = 2, rho4 = 4, d2 = dx * dx + dy * dy;
+  let S, f;
+  if (d2 < 1e-12) { S = Math.log(w1) / rho; f = t => [t * dx, t * dy, Math.exp(rho * t * S)]; }
+  else {
+    const d1 = Math.sqrt(d2), b0 = (w1 * w1 - 1 + rho4 * d2) / (2 * rho2 * d1), b1 = (w1 * w1 - 1 - rho4 * d2) / (2 * w1 * rho2 * d1);
+    const r0 = Math.log(Math.sqrt(b0 * b0 + 1) - b0), r1 = Math.log(Math.sqrt(b1 * b1 + 1) - b1);
+    S = (r1 - r0) / rho;
+    f = t => { const s = t * S, u = 1 / (rho2 * d1) * (Math.cosh(r0) * Math.tanh(rho * s + r0) - Math.sinh(r0)); return [u * dx, u * dy, Math.cosh(r0) / Math.cosh(rho * s + r0)]; };
+  }
+  return { S: Math.abs(S), at: t => { const v = f(t); return [p0[0] + v[0] * w0, p0[1] + v[1] * w0, v[2] * w0]; } };
+}
+function flyTo(target) {
+  if (reduceMotion) { Object.assign(cam, target); dirty = true; return; }
+  const iz = interpZoom([cam.x, cam.y, VW / cam.k], [target.x, target.y, VW / target.k]);
+  const dur = Math.max(380, Math.min(2400, iz.S * 520));
+  const t0 = performance.now();
+  anim = { iz, t0, dur, target };
+  const step = now => {
+    if (!anim || anim.t0 !== t0) return;
+    let t = Math.min(1, (now - t0) / dur);
+    t = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const v = iz.at(t);
+    cam.x = v[0]; cam.y = v[1]; cam.k = VW / v[2];
+    if ((now - t0) >= dur) { Object.assign(cam, target); anim = null; }
+    dirty = true;
+    if (anim) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+/* ================= panel ================= */
+const panel = document.getElementById("panel");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function scaleText(path) {
+  const r = worldRect(path), ratio = ROOT_RECT[2] / r[2];
+  if (ratio < 1.5) return "";
+  const f = ratio < 100 ? ratio.toFixed(0) : Math.round(ratio).toLocaleString("sv-SE");
+  return `Den här delen är ungefär 1/${f} av helhetens bredd.`;
+}
+function renderPanel() {
+  const path = selPath, e = entryAt(path), n = e.n, cat = CATS[n.cat];
+  let crumbs = "";
+  for (let i = 0; i < path.length; i++) {
+    const pe = entryAt(path.slice(0, i));
+    crumbs += `<button type="button" data-path="${path.slice(0, i).join(".")}">${esc(titleOf(pe))}</button><span class="sep">›</span>`;
+  }
+  let kids = "";
+  if (n.kids.length) {
+    const groups = [];
+    n.kids.forEach((k, i) => {
+      const g = groups[groups.length - 1];
+      if (g && g.n === k.n && !k.note && !g.note) { g.count++; g.last = k; } else groups.push({ n: k.n, first: k, idx: i, count: 1, last: k, note: k.note });
+    });
+    kids = `<h3>Består av</h3><div class="kids">` + groups.map(g => {
+      const name = g.count > 3 ? `${titleOf(g.first)} … ${titleOf(g.last)}` : titleOf(g.first);
+      const extra = g.count > 3 ? `<span class="n">${g.count} st</span>` : "";
+      if (g.count > 1 && g.count <= 3) {
+        return n.kids.slice(g.idx, g.idx + g.count).map((k, j) => kidBtn(k, path.concat(g.idx + j), titleOf(k), "")).join("");
+      }
+      return kidBtn(g.first, path.concat(g.idx), name, extra);
+    }).join("") + `</div>`;
+  } else {
+    kids = `<h3>Består av</h3><p class="leafmark">Kartan går inte djupare här. ${n.cat === "diff" || n.cat === "poly" || n.cat === "oxide" || n.cat === "chan" ? "Det här är atomer och elektroner." : "Klicka uppåt i sökvägen för att se helheten den ingår i."}</p>`;
+  }
+  const facts = n.facts ? `<dl class="facts">${n.facts.map(([a, b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("")}</dl>` : "";
+  panel.innerHTML = `
+    ${path.length ? `<nav class="crumbs" aria-label="Sökväg">${crumbs}<span>${esc(titleOf(e))}</span></nav>` : ""}
+    <div class="eyebrow" style="color:${PAL[n.cat].t}"><span class="dot" style="background:${cat[0]}"></span>${esc(cat[1])} · nivå ${path.length}</div>
+    <h2>${esc(titleOf(e))}</h2>
+    ${e.label && e.label !== n.name ? `<p class="sub">${esc(n.name)}: ${esc(n.sub)}</p>` : `<p class="sub">${esc(n.sub)}</p>`}
+    ${e.note ? `<p class="note">${esc(e.note)}</p>` : ""}
+    ${n.body.map(p => `<p>${esc(p)}</p>`).join("")}
+    ${n.cpu ? `<div class="cpu"><b>Som i en processor</b>${esc(n.cpu)}</div>` : ""}
+    ${facts}
+    ${kids}
+    <p class="scale">${scaleText(path)}</p>`;
+  panel.scrollTop = 0;
+}
+function kidBtn(k, path, name, extra) {
+  return `<button type="button" data-path="${path.join(".")}"><span class="dot" style="background:${CATS[k.n.cat][0]}"></span>${esc(name)}${extra}</button>`;
+}
+panel.addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-path]"); if (!b) return;
+  const p = b.dataset.path === "" ? [] : b.dataset.path.split(".").map(Number);
+  select(p);
+});
+function select(path, fly = true) {
+  selPath = path; renderPanel(); dirty = true;
+  if (fly) flyTo(fitView(worldRect(path)));
+}
+
+/* ================= input ================= */
+const tip = document.getElementById("tip");
+const pointers = new Map();
+let down = null, pinch = null;
+function zoomAt(px, py, f) {
+  anim = null;
+  const wx = (px - VW / 2) / cam.k + cam.x, wy = (py - VH / 2) / cam.k + cam.y;
+  cam.k = Math.max(kRoot * 0.5, Math.min(kRoot * 5e9, cam.k * f));
+  cam.x = wx - (px - VW / 2) / cam.k; cam.y = wy - (py - VH / 2) / cam.k; dirty = true;
+}
+const local = ev => { const r = cv.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
+cv.addEventListener("wheel", ev => { ev.preventDefault(); const [x, y] = local(ev); zoomAt(x, y, Math.exp(-ev.deltaY * (ev.deltaMode ? 0.05 : 0.0018))); }, { passive: false });
+cv.addEventListener("pointerdown", ev => {
+  cv.setPointerCapture(ev.pointerId);
+  const [x, y] = local(ev); pointers.set(ev.pointerId, [x, y]);
+  if (pointers.size === 1) down = { x, y, t: performance.now(), moved: 0 };
+  if (pointers.size === 2) { const [a, b] = [...pointers.values()]; pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]) }; if (down) down.moved = 99; }
+});
+cv.addEventListener("pointermove", ev => {
+  const [x, y] = local(ev);
+  if (!pointers.has(ev.pointerId)) {
+    if (ev.pointerType === "mouse") {
+      const p = hit(x, y);
+      if (!samePath(p, hoverPath)) { hoverPath = p; dirty = true; }
+      if (p) { tip.hidden = false; tip.textContent = titleOf(entryAt(p)); tip.style.left = Math.min(x + 14, VW - tip.offsetWidth - 6) + "px"; tip.style.top = (y + 16) + "px"; } else tip.hidden = true;
+    }
+    return;
+  }
+  const prev = pointers.get(ev.pointerId); pointers.set(ev.pointerId, [x, y]);
+  if (pointers.size === 1) {
+    anim = null; cam.x -= (x - prev[0]) / cam.k; cam.y -= (y - prev[1]) / cam.k; dirty = true;
+    if (down) down.moved += Math.abs(x - prev[0]) + Math.abs(y - prev[1]);
+    if (down && down.moved > 6) cv.classList.add("dragging");
+  } else if (pointers.size === 2 && pinch) {
+    const [a, b] = [...pointers.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    zoomAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, d / pinch.d); pinch.d = d;
+  }
+});
+function endPointer(ev) {
+  if (!pointers.has(ev.pointerId)) return;
+  const [x, y] = local(ev); pointers.delete(ev.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 0) {
+    cv.classList.remove("dragging");
+    if (down && down.moved <= 6 && ev.type === "pointerup") {
+      const p = hit(x, y);
+      if (p) { if (tourIdx >= 0) endTour(); select(p); }
+    }
+    down = null;
+  }
+}
+cv.addEventListener("pointerup", endPointer);
+cv.addEventListener("pointercancel", endPointer);
+cv.addEventListener("pointerleave", () => { if (hoverPath) { hoverPath = null; dirty = true; } tip.hidden = true; });
+
+function goUp() { if (selPath.length) select(selPath.slice(0, -1)); else select([]); }
+document.getElementById("homeBtn").onclick = () => { endTour(); select([]); };
+document.getElementById("upBtn").onclick = goUp;
+document.getElementById("zin").onclick = () => zoomAt(VW / 2, VH / 2, 1.8);
+document.getElementById("zout").onclick = () => zoomAt(VW / 2, VH / 2, 1 / 1.8);
+addEventListener("keydown", ev => {
+  if (ev.target.closest && ev.target.closest("input,textarea")) return;
+  if (ev.key === "Escape" || ev.key === "Backspace") { ev.preventDefault(); if (tourIdx >= 0) endTour(); else goUp(); }
+  else if (tourIdx >= 0 && ev.key === "ArrowRight") tourGo(tourIdx + 1);
+  else if (tourIdx >= 0 && ev.key === "ArrowLeft") tourGo(tourIdx - 1);
+  else if (ev.key === "+" || ev.key === "=") zoomAt(VW / 2, VH / 2, 1.5);
+  else if (ev.key === "-") zoomAt(VW / 2, VH / 2, 1 / 1.5);
+});
+
+/* ================= guided tour ================= */
+function findPath(names) {
+  const path = []; let e = ROOTE;
+  for (const nm of names) {
+    const i = e.n.kids.findIndex(k => titleOf(k) === nm);
+    if (i < 0) throw new Error("tour: " + nm);
+    path.push(i); e = e.n.kids[i];
+  }
+  return path;
+}
+const L1 = ["Transformer-stacken", "Lager 1"];
+const H1 = [...L1, "Uppmärksamhet", "Huvud 1"];
+const DP = [...H1, "Q-projektion", "Skalärprodukt 1"];
+const TOUR = [
+  [[], "Helheten. Texten går in till vänster, genom den stora stacken i mitten och ut till höger. Ett varv ger ett enda token."],
+  [["Kontextfönstret"], "Allt börjar med texten: systemprompten, samtalet och din fråga."],
+  [["Tokeniseraren"], "Texten delas upp i tokens, och varje token blir ett heltal."],
+  [["Tokeniseraren", "Token “␣fung”"], "Ett token. Efter det här steget finns inga bokstäver kvar."],
+  [["Inbäddning"], "Heltalet slår upp en rad med tusentals tal: tokenens vektor."],
+  [["Transformer-stacken"], "Vektorn går upp genom dussintals lager. Den guldfärgade bussen är residualströmmen."],
+  [L1, "Ett lager: uppmärksamhet överst, MLP under, och tillägg till strömmen efter båda."],
+  [[...L1, "Uppmärksamhet"], "Uppmärksamheten låter tokens hämta information från tidigare tokens, i många huvuden samtidigt."],
+  [H1, "Ett huvud: fråga, nyckel och värde, poängmatris, softmax och viktad summa."],
+  [[...H1, "Poängmatris"], "Varje token jämför sin fråga med tidigare tokens nycklar. Framtiden är maskerad."],
+  [[...H1, "Q-projektion"], "Frågan Q räknas fram med en matrismultiplikation, liksom nästan allt annat."],
+  [DP, "En enda skalärprodukt: multiplicera tal med vikter och summera. Det här är en 'neuron'."],
+  [[...DP, "w3"], "En vikt: ett av miljarder inlärda tal, lagrat som 16 bitar."],
+  [[...DP, "w3", "Exponent (8 bitar)", "Exponentbit 6"], "En bit av vikten, lagrad i en minnescell."],
+  [[...DP, "w3", "Exponent (8 bitar)", "Exponentbit 6", "Åtkomsttransistor"], "Botten: en transistor, samma sorts strömbrytare som i en vanlig CPU."],
+  [[...DP, "MAC 1"], "Tillbaka i skalärprodukten: MAC-enheten gör själva multiplikationen och additionen."],
+  [[...DP, "MAC 1", "Multiplikator", "Grind 1"], "Multiplikatorn är byggd av logikgrindar, och varje grind av fyra transistorer."],
+  [[...L1, "MLP"], "Efter uppmärksamheten bearbetar MLP:n varje token för sig. Här sitter det mesta av parametrarna."],
+  [["Transformer-stacken", "Features och kretsar"], "Vad betyder talen? Forskare har hittat begrepp och kretsar inne i Claude."],
+  [["Utdatahuvudet"], "Efter sista lagret blir vektorn en poäng för varje möjligt nästa token."],
+  [["Utdatahuvudet", "Sannolikheter"], "Softmax gör poängen till sannolikheter."],
+  [["Sampling"], "Ett token dras ur fördelningen."],
+  [["Autoregressiv slinga"], "Tokenet läggs till texten och allt körs igen. Ett svar är tusentals sådana varv."],
+  [["KV-cachen"], "Det som redan räknats för tidigare tokens sparas, så varje varv blir billigare."],
+  [["Hårdvaran"], "Allt detta körs som matrismultiplikationer på tusentals AI-chip."],
+  [["Träningen"], "Och värdena i alla vikter kom från träningen. Där blev Claude Claude."],
+].map(([names, cap]) => ({ path: findPath(names), cap }));
+let tourIdx = -1;
+const tourbar = document.getElementById("tourbar");
+function tourGo(i) {
+  if (i < 0 || i >= TOUR.length) return;
+  tourIdx = i; tourbar.hidden = false;
+  document.getElementById("tStep").textContent = `${i + 1}/${TOUR.length}`;
+  document.getElementById("tCap").textContent = TOUR[i].cap;
+  document.getElementById("tNext").textContent = i === TOUR.length - 1 ? "Klar" : "Nästa ›";
+  select(TOUR[i].path);
+}
+function endTour() { tourIdx = -1; tourbar.hidden = true; }
+document.getElementById("tourBtn").onclick = () => tourGo(0);
+document.getElementById("tPrev").onclick = () => tourGo(tourIdx - 1);
+document.getElementById("tNext").onclick = () => { if (tourIdx === TOUR.length - 1) { endTour(); select([]); } else tourGo(tourIdx + 1); };
+document.getElementById("tEnd").onclick = endTour;
+
+/* ================= boot ================= */
+new ResizeObserver(() => { resize(); }).observe(vp);
+resize();
+select([], false);
+requestAnimationFrame(frame);
+if (document.fonts) document.fonts.ready.then(() => { dirty = true; });
+</script>
+
+</body>
+</html>
